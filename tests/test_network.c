@@ -406,3 +406,51 @@ void test_prop_net_soundness(void)
         qn_free(net);
     }
 }
+
+static QnStatus group_inner;
+static QnGroup group_id;
+
+static void toggles_group(QNet *net, void *ctx, const QnCell *cells, size_t n)
+{
+    (void) ctx;
+    (void) cells;
+    (void) n;
+    group_inner = qn_group_enable(net, group_id, false);
+}
+
+void test_net_groups(void)
+{
+    QNet *net = qn_new();
+    QnCell a = num(net, 0, iv(0, 10)), b = num(net, 0, qi_top());
+    QnGroup g;
+    CHECK(qn_new_group(net, false, &g) == QN_OK);
+    CHECK(!qn_group_enabled(net, g));
+    qn_set_group(net, g);
+    CHECK(qn_equal(net, a, b, NULL) == QN_OK);
+    qn_set_group(net, 0);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK_IV(qn_get(net, b), Q_NINF, Q_INF);   /* disabled: never ran */
+    CHECK(qn_begin_epoch(net) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK_IV(qn_get(net, b), Q_NINF, Q_INF);
+
+    CHECK(qn_group_enable(net, g, true) == QN_OK);   /* enabling puts it on the agenda */
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK_IV(qn_get(net, b), 0, 10);
+    CHECK(qn_group_enable(net, 0, false) == QN_EGROUP);
+    CHECK(qn_group_enable(net, 99, true) == QN_EGROUP);
+
+    /* disabling takes queued propagators off the agenda */
+    CHECK(qn_tell(net, a, iv(2, 3)) == QN_OK);
+    CHECK(qn_group_enable(net, g, false) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK_IV(qn_get(net, b), 0, 10);
+
+    /* not during propagation */
+    group_id = g;
+    QnCell cs[1] = { a };
+    CHECK(qn_custom(net, cs, 1, toggles_group, NULL) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK(group_inner == QN_EPROPAGATING);
+    qn_free(net);
+}

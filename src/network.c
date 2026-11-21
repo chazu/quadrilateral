@@ -15,6 +15,7 @@ const char *qn_status_str(QnStatus s)
     case QN_ESTAGED:      return "cell already staged for this boundary";
     case QN_EPROPAGATING: return "non-monotonic call during propagation";
     case QN_ENOMEM:       return "out of memory";
+    case QN_EGROUP:       return "no such group";
     }
     return "unknown status";
 }
@@ -26,6 +27,7 @@ typedef enum { P_SUM, P_PRODUCT, P_EQUAL, P_CUSTOM } PKind;
 typedef struct {
     PKind  kind;
     bool   queued;
+    QnGroup group;
     QnCell c[3];          /* sum, product: z, x, y. equal: a, b. */
     QConv  k[6];          /* plans; see the run functions */
     QnFn   fn;            /* custom */
@@ -53,6 +55,10 @@ struct QNet {
     uint32_t *queue;      /* a ring of propagator ids, capacity capprops */
     size_t    qhead, qcount;
 
+    bool     *groups;     /* enabled, for each group */
+    size_t    ngroups, capgroups;
+    QnGroup   current;
+
     uint64_t epoch, runs, budget;
     bool     propagating, contradicted;
     QnCell   conflict;
@@ -72,7 +78,15 @@ static bool grow(void **p, size_t *cap, size_t need, size_t elem)
 
 QNet *qn_new(void)
 {
-    return calloc(1, sizeof(QNet));
+    QNet *net = calloc(1, sizeof(QNet));
+    if (!net) return NULL;
+    if (!grow((void **) &net->groups, &net->capgroups, 1, sizeof *net->groups)) {
+        free(net);
+        return NULL;
+    }
+    net->groups[0] = true;
+    net->ngroups = 1;
+    return net;
 }
 
 void qn_free(QNet *net)
@@ -83,6 +97,7 @@ void qn_free(QNet *net)
     free(net->props);
     free(net->ccells);
     free(net->queue);
+    free(net->groups);
     free(net);
 }
 
@@ -90,7 +105,7 @@ void qn_free(QNet *net)
 
 static void enqueue(QNet *net, uint32_t p)
 {
-    if (net->props[p].queued) return;
+    if (net->props[p].queued || !net->groups[net->props[p].group]) return;
     net->props[p].queued = true;
     net->queue[(net->qhead + net->qcount++) % net->capprops] = p;
 }
@@ -192,6 +207,7 @@ static QnStatus add_prop(QNet *net, const Prop *p, const QnCell *cells, size_t n
     uint32_t id = (uint32_t) net->nprops;
     net->props[net->nprops++] = *p;
     net->props[id].queued = false;
+    net->props[id].group = net->current;
     for (size_t i = 0; i < n; i++) {
         QnStatus s = watch(net, cells[i], id);
         if (s) return s;
@@ -363,6 +379,46 @@ QnStatus qn_propagate(QNet *net)
 
 void qn_set_budget(QNet *net, uint64_t runs) { net->budget = runs; }
 uint64_t qn_runs(const QNet *net) { return net->runs; }
+
+/* --- groups ------------------------------------------------------------------------- */
+
+QnStatus qn_new_group(QNet *net, bool enabled, QnGroup *out)
+{
+    if (!grow((void **) &net->groups, &net->capgroups, net->ngroups + 1, sizeof *net->groups)) return QN_ENOMEM;
+    net->groups[net->ngroups] = enabled;
+    *out = (QnGroup) net->ngroups++;
+    return QN_OK;
+}
+
+void qn_set_group(QNet *net, QnGroup g)
+{
+    if (g < net->ngroups) net->current = g;
+}
+
+QnStatus qn_group_enable(QNet *net, QnGroup g, bool enabled)
+{
+    if (net->propagating) return QN_EPROPAGATING;
+    if (g >= net->ngroups || g == 0) return QN_EGROUP;
+    if (net->groups[g] == enabled) return QN_OK;
+    net->groups[g] = enabled;
+    if (enabled) {
+        if (!net->contradicted)
+            for (size_t p = 0; p < net->nprops; p++)
+                if (net->props[p].group == g) enqueue(net, (uint32_t) p);
+    } else {
+        /* take the group's propagators off the agenda, keeping the order of the rest */
+        size_t n = net->qcount, kept = 0;
+        for (size_t i = 0; i < n; i++) {
+            uint32_t p = net->queue[(net->qhead + i) % net->capprops];
+            if (net->props[p].group == g) net->props[p].queued = false;
+            else net->queue[(net->qhead + kept++) % net->capprops] = p;
+        }
+        net->qcount = kept;
+    }
+    return QN_OK;
+}
+
+bool qn_group_enabled(const QNet *net, QnGroup g) { return g < net->ngroups && net->groups[g]; }
 
 /* --- epochs ------------------------------------------------------------------------- */
 

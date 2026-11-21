@@ -349,8 +349,9 @@ static const QkTransfer counter_transfers[] = {
     { "make", QK_NONE, C_STORE, false },
 };
 
-static QkResult c_create(const QkHost *host, QkCall *call, QkInstance **out)
+static QkResult c_create(const QkKernel *self, const QkHost *host, QkCall *call, QkInstance **out)
 {
+    (void) self;
     (void) call;
     QkInstance *i = malloc(sizeof *i);
     if (!i) return QK_ERROR;

@@ -7,68 +7,86 @@
 
 /* --- storage ------------------------------------------------------------------- */
 
+#define NO_MODEL (-1)
+
 typedef struct { char *name; QType type; bool conserved; } Kind;
-typedef struct { char *path; QwKind kind; QwPhen owner; } CellInfo;
-typedef struct { char *port, *target; } Port;
+typedef struct { char *path; QwKind kind; QwPhen owner; int model; } CellInfo;
+typedef struct { char *port, *target; } Port;                   /* qw_connect */
+typedef struct { char *port; int model; char *target; } PortMap;   /* qw_port */
 typedef struct { uint32_t slot; QnCell cell; QInterval range; bool explicit_; } Assume;
 
+/* A kernel attached to a phenomenon, or to one model of it. */
 typedef struct {
-    char           *name;
-    Port           *ports;
-    size_t          nports, capports;
     const QkKernel *k;
     QkInstance     *inst;
     QnCell         *bind;       /* for each slot */
     QConv          *to_slot;    /* cell scale to slot scale */
     QConv          *to_cell;    /* slot scale to cell scale */
+    bool            via_model;  /* a slot resolves through a port that depends on a model */
     bool            predicted;
     QkPrediction    pred;
     Assume         *as;
     size_t          nas, capas;
-    uint64_t        events, predicts;
+    uint64_t        events;
+} Att;
+
+typedef struct { char *name; QnGroup group; Att att; } Model;
+
+typedef struct {
+    char    *name;
+    Port    *ports;
+    size_t   nports, capports;
+    PortMap *pmaps;
+    size_t   npmaps, cappmaps;
+    Model   *models;
+    size_t   nmodels, capmodels;
+    int      active;            /* a model index, or NO_MODEL if the phenomenon has no models */
+    Att      base;
+    uint64_t predicts;
 } Phen;
 
-typedef struct { QWorld *w; QwPhen id; } NarrowCtx;
+typedef struct { QWorld *w; QwPhen id; int model; } NarrowCtx;
 
-enum { M_CREATE, M_PREDICT, M_ADVANCE, M_NARROW };
+enum { M_CREATE, M_PREDICT, M_ADVANCE, M_NARROW, M_MAP };
 
 struct QkCall {
     QWorld *w;
     QwPhen  id;
+    Att    *att;
     int     mode;
     int     err;
     char    msg[256];
 };
 
 struct QWorld {
-    QNet     *net;
-    uint64_t  seed;
-    int8_t    tick;
+    QNet      *net;
+    uint64_t   seed;
+    int8_t     tick;
 
-    char    **bases;
-    size_t    nbases, capbases;
-    Kind     *kinds;
-    size_t    nkinds, capkinds;
-    CellInfo *cells;
-    size_t    ncells, capcells;
-    Phen     *phens;
-    size_t    nphens, capphens;
+    char     **bases;
+    size_t     nbases, capbases;
+    Kind      *kinds;
+    size_t     nkinds, capkinds;
+    CellInfo  *cells;
+    size_t     ncells, capcells;
+    Phen      *phens;
+    size_t     nphens, capphens;
     NarrowCtx **nctx;
-    size_t    nnctx, capnctx;
+    size_t     nnctx, capnctx;
 
-    int64_t   now;
-    uint64_t  boundaries;
+    int64_t    now;
+    uint64_t   boundaries, advances, switches;
 
-    /* staging for one boundary, one entry for each cell */
-    int64_t  *delta, *wval;
-    bool     *written;
-    size_t    capstage;
+    /* staging for one boundary or switch, one entry for each cell */
+    int64_t   *delta, *wval;
+    bool      *written;
+    size_t     capstage;
 
-    bool      narrow_failed;
-    char      narrow_msg[300];
-    char      err[512];
-    char      log[256];
-    QkHost    host;
+    bool       narrow_failed;
+    char       narrow_msg[300];
+    char       err[512];
+    char       log[256];
+    QkHost     host;
 };
 
 static bool grow(void **p, size_t *cap, size_t need, size_t elem)
@@ -122,6 +140,26 @@ const char *qw_error(const QWorld *w) { return w->err; }
 QNet *qw_net(QWorld *w) { return w->net; }
 int64_t qw_now(const QWorld *w) { return w->now; }
 uint64_t qw_boundaries(const QWorld *w) { return w->boundaries; }
+uint64_t qw_advances(const QWorld *w) { return w->advances; }
+uint64_t qw_switches(const QWorld *w) { return w->switches; }
+
+static void clear_staging(QWorld *w)
+{
+    for (size_t c = 0; c < w->ncells; c++) {
+        w->delta[c] = 0;
+        w->written[c] = false;
+    }
+}
+
+static void free_att(Att *a)
+{
+    if (a->k && a->k->destroy && a->inst) a->k->destroy(a->inst);
+    free(a->bind);
+    free(a->to_slot);
+    free(a->to_cell);
+    free(a->as);
+    memset(a, 0, sizeof *a);
+}
 
 /* --- the host table ---------------------------------------------------------------- */
 
@@ -141,52 +179,53 @@ static int call_err(QkCall *c, int code, const char *fmt, ...)
 
 static bool slot_ok(QkCall *c, uint32_t slot)
 {
-    Phen *p = call_phen(c);
-    if (slot < p->k->nslots) return true;
+    if (slot < c->att->k->nslots) return true;
     call_err(c, QK_HOST_EINDEX, "slot index %u out of range", slot);
     return false;
 }
 
-static void set_assume(Phen *p, uint32_t slot, QnCell cell, QInterval range, bool explicit_)
+static void set_assume(Att *a, uint32_t slot, QnCell cell, QInterval range, bool explicit_)
 {
-    for (size_t i = 0; i < p->nas; i++)
-        if (p->as[i].slot == slot) {
-            if (explicit_ || !p->as[i].explicit_) {
-                p->as[i].range = range;
-                p->as[i].explicit_ = explicit_;
+    for (size_t i = 0; i < a->nas; i++)
+        if (a->as[i].slot == slot) {
+            if (explicit_ || !a->as[i].explicit_) {
+                a->as[i].range = range;
+                a->as[i].explicit_ = explicit_;
             }
             return;
         }
-    if (!grow((void **) &p->as, &p->capas, p->nas + 1, sizeof *p->as)) return;
-    p->as[p->nas++] = (Assume) { slot, cell, range, explicit_ };
+    if (!grow((void **) &a->as, &a->capas, a->nas + 1, sizeof *a->as)) return;
+    a->as[a->nas++] = (Assume) { slot, cell, range, explicit_ };
 }
 
 static QInterval h_read(QkCall *c, uint32_t slot)
 {
     if (!slot_ok(c, slot)) return qi_top();
-    Phen *p = call_phen(c);
-    const QkSlot *s = &p->k->slots[slot];
+    Att *a = c->att;
+    const QkSlot *s = &a->k->slots[slot];
     if (s->role == QK_LINK) {
         call_err(c, QK_HOST_EROLE, "slot '%s' is a link, which cannot be read", s->name);
         return qi_top();
     }
-    QInterval v = qn_get(c->w->net, p->bind[slot]);
-    if (c->mode == M_PREDICT && s->role == QK_IN) set_assume(p, slot, p->bind[slot], v, false);
-    return qi_conv(v, &p->to_slot[slot]);
+    QInterval v = qn_get(c->w->net, a->bind[slot]);
+    if (c->mode == M_PREDICT && s->role == QK_IN) set_assume(a, slot, a->bind[slot], v, false);
+    return qi_conv(v, &a->to_slot[slot]);
 }
+
+static bool changing(int mode) { return mode == M_ADVANCE || mode == M_MAP; }
 
 static int h_write(QkCall *c, uint32_t slot, int64_t value)
 {
     if (!slot_ok(c, slot)) return QK_HOST_EINDEX;
-    Phen *p = call_phen(c);
-    const QkSlot *s = &p->k->slots[slot];
-    if (c->mode != M_ADVANCE) return call_err(c, QK_HOST_EMODE, "write to slot '%s' outside advance", s->name);
+    Att *a = c->att;
+    const QkSlot *s = &a->k->slots[slot];
+    if (!changing(c->mode)) return call_err(c, QK_HOST_EMODE, "write to slot '%s' outside advance", s->name);
     if (s->role != QK_OUT && s->role != QK_STATE)
         return call_err(c, QK_HOST_EROLE, "write to slot '%s', which is not an output or a state", s->name);
     int64_t v;
-    if (qp_conv(value, &p->to_cell[slot], &v) != Q_OK)
+    if (qp_conv(value, &a->to_cell[slot], &v) != Q_OK)
         return call_err(c, QK_HOST_EVALUE, "value for slot '%s' out of range", s->name);
-    QnCell cell = p->bind[slot];
+    QnCell cell = a->bind[slot];
     c->w->wval[cell] = v;
     c->w->written[cell] = true;
     return QK_HOST_OK;
@@ -194,18 +233,18 @@ static int h_write(QkCall *c, uint32_t slot, int64_t value)
 
 static int h_transfer(QkCall *c, uint32_t t, int64_t amount)
 {
-    Phen *p = call_phen(c);
-    if (t >= p->k->ntransfers) return call_err(c, QK_HOST_EINDEX, "transfer index %u out of range", t);
-    const QkTransfer *tr = &p->k->transfers[t];
-    if (c->mode != M_ADVANCE) return call_err(c, QK_HOST_EMODE, "transfer '%s' outside advance", tr->name);
+    Att *a = c->att;
+    if (t >= a->k->ntransfers) return call_err(c, QK_HOST_EINDEX, "transfer index %u out of range", t);
+    const QkTransfer *tr = &a->k->transfers[t];
+    if (!changing(c->mode)) return call_err(c, QK_HOST_EMODE, "transfer '%s' outside advance", tr->name);
     QWorld *w = c->w;
     if (tr->from != QK_NONE) {
-        QnCell f = p->bind[tr->from];
+        QnCell f = a->bind[tr->from];
         if (qp_sub(w->delta[f], amount, &w->delta[f]) != Q_OK)
             return call_err(c, QK_HOST_EVALUE, "transfer '%s' out of range", tr->name);
     }
     if (tr->to != QK_NONE) {
-        QnCell d = p->bind[tr->to];
+        QnCell d = a->bind[tr->to];
         if (qp_add(w->delta[d], amount, &w->delta[d]) != Q_OK)
             return call_err(c, QK_HOST_EVALUE, "transfer '%s' out of range", tr->name);
     }
@@ -215,32 +254,32 @@ static int h_transfer(QkCall *c, uint32_t t, int64_t amount)
 static int h_tell(QkCall *c, uint32_t slot, QInterval range)
 {
     if (!slot_ok(c, slot)) return QK_HOST_EINDEX;
-    Phen *p = call_phen(c);
-    const QkSlot *s = &p->k->slots[slot];
+    Att *a = c->att;
+    const QkSlot *s = &a->k->slots[slot];
     if (c->mode != M_NARROW) return call_err(c, QK_HOST_EMODE, "tell on slot '%s' outside narrow", s->name);
     if (s->role == QK_LINK) return call_err(c, QK_HOST_EROLE, "tell on link slot '%s'", s->name);
     if (!qi_valid(range)) return call_err(c, QK_HOST_EVALUE, "invalid interval for slot '%s'", s->name);
-    qn_tell(c->w->net, p->bind[slot], qi_conv(range, &p->to_cell[slot]));
+    qn_tell(c->w->net, a->bind[slot], qi_conv(range, &a->to_cell[slot]));
     return QK_HOST_OK;
 }
 
 static int h_assume(QkCall *c, uint32_t slot, QInterval range)
 {
     if (!slot_ok(c, slot)) return QK_HOST_EINDEX;
-    Phen *p = call_phen(c);
-    const QkSlot *s = &p->k->slots[slot];
+    Att *a = c->att;
+    const QkSlot *s = &a->k->slots[slot];
     if (c->mode != M_PREDICT) return call_err(c, QK_HOST_EMODE, "assume on slot '%s' outside predict", s->name);
     if (s->role != QK_IN) return call_err(c, QK_HOST_EROLE, "assume on slot '%s', which is not an input", s->name);
     if (!qi_valid(range)) return call_err(c, QK_HOST_EVALUE, "invalid interval for slot '%s'", s->name);
-    set_assume(p, slot, p->bind[slot], qi_conv(range, &p->to_cell[slot]), true);
+    set_assume(a, slot, a->bind[slot], qi_conv(range, &a->to_cell[slot]), true);
     return QK_HOST_OK;
 }
 
+/* An advance draws with its event count. A map draws with the epoch (ADR 0010). */
 static QRCursor h_random(QkCall *c, const char *stream)
 {
-    Phen *p = call_phen(c);
     QRStream s = qr_stream(c->w->seed, c->id, stream);
-    return qr_cursor(&s, p->events);
+    return qr_cursor(&s, c->mode == M_MAP ? qn_epoch(c->w->net) : c->att->events);
 }
 
 static int64_t h_now(QkCall *c) { return c->w->now; }
@@ -274,17 +313,23 @@ void qw_free(QWorld *w)
     if (!w) return;
     for (size_t i = 0; i < w->nphens; i++) {
         Phen *p = &w->phens[i];
-        if (p->k && p->k->destroy && p->inst) p->k->destroy(p->inst);
+        free_att(&p->base);
+        for (size_t j = 0; j < p->nmodels; j++) {
+            free_att(&p->models[j].att);
+            free(p->models[j].name);
+        }
         for (size_t j = 0; j < p->nports; j++) {
             free(p->ports[j].port);
             free(p->ports[j].target);
         }
+        for (size_t j = 0; j < p->npmaps; j++) {
+            free(p->pmaps[j].port);
+            free(p->pmaps[j].target);
+        }
+        free(p->models);
         free(p->ports);
+        free(p->pmaps);
         free(p->name);
-        free(p->bind);
-        free(p->to_slot);
-        free(p->to_cell);
-        free(p->as);
     }
     for (size_t i = 0; i < w->nbases; i++) free(w->bases[i]);
     for (size_t i = 0; i < w->nkinds; i++) free(w->kinds[i].name);
@@ -362,6 +407,13 @@ static bool find_phen(const QWorld *w, const char *name, size_t len, QwPhen *out
     return false;
 }
 
+static int find_model(const Phen *p, const char *name, size_t len)
+{
+    for (size_t i = 0; i < p->nmodels; i++)
+        if (strlen(p->models[i].name) == len && !memcmp(p->models[i].name, name, len)) return (int) i;
+    return NO_MODEL;
+}
+
 QwStatus qw_phenomenon(QWorld *w, const char *name, QwPhen *out)
 {
     if (!valid_name(name)) return fail(w, QW_ENAME, "invalid phenomenon name '%s'", name);
@@ -370,9 +422,54 @@ QwStatus qw_phenomenon(QWorld *w, const char *name, QwPhen *out)
     if (!grow((void **) &w->phens, &w->capphens, w->nphens + 1, sizeof *w->phens)) return QW_ENOMEM;
     Phen *p = &w->phens[w->nphens];
     memset(p, 0, sizeof *p);
+    p->active = NO_MODEL;
     if (!(p->name = dupstr(name))) return QW_ENOMEM;
     *out = (QwPhen) w->nphens++;
     return QW_OK;
+}
+
+QwStatus qw_model(QWorld *w, QwPhen pid, const char *name)
+{
+    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
+    Phen *p = &w->phens[pid];
+    if (!valid_name(name)) return fail(w, QW_ENAME, "%s: invalid model name '%s'", p->name, name);
+    if (find_model(p, name, strlen(name)) != NO_MODEL)
+        return fail(w, QW_EDUP, "%s: model '%s' already exists", p->name, name);
+    char prefix[512];
+    snprintf(prefix, sizeof prefix, "%s.%s", p->name, name);
+    for (size_t i = 0; i < w->ncells; i++) {
+        size_t n = strlen(prefix);
+        if (!strncmp(w->cells[i].path, prefix, n) && (w->cells[i].path[n] == '.' || !w->cells[i].path[n]))
+            return fail(w, QW_EDUP, "%s: model '%s' would contain the existing cell '%s'", p->name, name,
+                        w->cells[i].path);
+    }
+    if (!grow((void **) &p->models, &p->capmodels, p->nmodels + 1, sizeof *p->models)) return QW_ENOMEM;
+    Model *m = &p->models[p->nmodels];
+    memset(m, 0, sizeof *m);
+    if (!(m->name = dupstr(name))) return QW_ENOMEM;
+    bool first = p->nmodels == 0;
+    if (qn_new_group(w->net, first, &m->group) != QN_OK) return QW_ENOMEM;
+    if (first) p->active = 0;
+    p->nmodels++;
+    return QW_OK;
+}
+
+QwStatus qw_model_begin(QWorld *w, QwPhen pid, const char *model)
+{
+    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
+    Phen *p = &w->phens[pid];
+    int m = find_model(p, model, strlen(model));
+    if (m == NO_MODEL) return fail(w, QW_ENAME, "%s: no model '%s'", p->name, model);
+    qn_set_group(w->net, p->models[m].group);
+    return QW_OK;
+}
+
+void qw_model_end(QWorld *w) { qn_set_group(w->net, 0); }
+
+const char *qw_active_model(const QWorld *w, QwPhen pid)
+{
+    if (pid >= w->nphens || w->phens[pid].active == NO_MODEL) return NULL;
+    return w->phens[pid].models[w->phens[pid].active].name;
 }
 
 QwStatus qw_find(const QWorld *w, const char *path, QnCell *out)
@@ -397,19 +494,23 @@ QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCel
     QnCell dup;
     if (qw_find(w, path, &dup) == QW_OK) return fail(w, QW_EDUP, "cell '%s' already exists", path);
     if (kind >= w->nkinds) return fail(w, QW_ENAME, "cell '%s': no such kind", path);
+    const Phen *p = &w->phens[owner];
+    const char *second = dot + 1, *dot2 = strchr(second, '.');
+    int model = find_model(p, second, dot2 ? (size_t) (dot2 - second) : strlen(second));
+    if (model != NO_MODEL && !dot2) return fail(w, QW_ENAME, "cell path '%s' is the name of a model", path);
     const Kind *k = &w->kinds[kind];
     if (k->conserved && (!qi_is_point(base) || base.lo == Q_NINF || base.hi == Q_INF))
         return fail(w, QW_ESTOCK, "stock '%s' needs an exact value", path);
+    if (k->conserved && model != NO_MODEL && model != p->active && base.lo != 0)
+        return fail(w, QW_ESTOCK, "stock '%s' belongs to an inactive model, so it must be zero", path);
     if (!grow((void **) &w->cells, &w->capcells, w->ncells + 1, sizeof *w->cells)) return QW_ENOMEM;
     size_t need = w->ncells + 1;
-    size_t cap = w->capstage;
-    if (need > cap) {
-        if (!grow((void **) &w->delta, &cap, need, sizeof *w->delta)) return QW_ENOMEM;
-        cap = w->capstage;
-        if (!grow((void **) &w->wval, &cap, need, sizeof *w->wval)) return QW_ENOMEM;
-        cap = w->capstage;
-        if (!grow((void **) &w->written, &cap, need, sizeof *w->written)) return QW_ENOMEM;
-        w->capstage = cap;
+    if (need > w->capstage) {
+        size_t c1 = w->capstage, c2 = w->capstage, c3 = w->capstage;
+        if (!grow((void **) &w->delta, &c1, need, sizeof *w->delta)) return QW_ENOMEM;
+        if (!grow((void **) &w->wval, &c2, need, sizeof *w->wval)) return QW_ENOMEM;
+        if (!grow((void **) &w->written, &c3, need, sizeof *w->written)) return QW_ENOMEM;
+        w->capstage = c1;
     }
     QnCell c;
     QnStatus s = qn_cell(w->net, &k->type, base, &c);
@@ -419,6 +520,7 @@ QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCel
     if (!(ci->path = dupstr(path))) return QW_ENOMEM;
     ci->kind = kind;
     ci->owner = owner;
+    ci->model = model;
     w->delta[c] = w->wval[c] = 0;
     w->written[c] = false;
     w->ncells++;
@@ -431,7 +533,7 @@ QwStatus qw_connect(QWorld *w, QwPhen pid, const char *port, const char *target)
     if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
     Phen *p = &w->phens[pid];
     if (!valid_name(port)) return fail(w, QW_ENAME, "%s: invalid port name '%s'", p->name, port);
-    if (p->k) return fail(w, QW_EKERNEL, "%s: connect ports before the kernel is attached", p->name);
+    if (p->base.k) return fail(w, QW_EKERNEL, "%s: connect ports before a kernel is attached", p->name);
     for (size_t i = 0; i < p->nports; i++)
         if (!strcmp(p->ports[i].port, port)) return fail(w, QW_EDUP, "%s: port '%s' already connected", p->name, port);
     if (!grow((void **) &p->ports, &p->capports, p->nports + 1, sizeof *p->ports)) return QW_ENOMEM;
@@ -441,68 +543,117 @@ QwStatus qw_connect(QWorld *w, QwPhen pid, const char *port, const char *target)
     return QW_OK;
 }
 
-/* The cell path for a slot: through a connected port, or under the phenomenon. */
-static void slot_path(const Phen *p, const char *slot, char *buf, size_t len)
+QwStatus qw_port(QWorld *w, QwPhen pid, const char *port, const char *model, const char *target)
 {
-    for (size_t i = 0; i < p->nports; i++) {
-        size_t n = strlen(p->ports[i].port);
-        if (!strncmp(slot, p->ports[i].port, n) && slot[n] == '.') {
-            snprintf(buf, len, "%s.%s", p->ports[i].target, slot + n + 1);
+    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
+    Phen *p = &w->phens[pid];
+    if (!valid_name(port)) return fail(w, QW_ENAME, "%s: invalid port name '%s'", p->name, port);
+    int m = find_model(p, model, strlen(model));
+    if (m == NO_MODEL) return fail(w, QW_ENAME, "%s: no model '%s'", p->name, model);
+    for (size_t i = 0; i < p->npmaps; i++)
+        if (!strcmp(p->pmaps[i].port, port) && p->pmaps[i].model == m)
+            return fail(w, QW_EDUP, "%s: port '%s' already mapped for model '%s'", p->name, port, model);
+    if (!grow((void **) &p->pmaps, &p->cappmaps, p->npmaps + 1, sizeof *p->pmaps)) return QW_ENOMEM;
+    PortMap *pm = &p->pmaps[p->npmaps];
+    if (!(pm->port = dupstr(port)) || !(pm->target = dupstr(target))) return QW_ENOMEM;
+    pm->model = m;
+    p->npmaps++;
+    return QW_OK;
+}
+
+/* "P.port.rest" becomes "<target>.rest" when P maps `port` for its active
+ * model. Sets *via when a mapping applied. */
+static void resolve_ports(const QWorld *w, const char *path, char *out, size_t len, bool *via)
+{
+    const char *dot = strchr(path, '.');
+    QwPhen pid;
+    if (dot && find_phen(w, path, (size_t) (dot - path), &pid)) {
+        const Phen *p = &w->phens[pid];
+        const char *port = dot + 1, *rest = strchr(port, '.');
+        size_t plen = rest ? (size_t) (rest - port) : strlen(port);
+        for (size_t i = 0; i < p->npmaps; i++) {
+            const PortMap *pm = &p->pmaps[i];
+            if (pm->model == p->active && strlen(pm->port) == plen && !memcmp(pm->port, port, plen)) {
+                snprintf(out, len, "%s%s", pm->target, rest ? rest : "");
+                *via = true;
+                return;
+            }
+        }
+    }
+    snprintf(out, len, "%s", path);
+}
+
+/* The cell path for a slot of a kernel attached to phenomenon p, in model m
+ * (or NO_MODEL), with extra connections first (used by map kernels). */
+static void slot_path(const QWorld *w, const Phen *p, int m, const Port *extra, size_t nextra, const char *slot,
+                      char *out, size_t len, bool *via)
+{
+    char raw[512];
+    for (size_t pass = 0; pass < 2; pass++) {
+        const Port *ports = pass == 0 ? extra : p->ports;
+        size_t n = pass == 0 ? nextra : p->nports;
+        for (size_t i = 0; i < n; i++) {
+            size_t pl = strlen(ports[i].port);
+            if (!strncmp(slot, ports[i].port, pl) && slot[pl] == '.') {
+                snprintf(raw, sizeof raw, "%s.%s", ports[i].target, slot + pl + 1);
+                resolve_ports(w, raw, out, len, via);
+                return;
+            }
+        }
+    }
+    QnCell c;
+    if (m != NO_MODEL) {
+        snprintf(raw, sizeof raw, "%s.%s.%s", p->name, p->models[m].name, slot);
+        if (qw_find(w, raw, &c) == QW_OK) {
+            snprintf(out, len, "%s", raw);
             return;
         }
     }
-    snprintf(buf, len, "%s.%s", p->name, slot);
-}
-
-static void narrow_trampoline(QNet *net, void *ctx, const QnCell *cells, size_t n)
-{
-    (void) net;
-    (void) cells;
-    (void) n;
-    NarrowCtx *nc = ctx;
-    QWorld *w = nc->w;
-    Phen *p = &w->phens[nc->id];
-    QkCall call = { w, nc->id, M_NARROW, 0, { 0 } };
-    p->k->narrow(p->inst, &call);
-    if (call.err && !w->narrow_failed) {
-        w->narrow_failed = true;
-        snprintf(w->narrow_msg, sizeof w->narrow_msg, "%s (%s): %s", p->name, p->k->name, call.msg);
-    }
+    snprintf(raw, sizeof raw, "%s.%s", p->name, slot);
+    resolve_ports(w, raw, out, len, via);
 }
 
 static bool is_stock_role(QkRole r) { return r == QK_STOCK || r == QK_LINK; }
 
-QwStatus qw_attach(QWorld *w, QwPhen pid, const QkKernel *k)
+static QwStatus check_contract(QWorld *w, const char *pn, const QkKernel *k)
 {
-    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
-    Phen *p = &w->phens[pid];
-    const char *pn = p->name;
-    if (p->k) return fail(w, QW_EKERNEL, "%s: already has a kernel", pn);
     if (k->abi_version != QK_ABI_VERSION || k->size < sizeof(QkKernel))
         return fail(w, QW_EKERNEL, "%s: kernel '%s' has interface version %u, expected %u", pn, k->name,
                     k->abi_version, QK_ABI_VERSION);
     if (k->qr_version != QR_VERSION)
         return fail(w, QW_EKERNEL, "%s: kernel '%s' expects random version %u", pn, k->name, k->qr_version);
-    if (k->flags & (QK_MAP | QK_RATES))
-        return fail(w, QW_EKERNEL, "%s: kernel '%s': map and rate kernels are not supported yet", pn, k->name);
+    if (k->flags & QK_RATES) return fail(w, QW_EKERNEL, "%s: kernel '%s': rate kernels are not supported yet", pn, k->name);
     if ((k->flags & QK_EVOLVE) && (!k->predict || !k->advance))
         return fail(w, QW_EKERNEL, "%s: kernel '%s' is an evolution kernel without predict or advance", pn, k->name);
     if ((k->flags & QK_NARROW) && !k->narrow)
         return fail(w, QW_EKERNEL, "%s: kernel '%s' is a narrowing kernel without narrow", pn, k->name);
+    if ((k->flags & QK_MAP) && !k->map)
+        return fail(w, QW_EKERNEL, "%s: kernel '%s' is a map kernel without map", pn, k->name);
+    return QW_OK;
+}
 
-    QnCell *bind = calloc(k->nslots ? k->nslots : 1, sizeof *bind);
-    QConv *ts = calloc(k->nslots ? k->nslots : 1, sizeof *ts);
-    QConv *tc = calloc(k->nslots ? k->nslots : 1, sizeof *tc);
+/* Resolves and checks every slot and transfer of kernel k for phenomenon pid
+ * in model m. On success, the arrays are new and belong to the caller. */
+static QwStatus bind_kernel(QWorld *w, QwPhen pid, int m, const QkKernel *k, const Port *extra, size_t nextra,
+                            QnCell **bind_out, QConv **ts_out, QConv **tc_out, bool *via_out)
+{
+    const Phen *p = &w->phens[pid];
+    const char *pn = p->name;
+    size_t n = k->nslots ? k->nslots : 1;
+    QnCell *bind = calloc(n, sizeof *bind);
+    QConv *ts = calloc(n, sizeof *ts), *tc = calloc(n, sizeof *tc);
     QwStatus st = QW_OK;
+    bool via_any = false;
     if (!bind || !ts || !tc) {
         st = QW_ENOMEM;
         goto out;
     }
-
     for (uint32_t i = 0; i < k->nslots; i++) {
         const QkSlot *s = &k->slots[i];
         char path[512];
-        slot_path(p, s->name, path, sizeof path);
+        bool via = false;
+        slot_path(w, p, m, extra, nextra, s->name, path, sizeof path, &via);
+        via_any |= via;
         QnCell c;
         if (qw_find(w, path, &c) != QW_OK) {
             st = fail(w, QW_ENAME, "%s: slot '%s' of kernel '%s' needs the cell '%s', which does not exist", pn,
@@ -553,7 +704,6 @@ QwStatus qw_attach(QWorld *w, QwPhen pid, const QkKernel *k)
         qtype_conv_plan(&slot_type, &kind->type, &tc[i]);
         bind[i] = c;
     }
-
     for (uint32_t i = 0; i < k->ntransfers; i++) {
         const QkTransfer *t = &k->transfers[i];
         uint32_t ends[2] = { t->from, t->to };
@@ -577,43 +727,99 @@ QwStatus qw_attach(QWorld *w, QwPhen pid, const QkKernel *k)
             goto out;
         }
     }
+    if ((k->flags & QK_NARROW) && via_any) {
+        st = fail(w, QW_EKERNEL, "%s: narrowing kernel '%s' reads through a port that depends on a model; not supported yet",
+                  pn, k->name);
+        goto out;
+    }
+    *bind_out = bind;
+    *ts_out = ts;
+    *tc_out = tc;
+    *via_out = via_any;
+    return QW_OK;
+out:
+    free(bind);
+    free(ts);
+    free(tc);
+    return st;
+}
 
-    p->k = k;
-    p->bind = bind;
-    p->to_slot = ts;
-    p->to_cell = tc;
-    bind = NULL;
-    ts = tc = NULL;
-    p->predicted = false;
+static Att *att_of(QWorld *w, QwPhen pid, int m) { return m == NO_MODEL ? &w->phens[pid].base : &w->phens[pid].models[m].att; }
 
+static void narrow_trampoline(QNet *net, void *ctx, const QnCell *cells, size_t n)
+{
+    (void) net;
+    (void) cells;
+    (void) n;
+    NarrowCtx *nc = ctx;
+    QWorld *w = nc->w;
+    Phen *p = &w->phens[nc->id];
+    if (nc->model != NO_MODEL && nc->model != p->active) return;
+    Att *a = att_of(w, nc->id, nc->model);
+    QkCall call = { w, nc->id, a, M_NARROW, 0, { 0 } };
+    a->k->narrow(a->inst, &call);
+    if (call.err && !w->narrow_failed) {
+        w->narrow_failed = true;
+        snprintf(w->narrow_msg, sizeof w->narrow_msg, "%s (%s): %s", p->name, a->k->name, call.msg);
+    }
+}
+
+static QwStatus attach(QWorld *w, QwPhen pid, int m, const QkKernel *k)
+{
+    Phen *p = &w->phens[pid];
+    const char *pn = p->name;
+    Att *a = att_of(w, pid, m);
+    if (a->k) return fail(w, QW_EKERNEL, "%s: already has a kernel%s%s", pn, m == NO_MODEL ? "" : " in model ",
+                          m == NO_MODEL ? "" : p->models[m].name);
+    QwStatus st = check_contract(w, pn, k);
+    if (st) return st;
+    if (k->flags & QK_MAP) return fail(w, QW_EKERNEL, "%s: kernel '%s' is a map kernel; use qw_switch", pn, k->name);
+    QnCell *bind;
+    QConv *ts, *tc;
+    bool via;
+    if ((st = bind_kernel(w, pid, m, k, NULL, 0, &bind, &ts, &tc, &via))) return st;
+    a->k = k;
+    a->bind = bind;
+    a->to_slot = ts;
+    a->to_cell = tc;
+    a->via_model = via;
+    a->predicted = false;
     if (k->create) {
-        QkCall call = { w, pid, M_CREATE, 0, { 0 } };
-        if (k->create(&w->host, &call, &p->inst) != QK_OK || call.err) {
+        QkCall call = { w, pid, a, M_CREATE, 0, { 0 } };
+        if (k->create(k, &w->host, &call, &a->inst) != QK_OK || call.err) {
             st = fail(w, QW_EKERNEL, "%s: kernel '%s' failed to start: %s", pn, k->name, call.msg);
-            /* the kernel did not start, so it is not attached */
-            free(p->bind);
-            free(p->to_slot);
-            free(p->to_cell);
-            p->bind = NULL;
-            p->to_slot = p->to_cell = NULL;
-            p->inst = NULL;
-            p->k = NULL;
-            goto out;
+            a->inst = NULL;
+            a->k = NULL;   /* free_att must not call destroy */
+            free_att(a);
+            return st;
         }
     }
     if (k->flags & QK_NARROW) {
         if (!grow((void **) &w->nctx, &w->capnctx, w->nnctx + 1, sizeof *w->nctx)) return QW_ENOMEM;
         NarrowCtx *nc = malloc(sizeof *nc);
         if (!nc) return QW_ENOMEM;
-        *nc = (NarrowCtx) { w, pid };
+        *nc = (NarrowCtx) { w, pid, m };
         w->nctx[w->nnctx++] = nc;
-        if (qn_custom(w->net, p->bind, k->nslots, narrow_trampoline, nc) != QN_OK) return QW_ENOMEM;
+        if (m != NO_MODEL) qn_set_group(w->net, p->models[m].group);
+        QnStatus s = qn_custom(w->net, a->bind, k->nslots, narrow_trampoline, nc);
+        qn_set_group(w->net, 0);
+        if (s != QN_OK) return QW_ENOMEM;
     }
-out:
-    free(bind);
-    free(ts);
-    free(tc);
-    return st;
+    return QW_OK;
+}
+
+QwStatus qw_attach(QWorld *w, QwPhen pid, const QkKernel *k)
+{
+    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
+    return attach(w, pid, NO_MODEL, k);
+}
+
+QwStatus qw_model_attach(QWorld *w, QwPhen pid, const char *model, const QkKernel *k)
+{
+    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
+    int m = find_model(&w->phens[pid], model, strlen(model));
+    if (m == NO_MODEL) return fail(w, QW_ENAME, "%s: no model '%s'", w->phens[pid].name, model);
+    return attach(w, pid, m, k);
 }
 
 /* --- running ------------------------------------------------------------------------- */
@@ -633,71 +839,78 @@ static QwStatus settle(QWorld *w)
     return QW_OK;
 }
 
-static bool evolving(const Phen *p) { return p->k && (p->k->flags & QK_EVOLVE); }
-
-/* Every input inside its valid range, in the slot's scale */
-static QwStatus check_valid(QWorld *w, Phen *p)
+/* The running kernels of a phenomenon: its base kernel, then its active
+ * model's kernel. */
+static Att *running(QWorld *w, size_t pid, int which)
 {
-    for (uint32_t i = 0; i < p->k->nslots; i++) {
-        const QkSlot *s = &p->k->slots[i];
+    Phen *p = &w->phens[pid];
+    Att *a = which == 0 ? &p->base : (p->active == NO_MODEL ? NULL : &p->models[p->active].att);
+    return a && a->k && (a->k->flags & QK_EVOLVE) ? a : NULL;
+}
+
+static QwStatus check_valid(QWorld *w, const Phen *p, const Att *a)
+{
+    for (uint32_t i = 0; i < a->k->nslots; i++) {
+        const QkSlot *s = &a->k->slots[i];
         if (s->role == QK_LINK) continue;
-        QInterval v = qi_conv(qn_get(w->net, p->bind[i]), &p->to_slot[i]);
+        QInterval v = qi_conv(qn_get(w->net, a->bind[i]), &a->to_slot[i]);
         if (!qi_subset(v, s->valid)) {
-            char a[64], b[64];
-            q_format_decimal(v.lo, s->scale, a, sizeof a);
-            q_format_decimal(v.hi, s->scale, b, sizeof b);
-            return fail(w, QW_EINAPPLICABLE, "%s: kernel '%s' is not valid for '%s' in [%s, %s]", p->name, p->k->name,
-                        w->cells[p->bind[i]].path, a, b);
+            char lo[64], hi[64];
+            q_format_decimal(v.lo, s->scale, lo, sizeof lo);
+            q_format_decimal(v.hi, s->scale, hi, sizeof hi);
+            return fail(w, QW_EINAPPLICABLE, "%s: kernel '%s' is not valid for '%s' in [%s, %s]", p->name, a->k->name,
+                        w->cells[a->bind[i]].path, lo, hi);
         }
     }
     return QW_OK;
 }
 
-static QwStatus kernel_failed(QWorld *w, Phen *p, const char *what, const QkCall *call, QkResult r)
+static QwStatus kernel_failed(QWorld *w, const Phen *p, const Att *a, const char *what, const QkCall *call, QkResult r)
 {
     if (r == QK_INAPPLICABLE)
-        return fail(w, QW_EINAPPLICABLE, "%s: kernel '%s' is not applicable (%s)", p->name, p->k->name, what);
-    return fail(w, QW_EKERNEL, "%s: kernel '%s' failed in %s: %s", p->name, p->k->name, what,
+        return fail(w, QW_EINAPPLICABLE, "%s: kernel '%s' is not applicable (%s)", p->name, a->k->name, what);
+    return fail(w, QW_EKERNEL, "%s: kernel '%s' failed in %s: %s", p->name, a->k->name, what,
                 call->err ? call->msg : "kernel error");
 }
 
-static QwStatus predict(QWorld *w, QwPhen id)
+static QwStatus predict(QWorld *w, QwPhen id, Att *a)
 {
     Phen *p = &w->phens[id];
-    QwStatus st = check_valid(w, p);
+    QwStatus st = check_valid(w, p, a);
     if (st) return st;
-    p->nas = 0;
-    QkCall call = { w, id, M_PREDICT, 0, { 0 } };
+    a->nas = 0;
+    QkCall call = { w, id, a, M_PREDICT, 0, { 0 } };
     QkPrediction pr = { QK_NO_TIME, QK_NO_TIME, QK_NO_TIME };
-    QkResult r = p->k->predict(p->inst, &call, &pr);
+    QkResult r = a->k->predict(a->inst, &call, &pr);
     p->predicts++;
-    if (r != QK_OK || call.err) return kernel_failed(w, p, "predict", &call, r);
+    if (r != QK_OK || call.err) return kernel_failed(w, p, a, "predict", &call, r);
     if (pr.horizon <= w->now)
-        return fail(w, QW_EKERNEL, "%s: kernel '%s' predicted a horizon that is not after now", p->name, p->k->name);
+        return fail(w, QW_EKERNEL, "%s: kernel '%s' predicted a horizon that is not after now", p->name, a->k->name);
     if (pr.event_lo != QK_NO_TIME && (pr.event_lo <= w->now || pr.event_hi < pr.event_lo))
-        return fail(w, QW_EKERNEL, "%s: kernel '%s' predicted an invalid event time", p->name, p->k->name);
-    p->pred = pr;
-    p->predicted = true;
+        return fail(w, QW_EKERNEL, "%s: kernel '%s' predicted an invalid event time", p->name, a->k->name);
+    a->pred = pr;
+    a->predicted = true;
     return QW_OK;
 }
 
-/* After a boundary or an input: drop each prediction that has expired or
- * whose assumptions no longer hold. */
+/* After a boundary, an input or a switch: drop each prediction that has
+ * expired or whose assumptions no longer hold. */
 static void invalidate(QWorld *w)
 {
-    for (size_t i = 0; i < w->nphens; i++) {
-        Phen *p = &w->phens[i];
-        if (!evolving(p) || !p->predicted) continue;
-        if (w->now >= p->pred.horizon || w->now >= p->pred.event_lo) {
-            p->predicted = false;
-            continue;
-        }
-        for (size_t j = 0; j < p->nas; j++)
-            if (!qi_subset(qn_get(w->net, p->as[j].cell), p->as[j].range)) {
-                p->predicted = false;
-                break;
+    for (size_t i = 0; i < w->nphens; i++)
+        for (int which = 0; which < 2; which++) {
+            Att *a = running(w, i, which);
+            if (!a || !a->predicted) continue;
+            if (w->now >= a->pred.horizon || w->now >= a->pred.event_lo) {
+                a->predicted = false;
+                continue;
             }
-    }
+            for (size_t j = 0; j < a->nas; j++)
+                if (!qi_subset(qn_get(w->net, a->as[j].cell), a->as[j].range)) {
+                    a->predicted = false;
+                    break;
+                }
+        }
 }
 
 static QwStatus commit(QWorld *w)
@@ -726,29 +939,33 @@ QwStatus qw_run(QWorld *w, int64_t until)
     if (st) return st;
     while (w->now < until) {
         int64_t b = until;
-        for (size_t i = 0; i < w->nphens; i++) {
-            Phen *p = &w->phens[i];
-            if (!evolving(p)) continue;
-            if (!p->predicted && (st = predict(w, (QwPhen) i))) return st;
-            if (p->pred.horizon < b) b = p->pred.horizon;
-            if (p->pred.event_lo < b) b = p->pred.event_lo;
-        }
-
-        for (size_t i = 0; i < w->nphens; i++) {
-            Phen *p = &w->phens[i];
-            if (!evolving(p)) continue;
-            if ((st = check_valid(w, p))) return st;
-            QkCall call = { w, (QwPhen) i, M_ADVANCE, 0, { 0 } };
-            QkResult r = p->k->advance(p->inst, &call, b);
-            p->events++;
-            if (r != QK_OK || call.err) {
-                for (size_t c = 0; c < w->ncells; c++) {
-                    w->delta[c] = 0;
-                    w->written[c] = false;
-                }
-                return kernel_failed(w, p, "advance", &call, r);
+        for (size_t i = 0; i < w->nphens; i++)
+            for (int which = 0; which < 2; which++) {
+                Att *a = running(w, i, which);
+                if (!a) continue;
+                if (!a->predicted && (st = predict(w, (QwPhen) i, a))) return st;
+                if (a->pred.horizon < b) b = a->pred.horizon;
+                if (a->pred.event_lo < b) b = a->pred.event_lo;
             }
-        }
+
+        for (size_t i = 0; i < w->nphens; i++)
+            for (int which = 0; which < 2; which++) {
+                Att *a = running(w, i, which);
+                if (!a) continue;
+                Phen *p = &w->phens[i];
+                if ((st = check_valid(w, p, a))) {
+                    clear_staging(w);
+                    return st;
+                }
+                QkCall call = { w, (QwPhen) i, a, M_ADVANCE, 0, { 0 } };
+                QkResult r = a->k->advance(a->inst, &call, b);
+                a->events++;
+                w->advances++;
+                if (r != QK_OK || call.err) {
+                    clear_staging(w);
+                    return kernel_failed(w, p, a, "advance", &call, r);
+                }
+            }
         if ((st = commit(w))) return st;
         w->now = b;
         w->boundaries++;
@@ -758,6 +975,129 @@ QwStatus qw_run(QWorld *w, int64_t until)
     }
     return QW_OK;
 }
+
+/* --- switching models ---------------------------------------------------------------- */
+
+typedef struct { QnCell *bind; QConv *ts, *tc; bool via; } Binding;
+
+QwStatus qw_switch(QWorld *w, QwPhen pid, const char *model, const QkKernel *map)
+{
+    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
+    Phen *p = &w->phens[pid];
+    const char *pn = p->name;
+    int to = find_model(p, model, strlen(model)), from = p->active;
+    if (to == NO_MODEL) return fail(w, QW_ENAME, "%s: no model '%s'", pn, model);
+    if (to == from) return fail(w, QW_EDUP, "%s: model '%s' is already active", pn, model);
+    QwStatus st = check_contract(w, pn, map);
+    if (st) return st;
+    if (!(map->flags & QK_MAP)) return fail(w, QW_EKERNEL, "%s: kernel '%s' is not a map kernel", pn, map->name);
+    if ((st = settle(w))) return st;
+
+    /* 1. bind the map: from.* is the active model, to.* the new one */
+    char fromt[512], tot[512];
+    snprintf(fromt, sizeof fromt, "%s.%s", pn, p->models[from].name);
+    snprintf(tot, sizeof tot, "%s.%s", pn, p->models[to].name);
+    Port extra[2] = { { (char *) "from", fromt }, { (char *) "to", tot } };
+    Att ma;
+    memset(&ma, 0, sizeof ma);
+    ma.k = map;
+    if ((st = bind_kernel(w, pid, NO_MODEL, map, extra, 2, &ma.bind, &ma.to_slot, &ma.to_cell, &ma.via_model)))
+        return st;
+
+    /* 2. run it */
+    QkCall call = { w, pid, &ma, M_CREATE, 0, { 0 } };
+    if (map->create && map->create(map, &w->host, &call, &ma.inst) != QK_OK) {
+        st = fail(w, QW_EKERNEL, "%s: map kernel '%s' failed to start: %s", pn, map->name, call.msg);
+        ma.inst = NULL;
+        goto fail_map;
+    }
+    call.mode = M_MAP;
+    QkResult r = map->map(ma.inst, &call);
+    if (r != QK_OK || call.err) {
+        st = kernel_failed(w, p, &ma, "map", &call, r);
+        goto fail_map;
+    }
+
+    /* 3. every stock of the old model must now be exactly zero */
+    for (size_t c = 0; c < w->ncells; c++) {
+        if (w->cells[c].owner != pid || w->cells[c].model != from || !w->kinds[w->cells[c].kind].conserved) continue;
+        int64_t v;
+        if (qp_add(qn_base(w->net, (QnCell) c).lo, w->delta[c], &v) != Q_OK || v != 0) {
+            st = fail(w, QW_ESTOCK, "%s: map kernel '%s' left %lld quanta in the stock '%s'", pn, map->name,
+                      (long long) v, w->cells[c].path);
+            goto fail_map;
+        }
+    }
+
+    /* 4. make the new model active and bind every kernel again */
+    p->active = to;
+    size_t natt = 0;
+    for (size_t i = 0; i < w->nphens; i++) natt += 1 + w->phens[i].nmodels;
+    Binding *nb = calloc(natt, sizeof *nb);
+    if (!nb) {
+        st = QW_ENOMEM;
+        p->active = from;
+        goto fail_map;
+    }
+    size_t at = 0;
+    for (size_t i = 0; i < w->nphens && !st; i++)
+        for (int m = NO_MODEL; m < (int) w->phens[i].nmodels && !st; m++, at++) {
+            Att *a = att_of(w, (QwPhen) i, m);
+            if (a->k) st = bind_kernel(w, (QwPhen) i, m, a->k, NULL, 0, &nb[at].bind, &nb[at].ts, &nb[at].tc, &nb[at].via);
+        }
+    if (st) {
+        p->active = from;
+        for (size_t i = 0; i < natt; i++) {
+            free(nb[i].bind);
+            free(nb[i].ts);
+            free(nb[i].tc);
+        }
+        free(nb);
+        goto fail_map;
+    }
+    at = 0;
+    for (size_t i = 0; i < w->nphens; i++)
+        for (int m = NO_MODEL; m < (int) w->phens[i].nmodels; m++, at++) {
+            Att *a = att_of(w, (QwPhen) i, m);
+            if (!a->k) continue;
+            if (memcmp(a->bind, nb[at].bind, a->k->nslots * sizeof *a->bind)) a->predicted = false;
+            free(a->bind);
+            free(a->to_slot);
+            free(a->to_cell);
+            a->bind = nb[at].bind;
+            a->to_slot = nb[at].ts;
+            a->to_cell = nb[at].tc;
+            a->via_model = nb[at].via;
+        }
+    free(nb);
+    p->models[from].att.predicted = false;
+    p->models[to].att.predicted = false;
+
+    /* 5. commit, swap the propagator groups, and open a new epoch */
+    if ((st = commit(w))) goto done;
+    qn_group_enable(w->net, p->models[from].group, false);
+    qn_group_enable(w->net, p->models[to].group, true);
+    qn_begin_epoch(w->net);
+    w->switches++;
+    st = settle(w);
+    invalidate(w);
+done:
+    if (map->destroy && ma.inst) map->destroy(ma.inst);
+    ma.inst = NULL;
+    ma.k = NULL;
+    free_att(&ma);
+    return st;
+
+fail_map:
+    clear_staging(w);
+    if (map->destroy && ma.inst) map->destroy(ma.inst);
+    ma.inst = NULL;
+    ma.k = NULL;
+    free_att(&ma);
+    return st;
+}
+
+/* --- inputs and inspection ------------------------------------------------------------ */
 
 QwStatus qw_input(QWorld *w, const char *path, QInterval v)
 {
@@ -775,12 +1115,26 @@ QwStatus qw_input(QWorld *w, const char *path, QInterval v)
 
 QInterval qw_get(const QWorld *w, const char *path)
 {
+    char resolved[512];
+    bool via = false;
+    resolve_ports(w, path, resolved, sizeof resolved, &via);
     QnCell c;
-    if (qw_find(w, path, &c) != QW_OK) return qi_top();
+    if (qw_find(w, resolved, &c) != QW_OK) return qi_top();
     return qn_get(w->net, c);
 }
 
 uint64_t qw_predicts(const QWorld *w, QwPhen p) { return p < w->nphens ? w->phens[p].predicts : 0; }
+
+int64_t qw_total(const QWorld *w, QwKind kind)
+{
+    int64_t t = 0;
+    for (size_t c = 0; c < w->ncells; c++)
+        if (w->cells[c].kind == kind) {
+            int64_t v;
+            if (qp_add(t, qn_base(w->net, (QnCell) c).lo, &v) == Q_OK) t = v;
+        }
+    return t;
+}
 
 static uint64_t fnv(uint64_t h, uint64_t v)
 {
@@ -796,6 +1150,7 @@ uint64_t qw_hash(const QWorld *w)
     uint64_t h = 0xcbf29ce484222325ULL;
     h = fnv(h, (uint64_t) w->now);
     h = fnv(h, qn_epoch(w->net));
+    for (size_t i = 0; i < w->nphens; i++) h = fnv(h, (uint64_t) (int64_t) w->phens[i].active);
     for (size_t c = 0; c < w->ncells; c++) {
         QInterval b = qn_base(w->net, (QnCell) c);
         h = fnv(h, (uint64_t) b.lo);

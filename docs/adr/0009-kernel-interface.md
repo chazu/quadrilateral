@@ -144,7 +144,7 @@ typedef struct QkKernel {
     const QkTransfer *transfers;
     uint32_t          ntransfers;
 
-    QkResult (*create)(const QkHost *host, QkCall *call, QkInstance **out);
+    QkResult (*create)(const struct QkKernel *self, const QkHost *host, QkCall *call, QkInstance **out);
     void     (*destroy)(QkInstance *inst);
     QkResult (*predict)(QkInstance *inst, QkCall *call, QkPrediction *out);
     QkResult (*advance)(QkInstance *inst, QkCall *call, int64_t to);

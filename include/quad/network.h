@@ -38,6 +38,7 @@ typedef enum {
     QN_ESTAGED,         /* the cell already has a staged value for this boundary */
     QN_EPROPAGATING,    /* a non-monotonic call during propagation */
     QN_ENOMEM,
+    QN_EGROUP,          /* no such group */
 } QnStatus;
 
 const char *qn_status_str(QnStatus s);
@@ -64,6 +65,20 @@ QnStatus qn_quotient(QNet *net, QnCell z, QnCell x, QnCell y, QStatus *why);
  * it can only narrow. It runs again whenever one of `cells` narrows. */
 typedef void (*QnFn)(QNet *net, void *ctx, const QnCell *cells, size_t n);
 QnStatus qn_custom(QNet *net, const QnCell *cells, size_t n, QnFn fn, void *ctx);
+
+/* --- groups ------------------------------------------------------------------ */
+
+/* A group of propagators can be disabled, for example the propagators of an
+ * inactive model (ADR 0010). A disabled propagator never runs. Group 0 always
+ * exists and is enabled. New propagators join the current group. */
+typedef uint32_t QnGroup;
+
+QnStatus qn_new_group(QNet *net, bool enabled, QnGroup *out);
+void     qn_set_group(QNet *net, QnGroup g);   /* the group of new propagators */
+/* Enabling a group puts its propagators on the agenda. Not monotonic, so it
+ * is refused during propagation. */
+QnStatus qn_group_enable(QNet *net, QnGroup g, bool enabled);
+bool     qn_group_enabled(const QNet *net, QnGroup g);
 
 /* --- inside an epoch (monotonic) ------------------------------------------ */
 

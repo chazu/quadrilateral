@@ -15,9 +15,16 @@
  * This is the C-level host. Quadrilateral source will describe the same
  * things, and error messages already name cells by path (ADR 0007).
  *
- * The scheduler is the first version of ADR 0006: every evolving phenomenon
- * advances to one shared boundary. Each phenomenon has at most one kernel, so
- * each group of ADR 0009 section 9 has one member.
+ * A phenomenon can have models (ADR 0010). A model's cells have paths under
+ * the model, "roomB.fine.c0.energy", and one model is active. qw_port maps a
+ * port of the phenomenon to a path prefix for each model, so that another
+ * phenomenon can connect to "roomB.west" and reach the active model's cells.
+ * qw_switch changes the active model with a map kernel.
+ *
+ * The scheduler is the first version of ADR 0006: every evolving kernel
+ * advances to one shared boundary. A phenomenon runs at most two kernels:
+ * its own, and its active model's. Each group of ADR 0009 section 9 has one
+ * member.
  */
 
 #include <stdbool.h>
@@ -63,6 +70,26 @@ const char *qw_cell_path(const QWorld *w, QnCell c);
 QwStatus qw_connect(QWorld *w, QwPhen p, const char *port, const char *target);
 QwStatus qw_attach(QWorld *w, QwPhen p, const QkKernel *k);
 
+/* --- models (ADR 0010) ----------------------------------------------------------- */
+
+/* Declares a model. The first model of a phenomenon is active. A stock of an
+ * inactive model must start at zero. */
+QwStatus qw_model(QWorld *w, QwPhen p, const char *model);
+/* Propagators added between begin and end belong to the model, and run only
+ * while it is active. */
+QwStatus qw_model_begin(QWorld *w, QwPhen p, const char *model);
+void     qw_model_end(QWorld *w);
+/* A model's kernel. Its slot "x" binds to "<p>.<model>.x" if that cell
+ * exists, and otherwise to "<p>.x". */
+QwStatus qw_model_attach(QWorld *w, QwPhen p, const char *model, const QkKernel *k);
+/* In `model`, the port "<p>.<port>" leads to the path prefix `target`. */
+QwStatus qw_port(QWorld *w, QwPhen p, const char *port, const char *model, const char *target);
+/* Switches to `model` at the current time. The map kernel's slots "from.x"
+ * and "to.x" bind to the old and the new model. Every stock of the old model
+ * must be exactly zero afterwards, or the switch fails and nothing changes. */
+QwStatus qw_switch(QWorld *w, QwPhen p, const char *model, const QkKernel *map);
+const char *qw_active_model(const QWorld *w, QwPhen p);   /* NULL without models */
+
 /* --- running ------------------------------------------------------------------- */
 
 /* Advances the world to `until`, boundary by boundary. */
@@ -74,8 +101,11 @@ QwStatus qw_input(QWorld *w, const char *path, QInterval v);
 
 int64_t   qw_now(const QWorld *w);
 uint64_t  qw_boundaries(const QWorld *w);
-QInterval qw_get(const QWorld *w, const char *path);     /* the top interval if unknown */
+QInterval qw_get(const QWorld *w, const char *path);     /* through ports; the top interval if unknown */
 uint64_t  qw_predicts(const QWorld *w, QwPhen p);        /* predict calls so far */
+uint64_t  qw_advances(const QWorld *w);                  /* advance calls so far */
+uint64_t  qw_switches(const QWorld *w);
+int64_t   qw_total(const QWorld *w, QwKind kind);        /* the sum of every cell of a kind */
 
 /* A hash of all authoritative state: the clock, the epoch, and every cell's
  * base. Two runs with the same inputs must give the same hash (ADR 0004). */
