@@ -39,6 +39,7 @@ typedef enum {
     QN_EPROPAGATING,    /* a non-monotonic call during propagation */
     QN_ENOMEM,
     QN_EGROUP,          /* no such group */
+    QN_EDOMAIN,         /* an interval operation on a set cell, or the reverse */
 } QnStatus;
 
 const char *qn_status_str(QnStatus s);
@@ -66,6 +67,32 @@ QnStatus qn_quotient(QNet *net, QnCell z, QnCell x, QnCell y, QStatus *why);
 typedef void (*QnFn)(QNet *net, void *ctx, const QnCell *cells, size_t n);
 QnStatus qn_custom(QNet *net, const QnCell *cells, size_t n, QnFn fn, void *ctx);
 
+/* --- finite sets of atoms (ADR 0012) --------------------------------------------- */
+
+/* A set cell holds the atoms of an enumeration kind that are still possible,
+ * as a mask: atom i is bit i. Narrowing is a bitwise AND, and an empty mask is
+ * a contradiction. A set cell has the same 16-byte storage as an interval
+ * cell: qn_get and qn_base give the mask in `lo` and the universe in `hi`, so
+ * code that only copies values works for both domains. */
+#define QN_MAXATOMS 64
+
+QnStatus qn_set_cell(QNet *net, uint32_t kind, unsigned natoms, uint64_t base, QnCell *out);
+bool     qn_is_set(const QNet *net, QnCell c);
+uint64_t qn_get_set(const QNet *net, QnCell c);     /* 0 for an interval cell */
+uint64_t qn_base_set(const QNet *net, QnCell c);
+uint64_t qn_universe(const QNet *net, QnCell c);    /* 0 for an interval cell */
+QnStatus qn_tell_set(QNet *net, QnCell c, uint64_t allowed);
+QnStatus qn_stage_set(QNet *net, QnCell c, uint64_t mask);
+
+/* a = b, for two set cells of the same kind */
+QnStatus qn_set_equal(QNet *net, QnCell a, QnCell b);
+/* x = table[a]: a is a set cell with n atoms, x an interval cell, and
+ * table[i] is atom i's interval in x's scale. The network copies the table. */
+QnStatus qn_element(QNet *net, QnCell x, QnCell a, const QInterval *table, size_t n);
+/* b <=> (x in range): b is a boolean set cell (atom 0 false, atom 1 true) and
+ * x an interval cell; range is in x's scale. */
+QnStatus qn_reify_in(QNet *net, QnCell b, QnCell x, QInterval range);
+
 /* --- groups ------------------------------------------------------------------ */
 
 /* A group of propagators can be disabled, for example the propagators of an
@@ -87,7 +114,7 @@ QInterval    qn_get(const QNet *net, QnCell c);
 QInterval    qn_base(const QNet *net, QnCell c);
 const QType *qn_type(const QNet *net, QnCell c);
 
-/* Narrows c to c ∩ v. QN_CONTRADICTION if the result is empty; then the cell
+/* Narrows the interval cell c to c ∩ v. QN_CONTRADICTION if the result is empty; then the cell
  * keeps its value, the network is contradicted until the next epoch, and
  * every later tell returns QN_CONTRADICTION. */
 QnStatus qn_tell(QNet *net, QnCell c, QInterval v);

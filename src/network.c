@@ -16,13 +16,14 @@ const char *qn_status_str(QnStatus s)
     case QN_EPROPAGATING: return "non-monotonic call during propagation";
     case QN_ENOMEM:       return "out of memory";
     case QN_EGROUP:       return "no such group";
+    case QN_EDOMAIN:      return "operation does not fit the cell's domain";
     }
     return "unknown status";
 }
 
 /* --- storage ----------------------------------------------------------------- */
 
-typedef enum { P_SUM, P_PRODUCT, P_EQUAL, P_CUSTOM } PKind;
+typedef enum { P_SUM, P_PRODUCT, P_EQUAL, P_CUSTOM, P_SETEQ, P_ELEMENT, P_REIFY } PKind;
 
 typedef struct {
     PKind  kind;
@@ -32,14 +33,19 @@ typedef struct {
     QConv  k[6];          /* plans; see the run functions */
     QnFn   fn;            /* custom */
     void  *ctx;
-    size_t first, n;      /* custom: cells in net->ccells[first .. first + n) */
+    size_t first, n;      /* custom: cells in net->ccells[first .. first + n);
+                             element: net->tables[first .. first + n) */
+    QInterval range;      /* reify */
 } Prop;
 
 typedef struct { uint32_t *ids; size_t n, cap; } List;
 
+enum { D_INTERVAL, D_SET };
+
 typedef struct {
     QInterval base, cur, staged;
     bool      has_staged;
+    uint8_t   domain;
     QType     type;
     List      watchers;   /* propagators, in the order they were added */
 } Cell;
@@ -51,6 +57,8 @@ struct QNet {
     size_t   nprops, capprops;
     QnCell  *ccells;      /* the cell lists of custom propagators */
     size_t   nccells, capccells;
+    QInterval *tables;    /* the tables of element propagators */
+    size_t   ntables, captables;
 
     uint32_t *queue;      /* a ring of propagator ids, capacity capprops */
     size_t    qhead, qcount;
@@ -96,6 +104,7 @@ void qn_free(QNet *net)
     free(net->cells);
     free(net->props);
     free(net->ccells);
+    free(net->tables);
     free(net->queue);
     free(net->groups);
     free(net);
@@ -163,22 +172,88 @@ QInterval qn_get(const QNet *net, QnCell c) { return valid_cell(net, c) ? net->c
 QInterval qn_base(const QNet *net, QnCell c) { return valid_cell(net, c) ? net->cells[c].base : qi_top(); }
 const QType *qn_type(const QNet *net, QnCell c) { return valid_cell(net, c) ? &net->cells[c].type : NULL; }
 
+/* A set cell's storage: the mask in lo, the universe in hi, copied bit for bit. */
+static uint64_t word(int64_t v)
+{
+    uint64_t u;
+    memcpy(&u, &v, sizeof u);
+    return u;
+}
+
+static QInterval set_value(uint64_t mask, uint64_t universe)
+{
+    QInterval v;
+    memcpy(&v.lo, &mask, sizeof mask);
+    memcpy(&v.hi, &universe, sizeof universe);
+    return v;
+}
+
+static bool is_set(const QNet *net, QnCell c) { return net->cells[c].domain == D_SET; }
+
+static void contradict(QNet *net, QnCell c)
+{
+    net->contradicted = true;
+    net->conflict = c;
+    clear_queue(net);
+}
+
+static void wake(QNet *net, const Cell *cell)
+{
+    for (size_t i = 0; i < cell->watchers.n; i++) enqueue(net, cell->watchers.ids[i]);
+}
+
+QnStatus qn_set_cell(QNet *net, uint32_t kind, unsigned natoms, uint64_t base, QnCell *out)
+{
+    if (natoms < 1 || natoms > QN_MAXATOMS) return QN_EVALUE;
+    uint64_t universe = natoms == 64 ? ~(uint64_t) 0 : ((uint64_t) 1 << natoms) - 1;
+    if (!base || (base & ~universe)) return QN_EVALUE;
+    if (!grow((void **) &net->cells, &net->capcells, net->ncells + 1, sizeof(Cell))) return QN_ENOMEM;
+    Cell *c = &net->cells[net->ncells];
+    memset(c, 0, sizeof *c);
+    c->base = c->cur = set_value(base, universe);
+    c->type = qtype_make(kind, qdim_none(), 0);
+    c->domain = D_SET;
+    *out = (QnCell) net->ncells++;
+    return QN_OK;
+}
+
+bool qn_is_set(const QNet *net, QnCell c) { return valid_cell(net, c) && is_set(net, c); }
+uint64_t qn_get_set(const QNet *net, QnCell c) { return qn_is_set(net, c) ? word(net->cells[c].cur.lo) : 0; }
+uint64_t qn_base_set(const QNet *net, QnCell c) { return qn_is_set(net, c) ? word(net->cells[c].base.lo) : 0; }
+uint64_t qn_universe(const QNet *net, QnCell c) { return qn_is_set(net, c) ? word(net->cells[c].cur.hi) : 0; }
+
+QnStatus qn_tell_set(QNet *net, QnCell c, uint64_t allowed)
+{
+    if (!valid_cell(net, c)) return QN_ECELL;
+    if (!is_set(net, c)) return QN_EDOMAIN;
+    if (net->contradicted) return QN_CONTRADICTION;
+    Cell *cell = &net->cells[c];
+    uint64_t now = word(cell->cur.lo), m = now & allowed;
+    if (!m) {
+        contradict(net, c);
+        return QN_CONTRADICTION;
+    }
+    if (m == now) return QN_OK;
+    cell->cur = set_value(m, word(cell->cur.hi));
+    wake(net, cell);
+    return QN_OK;
+}
+
 QnStatus qn_tell(QNet *net, QnCell c, QInterval v)
 {
     if (!valid_cell(net, c)) return QN_ECELL;
+    if (is_set(net, c)) return QN_EDOMAIN;
     if (!qi_valid(v)) return QN_EVALUE;
     if (net->contradicted) return QN_CONTRADICTION;
     Cell *cell = &net->cells[c];
     QInterval m;
     if (!qi_meet(cell->cur, v, &m)) {
-        net->contradicted = true;
-        net->conflict = c;
-        clear_queue(net);
+        contradict(net, c);
         return QN_CONTRADICTION;
     }
     if (m.lo == cell->cur.lo && m.hi == cell->cur.hi) return QN_OK;
     cell->cur = m;
-    for (size_t i = 0; i < cell->watchers.n; i++) enqueue(net, cell->watchers.ids[i]);
+    wake(net, cell);
     return QN_OK;
 }
 
@@ -342,6 +417,60 @@ static void run_equal(QNet *net, const Prop *p)
     qn_tell(net, p->c[1], qi_conv(a, &p->k[1]));
 }
 
+static void run_seteq(QNet *net, const Prop *p)
+{
+    uint64_t a = qn_get_set(net, p->c[0]), b = qn_get_set(net, p->c[1]);
+    qn_tell_set(net, p->c[0], b);
+    qn_tell_set(net, p->c[1], a);
+}
+
+/* x = table[a] */
+static void run_element(QNet *net, const Prop *p)
+{
+    QnCell x = p->c[0], a = p->c[1];
+    const QInterval *table = net->tables + p->first;
+    QInterval xv = qn_get(net, x);
+    uint64_t mask = qn_get_set(net, a), keep = 0;
+    QInterval hull = { 0, 0 };
+    bool any = false;
+    for (size_t i = 0; i < p->n; i++) {
+        if (!(mask >> i & 1)) continue;
+        if (!any) hull = table[i];
+        else {
+            if (table[i].lo < hull.lo) hull.lo = table[i].lo;
+            if (table[i].hi > hull.hi) hull.hi = table[i].hi;
+        }
+        any = true;
+        QInterval m;
+        if (qi_meet(table[i], xv, &m)) keep |= (uint64_t) 1 << i;
+    }
+    if (any) qn_tell(net, x, hull);
+    qn_tell_set(net, a, keep);   /* keep == 0 is a contradiction */
+}
+
+/* b <=> x in range; atom 0 is false and atom 1 is true */
+static void run_reify(QNet *net, const Prop *p)
+{
+    QnCell b = p->c[0], x = p->c[1];
+    QInterval r = p->range, xv = qn_get(net, x), m;
+    if (qi_subset(xv, r)) qn_tell_set(net, b, 2);
+    else if (!qi_meet(xv, r, &m)) qn_tell_set(net, b, 1);
+    uint64_t bv = qn_get_set(net, b);
+    if (bv == 2) {
+        qn_tell(net, x, r);
+    } else if (bv == 1) {
+        /* x is outside r: narrow x only when the complement of r is one interval */
+        if (r.lo == Q_NINF && r.hi == Q_INF) qn_tell_set(net, b, 0);
+        else if (r.lo == Q_NINF) {
+            if (r.hi >= Q_FMAX) qn_tell_set(net, b, 0);
+            else qn_tell(net, x, (QInterval) { r.hi + 1, Q_INF });
+        } else if (r.hi == Q_INF) {
+            if (r.lo <= Q_FMIN) qn_tell_set(net, b, 0);
+            else qn_tell(net, x, (QInterval) { Q_NINF, r.lo - 1 });
+        }
+    }
+}
+
 static void run(QNet *net, const Prop *p)
 {
     switch (p->kind) {
@@ -349,7 +478,60 @@ static void run(QNet *net, const Prop *p)
     case P_PRODUCT: run_product(net, p); break;
     case P_EQUAL:   run_equal(net, p); break;
     case P_CUSTOM:  p->fn(net, p->ctx, net->ccells + p->first, p->n); break;
+    case P_SETEQ:   run_seteq(net, p); break;
+    case P_ELEMENT: run_element(net, p); break;
+    case P_REIFY:   run_reify(net, p); break;
     }
+}
+
+QnStatus qn_set_equal(QNet *net, QnCell a, QnCell b)
+{
+    if (!valid_cell(net, a) || !valid_cell(net, b)) return QN_ECELL;
+    if (!is_set(net, a) || !is_set(net, b)) return QN_EDOMAIN;
+    if (net->cells[a].type.kind != net->cells[b].type.kind || qn_universe(net, a) != qn_universe(net, b))
+        return QN_ETYPE;
+    Prop p;
+    memset(&p, 0, sizeof p);
+    p.kind = P_SETEQ;
+    p.c[0] = a;
+    p.c[1] = b;
+    return add_prop(net, &p, p.c, 2);
+}
+
+QnStatus qn_element(QNet *net, QnCell x, QnCell a, const QInterval *table, size_t n)
+{
+    if (!valid_cell(net, x) || !valid_cell(net, a)) return QN_ECELL;
+    if (is_set(net, x) || !is_set(net, a)) return QN_EDOMAIN;
+    if (n == 0 || n > QN_MAXATOMS || qn_universe(net, a) != (n == 64 ? ~(uint64_t) 0 : ((uint64_t) 1 << n) - 1))
+        return QN_EVALUE;
+    for (size_t i = 0; i < n; i++)
+        if (!qi_valid(table[i])) return QN_EVALUE;
+    if (!grow((void **) &net->tables, &net->captables, net->ntables + n, sizeof *net->tables)) return QN_ENOMEM;
+    Prop p;
+    memset(&p, 0, sizeof p);
+    p.kind = P_ELEMENT;
+    p.c[0] = x;
+    p.c[1] = a;
+    p.first = net->ntables;
+    p.n = n;
+    memcpy(net->tables + net->ntables, table, n * sizeof *table);
+    net->ntables += n;
+    return add_prop(net, &p, p.c, 2);
+}
+
+QnStatus qn_reify_in(QNet *net, QnCell b, QnCell x, QInterval range)
+{
+    if (!valid_cell(net, b) || !valid_cell(net, x)) return QN_ECELL;
+    if (!is_set(net, b) || is_set(net, x)) return QN_EDOMAIN;
+    if (qn_universe(net, b) != 3) return QN_ETYPE;
+    if (!qi_valid(range)) return QN_EVALUE;
+    Prop p;
+    memset(&p, 0, sizeof p);
+    p.kind = P_REIFY;
+    p.c[0] = b;
+    p.c[1] = x;
+    p.range = range;
+    return add_prop(net, &p, p.c, 2);
 }
 
 QnStatus qn_propagate(QNet *net)
@@ -424,10 +606,25 @@ bool qn_group_enabled(const QNet *net, QnGroup g) { return g < net->ngroups && n
 
 uint64_t qn_epoch(const QNet *net) { return net->epoch; }
 
+QnStatus qn_stage_set(QNet *net, QnCell c, uint64_t mask)
+{
+    if (net->propagating) return QN_EPROPAGATING;
+    if (!valid_cell(net, c)) return QN_ECELL;
+    if (!is_set(net, c)) return QN_EDOMAIN;
+    Cell *cell = &net->cells[c];
+    uint64_t universe = word(cell->base.hi);
+    if (!mask || (mask & ~universe)) return QN_EVALUE;
+    if (cell->has_staged) return QN_ESTAGED;
+    cell->staged = set_value(mask, universe);
+    cell->has_staged = true;
+    return QN_OK;
+}
+
 QnStatus qn_stage(QNet *net, QnCell c, QInterval v)
 {
     if (net->propagating) return QN_EPROPAGATING;
     if (!valid_cell(net, c)) return QN_ECELL;
+    if (is_set(net, c)) return QN_EDOMAIN;
     if (!qi_valid(v)) return QN_EVALUE;
     Cell *cell = &net->cells[c];
     if (cell->has_staged) return QN_ESTAGED;
