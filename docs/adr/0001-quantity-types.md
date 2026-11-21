@@ -70,7 +70,8 @@ A world's tick must be a power of ten of seconds, so that time follows the same 
 
 ### 5. Overflow
 
-- If an interval bound overflows, the bound becomes infinite. The result is wider but still sound, because it still contains every exact answer.
+- If an interval bound overflows, the interval widens, and it still contains every exact answer. A lower bound below the finite range becomes negative infinity. A lower bound above the finite range becomes the largest finite value, because negative infinity would also be sound but needlessly wide. Upper bounds are the mirror image.
+- The finite range is symmetric, from `-(INT64_MAX - 1)` to `INT64_MAX - 1`, so negation never overflows. `INT64_MIN + 1` is not a valid value.
 - If a point value overflows, it is an error. Point values are authoritative state and transfers, so a silent wrap or saturation would corrupt the world. Bruggadung learned this lesson: its fixed caps that failed silently became errors (`f405c3a`).
 
 ### 6. Conserved interactions
