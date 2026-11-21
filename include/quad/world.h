@@ -1,0 +1,158 @@
+#ifndef QUAD_WORLD_H
+#define QUAD_WORLD_H
+
+/* A world: the host of ADR 0009 and the scheduler of ADR 0006.
+ *
+ * A world has quantity kinds, phenomena, cells, and kernels. A cell has a
+ * path such as "roomA.energy", and the first component of the path names the
+ * phenomenon that owns the cell. A cell of a conserved kind is a stock: only
+ * transfers change it, and its value is always exact.
+ *
+ * A kernel's slot "x.y" binds to the cell "<phenomenon>.x.y", unless a port
+ * connection redirects it: after qw_connect(w, wall, "hot", "roomA"), the slot
+ * "hot.temperature" binds to "roomA.temperature".
+ *
+ * This is the C-level host. Quadrilateral source will describe the same
+ * things, and error messages already name cells by path (ADR 0007).
+ *
+ * A phenomenon can have models (ADR 0010). A model's cells have paths under
+ * the model, "roomB.fine.c0.energy", and one model is active. qw_port maps a
+ * port of the phenomenon to a path prefix for each model, so that another
+ * phenomenon can connect to "roomB.west" and reach the active model's cells.
+ * qw_switch changes the active model with a map kernel.
+ *
+ * The scheduler is the first version of ADR 0006: every evolving kernel
+ * advances to one shared boundary. A phenomenon runs at most two kernels:
+ * its own, and its active model's. Each group of ADR 0009 section 9 has one
+ * member.
+ */
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "quad/kernel.h"
+#include "quad/network.h"
+
+typedef struct QWorld QWorld;
+typedef uint32_t QwKind;
+typedef uint32_t QwPhen;
+
+typedef enum {
+    QW_OK = 0,
+    QW_ENAME,           /* an unknown or malformed name */
+    QW_EDUP,            /* a name that already exists */
+    QW_ETYPE,           /* quantity types or dimensions do not fit */
+    QW_EOWNER,          /* a write to a cell that another phenomenon owns */
+    QW_EKERNEL,         /* a bad contract, or a kernel broke a rule of the interface */
+    QW_EINAPPLICABLE,   /* an input is outside a kernel's valid range */
+    QW_ECONTRADICTION,  /* propagation found an empty domain */
+    QW_ESTOCK,          /* a stock changed other than by a transfer */
+    QW_ETIME,           /* a time before now, or past the end of the clock */
+    QW_ENOMEM,
+} QwStatus;
+
+const char *qw_status_str(QwStatus s);
+const char *qw_error(const QWorld *w);   /* the message of the last error */
+
+QWorld *qw_new(uint64_t seed, int8_t tick_scale);
+void    qw_free(QWorld *w);
+QNet   *qw_net(QWorld *w);
+
+/* --- building ---------------------------------------------------------------- */
+
+QwStatus qw_base_dim(QWorld *w, const char *name);
+QwStatus qw_kind(QWorld *w, const char *name, const char *dim, int scale, bool conserved, QwKind *out);
+QwStatus qw_kind_type(const QWorld *w, QwKind kind, QType *out);
+/* An enumeration kind (ADR 0012): 1 to 64 atom names, in order. Atom i is
+ * bit i of a set cell's mask. */
+QwStatus qw_enum_kind(QWorld *w, const char *name, const char *const *atoms, unsigned n, QwKind *out);
+int      qw_atom(const QWorld *w, QwKind kind, const char *name);   /* the atom's index, or -1 */
+QwStatus qw_phenomenon(QWorld *w, const char *name, QwPhen *out);
+QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out);
+/* A set cell of an enumeration kind, with the mask of its possible atoms */
+QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out);
+QwStatus qw_find(const QWorld *w, const char *path, QnCell *out);
+const char *qw_cell_path(const QWorld *w, QnCell c);
+QwStatus qw_connect(QWorld *w, QwPhen p, const char *port, const char *target);
+QwStatus qw_attach(QWorld *w, QwPhen p, const QkKernel *k);
+
+/* --- models (ADR 0010) ----------------------------------------------------------- */
+
+/* Declares a model. The first model of a phenomenon is active. A stock of an
+ * inactive model must start at zero. */
+QwStatus qw_model(QWorld *w, QwPhen p, const char *model);
+/* Propagators added between begin and end belong to the model, and run only
+ * while it is active. */
+QwStatus qw_model_begin(QWorld *w, QwPhen p, const char *model);
+void     qw_model_end(QWorld *w);
+/* A model's kernel. Its slot "x" binds to "<p>.<model>.x" if that cell
+ * exists, and otherwise to "<p>.x". */
+QwStatus qw_model_attach(QWorld *w, QwPhen p, const char *model, const QkKernel *k);
+/* In `model`, the port "<p>.<port>" leads to the path prefix `target`. */
+QwStatus qw_port(QWorld *w, QwPhen p, const char *port, const char *model, const char *target);
+/* Switches to `model` at the current time. The map kernel's slots "from.x"
+ * and "to.x" bind to the old and the new model. Every stock of the old model
+ * must be exactly zero afterwards, or the switch fails and nothing changes. */
+QwStatus qw_switch(QWorld *w, QwPhen p, const char *model, const QkKernel *map);
+const char *qw_active_model(const QWorld *w, QwPhen p);   /* NULL without models */
+
+/* --- running ------------------------------------------------------------------- */
+
+/* Advances the world to `until`, boundary by boundary. */
+QwStatus qw_run(QWorld *w, int64_t until);
+
+/* An input from outside the simulation: replaces a value at the current time,
+ * in a new epoch. A stock cannot take an input. */
+QwStatus qw_input(QWorld *w, const char *path, QInterval v);
+QwStatus qw_input_set(QWorld *w, const char *path, uint64_t mask);
+
+int64_t   qw_now(const QWorld *w);
+uint64_t  qw_boundaries(const QWorld *w);
+QInterval qw_get(const QWorld *w, const char *path);     /* through ports; the top interval if unknown */
+uint64_t  qw_get_set(const QWorld *w, const char *path); /* through ports; 0 if not a set cell */
+uint64_t  qw_predicts(const QWorld *w, QwPhen p);        /* predict calls so far */
+uint64_t  qw_advances(const QWorld *w);                  /* advance calls so far */
+uint64_t  qw_switches(const QWorld *w);
+int64_t   qw_total(const QWorld *w, QwKind kind);        /* the sum of every cell of a kind */
+
+/* A hash of all authoritative state: the clock, the epoch, and every cell's
+ * base. Two runs with the same inputs must give the same hash (ADR 0004). */
+uint64_t qw_hash(const QWorld *w);
+
+/* --- the change log (ADR 0011 section 6) ------------------------------------------ */
+
+/* The world commits authoritative changes at a boundary of qw_run, at a
+ * successful qw_switch, and at qw_input. When logging is on, each commit
+ * records one entry for each cell whose base changed.
+ *
+ * `epoch` is the epoch in which the change takes effect: the epoch number
+ * after the commit. `before` and `after` are copies of the cell's base. The
+ * log does not interpret them, because a cell can have another domain in the
+ * same storage. For a stock, `amount` is the net transfer that the commit
+ * applied, so after = before + amount. For a replaced value, `amount` is 0.
+ *
+ * Entries are in order of epoch, then of cell index. A failed step or a
+ * failed switch records nothing. A commit records its entries even if
+ * propagation in the new epoch then finds a contradiction, because the bases
+ * changed. A write of the value that the cell already has records nothing. */
+typedef enum { QW_CHANGE_VALUE, QW_CHANGE_STOCK } QwChangeKind;
+
+typedef struct {
+    uint64_t     epoch;
+    QnCell       cell;
+    QwChangeKind kind;
+    QInterval    before, after;
+    int64_t      amount;
+} QwChange;
+
+/* Turns logging on or off. Logging is off by default. Turning it off keeps
+ * the entries that the log already has. */
+void qw_log_changes(QWorld *w, bool on);
+/* The entries of the log, and their number in *n. The pointer is valid until
+ * the next call that commits changes or discards entries. */
+const QwChange *qw_changes(const QWorld *w, size_t *n);
+/* Drops every entry whose epoch is before `before_epoch`. */
+void qw_changes_discard(QWorld *w, uint64_t before_epoch);
+
+#endif
