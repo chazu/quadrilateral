@@ -29,17 +29,26 @@ A potential guiding principle is that the authoring language can be uniform whil
 
 ## 2. Background: what Triangle already has
 
-ChatGPT reported these facts after it read the repository. This document did not verify them against the code.
+ChatGPT reported a list of facts after it read the repository. The list below corrects that report. It was checked against Bruggadung at `f425574` on 2026-11-21. `quadrilateral-review-fable.md` section 2 gives the file references.
 
-- A C11 implementation with Tomabechi-style feature-structure unification.
-- A completed type hierarchy and a quick-check optimization.
-- Definite clauses.
-- Interval arithmetic with physical units. The documented arithmetic propagates constraints mostly forward.
-- Three-valued pattern matching (match, no match, unknown).
-- An Odin integration layer and generated component structures.
-- Full constraint resolution when content loads, and a restricted, conjunctive runtime. ChatGPT judged that this separation can make a highly expressive simulation language practical.
-- Declarative effects, agent-specific knowledge views, atomic change commitment, and variable simulation detail.
-- A scheduler. The source does not describe its internals. ChatGPT recommended that Quadrilateral keep a scheduler analogous to Bruggadung's (section 11.3). The source names two other bases for scheduler work: FMI 3.0, for its execution lifecycle and communication-point concepts, and Gecode, for its propagator scheduling (section 15).
+ChatGPT attributed all of these features to Triangle. Triangle is the C11 language engine only. Several features are in Bruggadung's Odin runtime (the "lab"), which links Triangle as a library.
+
+In Triangle (C11, about 15,000 lines):
+
+- Tomabechi quasi-destructive feature-structure unification.
+- A type hierarchy completed with generated greatest-lower-bound types, and a quick-check optimization.
+- Definite clauses, with depth-first resolution and depth and step limits.
+- Interval arithmetic with physical units. ChatGPT said that the arithmetic propagates constraints mostly forward. That is wrong. Narrowing also runs backward for `+`, `-`, and multiplication or division by a constant. A product or quotient of two variables does not narrow backward. Values are int64 intervals in exact unit quanta, with no floats. Settling rescans the whole structure on each round, for at most 16 rounds, so it is not incremental.
+- Three-valued pattern matching (entailed, unknown, incompatible).
+- Generated component structures for Odin, and an Odin binding package.
+- Constraint resolution when content loads. The runtime is restricted but not purely conjunctive: unification at run time also settles arithmetic and forces disjunctions, and clause search runs at run time.
+- One external hook, `tri_register_fn`. Only derive and construct call it, never unification or matching.
+
+In Bruggadung's Odin lab, not in Triangle:
+
+- Declarative effects, agent-specific knowledge views, and atomic change commitment.
+- Variable simulation detail. Only part of it is built.
+- A scheduler. It is event-driven, with one global int64 clock in 1 ms ticks. All domains advance together to the earliest boundary that any domain's horizon (`safeStep`, `nextEvent`) or any pending input sets. It does not let phenomena advance asynchronously. ChatGPT recommended that Quadrilateral keep a scheduler analogous to Bruggadung's (section 11.3). The source names two other bases for scheduler work: FMI 3.0, for its execution lifecycle and communication-point concepts, and Gecode, for its propagator scheduling (section 15).
 - A runtime that constructs descriptions from entity state and matches operations against them.
 
 Bruggadung separates the subjective knowledge of an agent from the authoritative physical simulation. Quadrilateral keeps that separation.
@@ -67,6 +76,8 @@ ChatGPT also said that Triangle's typed feature-structure engine is one of the h
 | First runtime | Triangle's C core, single-threaded | Proposed |
 | BEAM | Experimental backend, not foundational immediately | Proposed |
 | Target runtime (BEAM, Go, or C) | Not selected | Open |
+
+The table records the source conversation. On 2026-11-21 the project owner made later decisions: Quadrilateral is fresh C code that borrows from Triangle, it is not a fork of Triangle's code, and it has a C kernel interface. `quadrilateral-review-fable.md` section 1 records these decisions, and they replace the "Project form" and "First runtime" rows.
 
 ## 4. Core concepts
 
@@ -565,6 +576,8 @@ The design keeps a mechanism like Bruggadung's existing scheduler (Proposed):
 - The first implementation uses conservative synchronization, not speculative execution and rollback. Conservative synchronization is easier to reason about and keeps the existing commitment model.
 
 The runtime must detect an interaction before it advances past the interaction. Otherwise the runtime commits an invalid future.
+
+Bruggadung's scheduler does not do what the example describes. All its domains advance together to one global boundary, so the fire cannot be at minute 20 while the person is at minute 12. The horizon concept carries over. Asynchronous advancement for each phenomenon is new work (section 2).
 
 ### 11.4 Validity contracts
 
