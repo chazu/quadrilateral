@@ -28,6 +28,7 @@
  */
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "quad/kernel.h"
@@ -110,5 +111,40 @@ int64_t   qw_total(const QWorld *w, QwKind kind);        /* the sum of every cel
 /* A hash of all authoritative state: the clock, the epoch, and every cell's
  * base. Two runs with the same inputs must give the same hash (ADR 0004). */
 uint64_t qw_hash(const QWorld *w);
+
+/* --- the change log (ADR 0011 section 6) ------------------------------------------ */
+
+/* The world commits authoritative changes at a boundary of qw_run, at a
+ * successful qw_switch, and at qw_input. When logging is on, each commit
+ * records one entry for each cell whose base changed.
+ *
+ * `epoch` is the epoch in which the change takes effect: the epoch number
+ * after the commit. `before` and `after` are copies of the cell's base. The
+ * log does not interpret them, because a cell can have another domain in the
+ * same storage. For a stock, `amount` is the net transfer that the commit
+ * applied, so after = before + amount. For a replaced value, `amount` is 0.
+ *
+ * Entries are in order of epoch, then of cell index. A failed step or a
+ * failed switch records nothing. A commit records its entries even if
+ * propagation in the new epoch then finds a contradiction, because the bases
+ * changed. A write of the value that the cell already has records nothing. */
+typedef enum { QW_CHANGE_VALUE, QW_CHANGE_STOCK } QwChangeKind;
+
+typedef struct {
+    uint64_t     epoch;
+    QnCell       cell;
+    QwChangeKind kind;
+    QInterval    before, after;
+    int64_t      amount;
+} QwChange;
+
+/* Turns logging on or off. Logging is off by default. Turning it off keeps
+ * the entries that the log already has. */
+void qw_log_changes(QWorld *w, bool on);
+/* The entries of the log, and their number in *n. The pointer is valid until
+ * the next call that commits changes or discards entries. */
+const QwChange *qw_changes(const QWorld *w, size_t *n);
+/* Drops every entry whose epoch is before `before_epoch`. */
+void qw_changes_discard(QWorld *w, uint64_t before_epoch);
 
 #endif

@@ -80,7 +80,15 @@ struct QWorld {
     /* staging for one boundary or switch, one entry for each cell */
     int64_t   *delta, *wval;
     bool      *written;
+    bool      *touched;     /* the cell is in the list `changed` */
+    QnCell    *changed;     /* the cells that a write or a transfer touched */
+    size_t     nchanged;
     size_t     capstage;
+
+    /* the change log */
+    bool       logging;
+    QwChange  *log_entries;
+    size_t     nlog, caplog;
 
     bool       narrow_failed;
     char       narrow_msg[300];
@@ -143,12 +151,26 @@ uint64_t qw_boundaries(const QWorld *w) { return w->boundaries; }
 uint64_t qw_advances(const QWorld *w) { return w->advances; }
 uint64_t qw_switches(const QWorld *w) { return w->switches; }
 
+/* Adds cell c to the list of touched cells, once. The list has room for
+ * every cell, so this cannot fail. */
+static void touch(QWorld *w, QnCell c)
+{
+    if (w->touched[c]) return;
+    w->touched[c] = true;
+    w->changed[w->nchanged++] = c;
+}
+
+/* Clears the staging of every touched cell. Untouched cells are already
+ * clear, so the cost does not grow with the number of cells. */
 static void clear_staging(QWorld *w)
 {
-    for (size_t c = 0; c < w->ncells; c++) {
+    for (size_t i = 0; i < w->nchanged; i++) {
+        QnCell c = w->changed[i];
         w->delta[c] = 0;
         w->written[c] = false;
+        w->touched[c] = false;
     }
+    w->nchanged = 0;
 }
 
 static void free_att(Att *a)
@@ -228,6 +250,7 @@ static int h_write(QkCall *c, uint32_t slot, int64_t value)
     QnCell cell = a->bind[slot];
     c->w->wval[cell] = v;
     c->w->written[cell] = true;
+    touch(c->w, cell);
     return QK_HOST_OK;
 }
 
@@ -240,11 +263,13 @@ static int h_transfer(QkCall *c, uint32_t t, int64_t amount)
     QWorld *w = c->w;
     if (tr->from != QK_NONE) {
         QnCell f = a->bind[tr->from];
+        touch(w, f);
         if (qp_sub(w->delta[f], amount, &w->delta[f]) != Q_OK)
             return call_err(c, QK_HOST_EVALUE, "transfer '%s' out of range", tr->name);
     }
     if (tr->to != QK_NONE) {
         QnCell d = a->bind[tr->to];
+        touch(w, d);
         if (qp_add(w->delta[d], amount, &w->delta[d]) != Q_OK)
             return call_err(c, QK_HOST_EVALUE, "transfer '%s' out of range", tr->name);
     }
@@ -343,6 +368,9 @@ void qw_free(QWorld *w)
     free(w->delta);
     free(w->wval);
     free(w->written);
+    free(w->touched);
+    free(w->changed);
+    free(w->log_entries);
     qn_free(w->net);
     free(w);
 }
@@ -506,10 +534,12 @@ QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCel
     if (!grow((void **) &w->cells, &w->capcells, w->ncells + 1, sizeof *w->cells)) return QW_ENOMEM;
     size_t need = w->ncells + 1;
     if (need > w->capstage) {
-        size_t c1 = w->capstage, c2 = w->capstage, c3 = w->capstage;
+        size_t c1 = w->capstage, c2 = w->capstage, c3 = w->capstage, c4 = w->capstage, c5 = w->capstage;
         if (!grow((void **) &w->delta, &c1, need, sizeof *w->delta)) return QW_ENOMEM;
         if (!grow((void **) &w->wval, &c2, need, sizeof *w->wval)) return QW_ENOMEM;
         if (!grow((void **) &w->written, &c3, need, sizeof *w->written)) return QW_ENOMEM;
+        if (!grow((void **) &w->touched, &c4, need, sizeof *w->touched)) return QW_ENOMEM;
+        if (!grow((void **) &w->changed, &c5, need, sizeof *w->changed)) return QW_ENOMEM;
         w->capstage = c1;
     }
     QnCell c;
@@ -523,6 +553,7 @@ QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCel
     ci->model = model;
     w->delta[c] = w->wval[c] = 0;
     w->written[c] = false;
+    w->touched[c] = false;
     w->ncells++;
     if (out) *out = c;
     return QW_OK;
@@ -913,22 +944,88 @@ static void invalidate(QWorld *w)
         }
 }
 
+/* --- the change log ----------------------------------------------------------------- */
+
+void qw_log_changes(QWorld *w, bool on) { w->logging = on; }
+
+const QwChange *qw_changes(const QWorld *w, size_t *n)
+{
+    *n = w->nlog;
+    return w->log_entries;
+}
+
+void qw_changes_discard(QWorld *w, uint64_t before_epoch)
+{
+    size_t k = 0;   /* entries are in epoch order, so the old ones come first */
+    while (k < w->nlog && w->log_entries[k].epoch < before_epoch) k++;
+    if (!k) return;
+    memmove(w->log_entries, w->log_entries + k, (w->nlog - k) * sizeof *w->log_entries);
+    w->nlog -= k;
+}
+
+/* Makes room for n more entries, if logging is on. */
+static bool log_reserve(QWorld *w, size_t n)
+{
+    return !w->logging || grow((void **) &w->log_entries, &w->caplog, w->nlog + n, sizeof *w->log_entries);
+}
+
+/* Records a change. The caller reserved the room. The epoch is not known
+ * yet, so log_stamp sets it after qn_begin_epoch. */
+static void log_change(QWorld *w, QnCell c, QwChangeKind kind, QInterval before, QInterval after, int64_t amount)
+{
+    if (!w->logging) return;
+    if (kind == QW_CHANGE_VALUE && before.lo == after.lo && before.hi == after.hi) return;
+    w->log_entries[w->nlog++] = (QwChange) { 0, c, kind, before, after, amount };
+}
+
+/* Sets the epoch of the entries from index `from` to the current epoch. */
+static void log_stamp(QWorld *w, size_t from)
+{
+    uint64_t e = qn_epoch(w->net);
+    for (size_t i = from; i < w->nlog; i++) w->log_entries[i].epoch = e;
+}
+
+static int cmp_cell(const void *a, const void *b)
+{
+    QnCell x = *(const QnCell *) a, y = *(const QnCell *) b;
+    return (x > y) - (x < y);
+}
+
+/* Stages the touched cells in order of cell index, and logs each change.
+ * The cost grows with the number of touched cells only. If a stock goes out
+ * of range, nothing is staged or logged. On return, the staging is clear. */
 static QwStatus commit(QWorld *w)
 {
-    for (size_t c = 0; c < w->ncells; c++) {
+    qsort(w->changed, w->nchanged, sizeof *w->changed, cmp_cell);
+    for (size_t i = 0; i < w->nchanged; i++) {
+        QnCell c = w->changed[i];
+        int64_t v;
+        if (w->delta[c] && qp_add(qn_base(w->net, c).lo, w->delta[c], &v) != Q_OK) {
+            QwStatus st = fail(w, QW_ESTOCK, "stock '%s' out of range", w->cells[c].path);
+            clear_staging(w);
+            return st;
+        }
+    }
+    if (!log_reserve(w, w->nchanged)) {
+        clear_staging(w);
+        return fail(w, QW_ENOMEM, "no memory for the change log");
+    }
+    for (size_t i = 0; i < w->nchanged; i++) {
+        QnCell c = w->changed[i];
+        QInterval base = qn_base(w->net, c);
         if (w->written[c]) {
-            qn_stage(w->net, (QnCell) c, qi_point(w->wval[c]));
-            w->written[c] = false;
+            QInterval v = qi_point(w->wval[c]);
+            qn_stage(w->net, c, v);
+            log_change(w, c, QW_CHANGE_VALUE, base, v, 0);
         }
         if (w->delta[c]) {
             int64_t v;
-            QInterval base = qn_base(w->net, (QnCell) c);
-            if (qp_add(base.lo, w->delta[c], &v) != Q_OK)
-                return fail(w, QW_ESTOCK, "stock '%s' out of range", w->cells[c].path);
-            qn_stage(w->net, (QnCell) c, qi_point(v));
-            w->delta[c] = 0;
+            (void) qp_add(base.lo, w->delta[c], &v);   /* checked above */
+            qn_stage(w->net, c, qi_point(v));
+            log_change(w, c, QW_CHANGE_STOCK, base, qi_point(v), w->delta[c]);
         }
     }
+    clear_staging(w);
     return QW_OK;
 }
 
@@ -966,10 +1063,12 @@ QwStatus qw_run(QWorld *w, int64_t until)
                     return kernel_failed(w, p, a, "advance", &call, r);
                 }
             }
+        size_t logged = w->nlog;
         if ((st = commit(w))) return st;
         w->now = b;
         w->boundaries++;
         qn_begin_epoch(w->net);
+        log_stamp(w, logged);
         if ((st = settle(w))) return st;
         invalidate(w);
     }
@@ -1074,10 +1173,12 @@ QwStatus qw_switch(QWorld *w, QwPhen pid, const char *model, const QkKernel *map
     p->models[to].att.predicted = false;
 
     /* 5. commit, swap the propagator groups, and open a new epoch */
+    size_t logged = w->nlog;
     if ((st = commit(w))) goto done;
     qn_group_enable(w->net, p->models[from].group, false);
     qn_group_enable(w->net, p->models[to].group, true);
     qn_begin_epoch(w->net);
+    log_stamp(w, logged);
     w->switches++;
     st = settle(w);
     invalidate(w);
@@ -1106,8 +1207,12 @@ QwStatus qw_input(QWorld *w, const char *path, QInterval v)
     if (w->kinds[w->cells[c].kind].conserved)
         return fail(w, QW_ESTOCK, "'%s' is a stock; a stock changes only by transfers", path);
     if (!qi_valid(v)) return fail(w, QW_ETYPE, "invalid interval for '%s'", path);
+    if (!log_reserve(w, 1)) return fail(w, QW_ENOMEM, "no memory for the change log");
+    size_t logged = w->nlog;
+    log_change(w, c, QW_CHANGE_VALUE, qn_base(w->net, c), v, 0);
     qn_stage(w->net, c, v);
     qn_begin_epoch(w->net);
+    log_stamp(w, logged);
     QwStatus st = settle(w);
     invalidate(w);
     return st;
