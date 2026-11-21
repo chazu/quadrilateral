@@ -39,8 +39,8 @@ ChatGPT reported these facts after it read the repository. This document did not
 - An Odin integration layer and generated component structures.
 - Full constraint resolution when content loads, and a restricted, conjunctive runtime. ChatGPT judged that this separation can make a highly expressive simulation language practical.
 - Declarative effects, agent-specific knowledge views, atomic change commitment, and variable simulation detail.
-- A scheduler. The source does not describe it.
-- A lab that constructs descriptions from entity state and matches operations against them.
+- A scheduler. The source does not describe its internals. ChatGPT recommended that Quadrilateral keep a scheduler analogous to Bruggadung's (section 11.3). The source names two other bases for scheduler work: FMI 3.0, for its execution lifecycle and communication-point concepts, and Gecode, for its propagator scheduling (section 15).
+- A runtime that constructs descriptions from entity state and matches operations against them.
 
 Bruggadung separates the subjective knowledge of an agent from the authoritative physical simulation. Quadrilateral keeps that separation.
 
@@ -88,11 +88,11 @@ ChatGPT's explicit recommendation, after the wall example, was four first-class 
 
 ChatGPT also stated that a phenomenon is not an entity, an actor, or a process. A phenomenon is more than a process.
 
-ChatGPT first called the phenomenon the fundamental computational object. Later it made the propagator the computational abstraction and the phenomenon the simulation abstraction (section 12.5).
+ChatGPT first called the phenomenon the fundamental computational object. Later it made the propagator the computational abstraction and the phenomenon the simulation abstraction (section 12.5). Note that the discussion of 'phenomenon' came from ChatGPT's assertion that it may be feasible to make such an abstraction the core unifying abstraction underlying quadrilateral. In other words, an option agreed upon as likely.
 
 The aim is a relatively small conceptual core with considerable expressive power.
 
-Phenomena describe processes. Interactions describe the coupling between processes. The runtime assembles these descriptions into an executable network.
+Phenomena describe occurants. Interactions describe the coupling between occurants. The runtime assembles these descriptions into an executable network. Note the use of the word occurant specifically as opposed to 'process', in line with ChatGPT's assertion on line 89.
 
 ## 5. Semantic layers
 
@@ -216,7 +216,7 @@ The scheduler therefore schedules phenomena and their interactions. It does not 
 
 ## 7. Variable level of detail
 
-Dynamic level of detail is the reason phenomena are the fundamental abstraction (Decided). The simulation has a locus of focus, and it must scale detail dynamically to use resources efficiently.
+Dynamic level of detail is the reason phenomena are the fundamental abstraction (Decided). The simulation has one or more loci of focus, and it must scale detail dynamically to use resources efficiently.
 
 ### 7.1 Model selection
 
@@ -254,6 +254,20 @@ Each simulation model has two operations.
 
 Abstraction is fairly simple. Refinement is much harder, because information that was not retained cannot be recovered. Example: an abstract fire consumed twenty kilograms of wood. The detailed state needs a plausible distribution of charred material, hot spots, smoke, and structural damage.
 
+The source does not connect this use of "refinement" to an established formal concept. The note below is an addition to the source material.
+
+> Note (not from the source). The operation is well known, but under other names:
+>
+> - Concretization, in abstract interpretation. An abstraction function and a concretization function form a pair. Concretization maps one abstract state to the set of all detailed states that are consistent with it. Refinement, as this document uses the word, selects one member of that set.
+> - Lifting, in equation-free multiscale modeling. The inverse operation is restriction.
+> - Prolongation, in multigrid methods and adaptive mesh refinement. The inverse operation is restriction.
+> - Backmapping, in coarse-grained molecular simulation.
+> - Disaggregation, in multiresolution simulation modeling. The inverse operation is aggregation.
+>
+> In formal methods, "refinement" has a different meaning. There it is a relation between two specifications: each behavior of the refined specification is a behavior that the abstract specification permits. That meaning corresponds to the requirement in section 7.4, not to the operation in this section.
+
+**Note from Project Owner** In my opinion, 'reification' may conceptually be a reasonable way to think of refinement. It may be the case that a domain-specific 'good enough' way of deriving the details of a previously coarsely-simulated situation is good enough. In this sense, 'refinement' may be simpler than the verbiage here suggests.
+
 Refinement is constrained reconstruction. It is not reversal.
 
 1. The abstract model supplies constraints.
@@ -262,7 +276,7 @@ Refinement is constrained reconstruction. It is not reversal.
 4. A reconstruction procedure fills the unconstrained details.
 5. A deterministic seed makes the choices reproducible.
 
-Unification establishes compatibility only. It does not recover lost history, and it does not guarantee a physically plausible reconstruction. Quadrilateral therefore needs explicit reconstruction policies, conservation checks, and possibly retained latent state. This distinction is fundamental to the language (Proposed).
+Unification establishes compatibility only. It does not recover lost history, and it does not guarantee a physically plausible reconstruction. Quadrilateral therefore needs explicit reconstruction policies, conservation checks, and possibly retained latent state. This distinction is potentially fundamental to the language (Proposed).
 
 ### 7.4 Uncertainty from abstraction
 
@@ -334,6 +348,7 @@ A temperature that changes from 300 to 400 degrees does not violate monotonic pr
 
 When simulated state changes, the runtime must invalidate or replace the old constraints. It cannot continue to narrow the domains of the previous instant. Each propagation context has an explicit validity epoch or an immutable state version (Proposed).
 
+**Note from project owner** - The not-monotonic-ness of the language begs for a bit more examination i think - since I know loosely the CALM theorem, i wonder whether this presents a fundamental stumbling block.
 ### 8.6 Propagation and evolution
 
 Two operations stay separate:
