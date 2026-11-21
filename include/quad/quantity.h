@@ -139,6 +139,20 @@ QStatus qp_conv(int64_t a, const QConv *c, int64_t *out);
 QStatus qp_mul(int64_t a, int64_t b, const QConv *c, int64_t *out);
 QStatus qp_div(int64_t a, int64_t b, const QConv *c, int64_t *out);
 
+/* --- dimension text ------------------------------------------------------------ */
+
+/* Parse a dimension (ADR 0009 section 10). The grammar:
+ *
+ *   dim   := ""  |  "1"  |  terms [ "/" terms ]
+ *   terms := term { (" " | "*") term }
+ *   term  := symbol [ "^" ["-"] digits ]
+ *
+ * The symbols are the SI base units (m kg s A K mol cd), the derived units
+ * N, J, W, Pa and Hz, and the names of the world's declared base dimensions:
+ * names[i] is base dimension Q_NSI + i. Every term after "/" is negated.
+ * Example: "kg m^2 s^-2" and "J" and "W s" are the same dimension. */
+QStatus q_parse_dim(const char *s, size_t len, const char *const *names, size_t nnames, QDim *out);
+
 /* --- decimal text ----------------------------------------------------------- */
 
 /* Parse [+-]digits[.digits][e[+-]digits] in coherent units into quanta of

@@ -3,7 +3,7 @@ CFLAGS  ?= -O2 -g
 override CFLAGS += -std=c11 -Wall -Wextra -Werror -Iinclude
 BUILD   ?= build
 
-SRC   := $(wildcard src/*.c)
+SRC   := $(wildcard src/*.c src/kernels/*.c)
 OBJ   := $(SRC:src/%.c=$(BUILD)/obj/%.o)
 TSRC  := $(wildcard tests/*.c)
 TOBJ  := $(TSRC:tests/%.c=$(BUILD)/obj/tests/%.o)

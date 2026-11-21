@@ -131,6 +131,7 @@ typedef struct QkHost {
     void      (*assume)(QkCall *call, uint32_t slot, QInterval range);    /* predict only */
     QRCursor  (*random)(QkCall *call, const char *stream);
     int64_t   (*now)(QkCall *call);
+    int8_t    (*tick_scale)(QkCall *call);   /* the world's tick is 10^tick_scale s */
     void      (*log)(QkCall *call, const char *message);
 } QkHost;
 

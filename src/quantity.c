@@ -470,6 +470,112 @@ QStatus qp_div(int64_t a, int64_t b, const QConv *c, int64_t *out)
     return point_out(r, out);
 }
 
+/* --- dimension text ----------------------------------------------------------------------- */
+
+typedef struct { const char *sym; int8_t l, m, t, a, k, n, j; } UnitSym;
+
+static const UnitSym unit_syms[] = {
+    /*        m  kg   s  A  K mol cd */
+    { "m",    1,  0,  0, 0, 0, 0, 0 },
+    { "kg",   0,  1,  0, 0, 0, 0, 0 },
+    { "s",    0,  0,  1, 0, 0, 0, 0 },
+    { "A",    0,  0,  0, 1, 0, 0, 0 },
+    { "K",    0,  0,  0, 0, 1, 0, 0 },
+    { "mol",  0,  0,  0, 0, 0, 1, 0 },
+    { "cd",   0,  0,  0, 0, 0, 0, 1 },
+    { "N",    1,  1, -2, 0, 0, 0, 0 },
+    { "J",    2,  1, -2, 0, 0, 0, 0 },
+    { "W",    2,  1, -3, 0, 0, 0, 0 },
+    { "Pa",  -1,  1, -2, 0, 0, 0, 0 },
+    { "Hz",   0,  0, -1, 0, 0, 0, 0 },
+};
+
+static bool is_name_char(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9');
+}
+
+/* the dimension of one symbol, or false if the symbol is unknown */
+static bool symbol_dim(const char *s, size_t n, const char *const *names, size_t nnames, QDim *out)
+{
+    *out = qdim_none();
+    for (size_t i = 0; i < sizeof unit_syms / sizeof unit_syms[0]; i++) {
+        const UnitSym *u = &unit_syms[i];
+        if (strlen(u->sym) == n && !memcmp(u->sym, s, n)) {
+            out->exp[Q_BASE_LENGTH] = u->l;
+            out->exp[Q_BASE_MASS] = u->m;
+            out->exp[Q_BASE_TIME] = u->t;
+            out->exp[Q_BASE_CURRENT] = u->a;
+            out->exp[Q_BASE_TEMPERATURE] = u->k;
+            out->exp[Q_BASE_AMOUNT] = u->n;
+            out->exp[Q_BASE_LUMINOUS] = u->j;
+            return true;
+        }
+    }
+    for (size_t i = 0; i < nnames && Q_NSI + i < Q_MAXBASE; i++) {
+        if (names[i] && strlen(names[i]) == n && !memcmp(names[i], s, n)) {
+            out->exp[Q_NSI + i] = 1;
+            return true;
+        }
+    }
+    return false;
+}
+
+QStatus q_parse_dim(const char *s, size_t len, const char *const *names, size_t nnames, QDim *out)
+{
+    QDim d = qdim_none();
+    size_t i = 0;
+    bool denominator = false, any = false;
+    if (len == 1 && s[0] == '1') {
+        *out = d;
+        return Q_OK;
+    }
+    while (i < len) {
+        if (s[i] == ' ' || s[i] == '*') {
+            i++;
+            continue;
+        }
+        if (s[i] == '/') {
+            if (denominator || !any) return Q_ESYNTAX;
+            denominator = true;
+            any = false;
+            i++;
+            continue;
+        }
+        size_t start = i;
+        while (i < len && is_name_char(s[i])) i++;
+        if (i == start || (s[start] >= '0' && s[start] <= '9')) return Q_ESYNTAX;
+        QDim sym;
+        if (!symbol_dim(s + start, i - start, names, nnames, &sym)) return Q_EDIM;
+        int exp = 1;
+        if (i < len && s[i] == '^') {
+            i++;
+            bool neg = false;
+            if (i < len && s[i] == '-') {
+                neg = true;
+                i++;
+            }
+            if (i >= len || s[i] < '0' || s[i] > '9') return Q_ESYNTAX;
+            exp = 0;
+            while (i < len && s[i] >= '0' && s[i] <= '9') {
+                exp = exp * 10 + (s[i++] - '0');
+                if (exp > 127) return Q_EDIM;
+            }
+            if (neg) exp = -exp;
+        }
+        if (denominator) exp = -exp;
+        for (int b = 0; b < Q_MAXBASE; b++) {
+            int e = d.exp[b] + exp * sym.exp[b];
+            if (e < INT8_MIN || e > INT8_MAX) return Q_EDIM;
+            d.exp[b] = (int8_t) e;
+        }
+        any = true;
+    }
+    if (denominator && !any) return Q_ESYNTAX;
+    *out = d;
+    return Q_OK;
+}
+
 /* --- decimal text ------------------------------------------------------------------------ */
 
 QStatus q_parse_decimal(const char *s, size_t len, int scale, int64_t *out)
