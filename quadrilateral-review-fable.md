@@ -243,3 +243,36 @@ The research branches in section 4 are independent of each other. The results of
 No decisions are open.
 
 Section 2 of `quadrilateral-design.md` now includes the corrections from section 2 of this document.
+
+## 8. Points from the source conversation that the ADRs do not cover yet
+
+A second reading of `Brigadoon Triangle Language (2026-11-20).md`, on 2026-11-21, after phase 5, found these points. Line numbers refer to a copy of the transcript without the filler turns, so the quotes are the reference.
+
+### 8.1 Points that shape the language front end (ADR 0011 takes them in)
+
+| Point | Source | State |
+|---|---|---|
+| The type system as the dependency system: the compiler knows which facts depend on which, and builds the incremental execution graph from that | "whether Triangle's type system can also serve as its simulation dependency system" | Not addressed. ADR 0011 makes the elaborator compute the dependency graph and record it in the IR. |
+| An explicit distinction between pure, monotonic deductions and state-changing processes | "an explicit distinction between pure, monotonic deductions and state-changing processes" | ADR 0008 for propagation. ADR 0011 extends it to rules and relations. |
+| A Datalog-like relational layer (reachability, habitability, task eligibility) | Capability 2 of the first proposal | Not built. ADR 0011 constrains its semantics so that incremental evaluation stays valid. |
+| CHR (Constraint Handling Rules), rated "very high" | The technology table | Not addressed. CHR propagation rules are monotonic, but simplification rules remove constraints, so they are not monotonic. ADR 0011 allows only the propagation form inside an epoch. |
+| Applicability conditions of a model as constraints. A model declares its assumptions, the information it preserves, its cost, and its validity | "those applicability conditions could themselves be expressed as constraints" | ADR 0010 has models but no declarations of this kind. ADR 0011 gives model descriptions these fields, even before automatic selection uses them. |
+| Laws attached to a phenomenon (`#ConservationOfMass`, …) | The `#Combustion` sketch | Conservation is a property of a kind (ADR 0009). ADR 0011 lowers laws to conserved kinds, propagators, and invariants. |
+| Interactions as typed feature structures, which can be unified and inspected | "make interactions themselves typed feature structures" | The C host has port connections and transfers, but no interaction object. ADR 0011 makes interactions source-level structures that lower to both. |
+| A shared-variable view for convenience, compiled down to interactions | "offer a shared-variable view for convenience, but compile it down to interactions" | Not addressed. ADR 0011 lists it as optional syntax. |
+| Phenomena that start and end during a run (a fire starts) | The fire examples throughout | Not addressed: the world is built before the run. ADR 0011 requires instantiation rules, and the runtime must create and end phenomena at boundaries with stable identities. |
+| The workshop experiment: workers, tools, materials, recipes, needs. Measure how naturally the language expresses it, how much work is incremental, and whether the hot paths compile | "My first experiment would be to take a small simulation—perhaps a workshop" | Triangle has `examples/workshop`. ADR 0011 uses it as an acceptance test for the front end. |
+
+### 8.2 Points for the runtime that stay open
+
+| Point | Source | State |
+|---|---|---|
+| Probabilistic values: distributions over quantities and over future events ("for a negotiation, a distribution over possible future events") | Capability 4, and the time discussion | Intervals and seeded draws exist. Distributions as values do not. An event prediction is an interval, with no probability. |
+| A coarse model's port values carry an error bound ("expose a bounded boundary-temperature estimate"), and a bound that is too wide requests refinement | The wall example, section 5 | The aggregate room publishes its mean temperature as if it were the boundary temperature. Intervals could carry the bound, but no model widens them yet. This is also the "uncertainty" criterion of model selection. |
+| Evaluator directions: "the language could distinguish the mathematical relation from the directions in which an implementation can efficiently evaluate it" | The time discussion | Section 4 of this document planned this, but ADR 0009 has no flag for it. Narrowing kernels are relations in every direction, and evolution kernels are forward only. A reserved flag for backward evaluation would keep the option visible. |
+| Temporal constraints between events (Simple Temporal Networks: "A before B, B within five minutes of A") | The time discussion | Event times are intervals (ADR 0005), but events are not cells, so no propagator relates them. |
+| Trajectory constraints ("temperature never exceeds this threshold during the interval") | The time discussion | Open question 4 of the design. An evolution kernel could publish the range of a value over its step as an interval in an `OUT` slot, which would let a propagator check such a constraint. |
+| Agents as actors with beliefs, goals, and mailboxes, whose decisions are proposals; the separation of subjective knowledge from the authoritative simulation | The concurrency discussion | Not addressed. Runtime unification (ADR 0007) is the planned basis for exchanging partial descriptions. |
+| Spatial state, spatial queries, and sparse spatial updates | The first architecture | Not addressed. A Dwarf Fortress-like world needs a spatial index. |
+| Event history in the persistent world | The first architecture | Epochs can be kept (ADR 0008), but nothing keeps them yet, and there is no history of events. |
+| FMI capability negotiation | The FMI recommendation | Flags and table sizes cover part of it. |
