@@ -64,8 +64,14 @@ QNet   *qw_net(QWorld *w);
 QwStatus qw_base_dim(QWorld *w, const char *name);
 QwStatus qw_kind(QWorld *w, const char *name, const char *dim, int scale, bool conserved, QwKind *out);
 QwStatus qw_kind_type(const QWorld *w, QwKind kind, QType *out);
+/* An enumeration kind (ADR 0012): 1 to 64 atom names, in order. Atom i is
+ * bit i of a set cell's mask. */
+QwStatus qw_enum_kind(QWorld *w, const char *name, const char *const *atoms, unsigned n, QwKind *out);
+int      qw_atom(const QWorld *w, QwKind kind, const char *name);   /* the atom's index, or -1 */
 QwStatus qw_phenomenon(QWorld *w, const char *name, QwPhen *out);
 QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out);
+/* A set cell of an enumeration kind, with the mask of its possible atoms */
+QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out);
 QwStatus qw_find(const QWorld *w, const char *path, QnCell *out);
 const char *qw_cell_path(const QWorld *w, QnCell c);
 QwStatus qw_connect(QWorld *w, QwPhen p, const char *port, const char *target);
@@ -99,10 +105,12 @@ QwStatus qw_run(QWorld *w, int64_t until);
 /* An input from outside the simulation: replaces a value at the current time,
  * in a new epoch. A stock cannot take an input. */
 QwStatus qw_input(QWorld *w, const char *path, QInterval v);
+QwStatus qw_input_set(QWorld *w, const char *path, uint64_t mask);
 
 int64_t   qw_now(const QWorld *w);
 uint64_t  qw_boundaries(const QWorld *w);
 QInterval qw_get(const QWorld *w, const char *path);     /* through ports; the top interval if unknown */
+uint64_t  qw_get_set(const QWorld *w, const char *path); /* through ports; 0 if not a set cell */
 uint64_t  qw_predicts(const QWorld *w, QwPhen p);        /* predict calls so far */
 uint64_t  qw_advances(const QWorld *w);                  /* advance calls so far */
 uint64_t  qw_switches(const QWorld *w);

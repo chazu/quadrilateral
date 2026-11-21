@@ -188,6 +188,8 @@ static QInterval set_value(uint64_t mask, uint64_t universe)
     return v;
 }
 
+QInterval qn_set_value(uint64_t mask, uint64_t universe) { return set_value(mask, universe); }
+
 static bool is_set(const QNet *net, QnCell c) { return net->cells[c].domain == D_SET; }
 
 static void contradict(QNet *net, QnCell c)

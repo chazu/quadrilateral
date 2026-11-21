@@ -133,6 +133,10 @@ typedef struct QkHost {
     int64_t   (*now)(QkCall *call);
     int8_t    (*tick_scale)(QkCall *call);   /* the world's tick is 10^tick_scale s */
     void      (*log)(QkCall *call, const char *message);
+    /* added by ADR 0012, at the end of the table */
+    int       (*atom)(QkCall *call, uint32_t slot, const char *name);
+    uint64_t  (*read_set)(QkCall *call, uint32_t slot);
+    int       (*write_atom)(QkCall *call, uint32_t slot, uint32_t atom);
 } QkHost;
 
 typedef struct QkKernel {

@@ -9,7 +9,7 @@
 
 #define NO_MODEL (-1)
 
-typedef struct { char *name; QType type; bool conserved; } Kind;
+typedef struct { char *name; QType type; bool conserved; char **atoms; unsigned natoms; } Kind;   /* natoms 0: a quantity */
 typedef struct { char *path; QwKind kind; QwPhen owner; int model; } CellInfo;
 typedef struct { char *port, *target; } Port;                   /* qw_connect */
 typedef struct { char *port; int model; char *target; } PortMap;   /* qw_port */
@@ -220,11 +220,24 @@ static void set_assume(Att *a, uint32_t slot, QnCell cell, QInterval range, bool
     a->as[a->nas++] = (Assume) { slot, cell, range, explicit_ };
 }
 
+static uint64_t word(int64_t v)
+{
+    uint64_t u;
+    memcpy(&u, &v, sizeof u);
+    return u;
+}
+
+static bool set_cell(const QWorld *w, QnCell c) { return qn_is_set(w->net, c); }
+
 static QInterval h_read(QkCall *c, uint32_t slot)
 {
     if (!slot_ok(c, slot)) return qi_top();
     Att *a = c->att;
     const QkSlot *s = &a->k->slots[slot];
+    if (set_cell(c->w, a->bind[slot])) {
+        call_err(c, QK_HOST_EROLE, "slot '%s' is a set; read it with read_set", s->name);
+        return qi_top();
+    }
     if (s->role == QK_LINK) {
         call_err(c, QK_HOST_EROLE, "slot '%s' is a link, which cannot be read", s->name);
         return qi_top();
@@ -236,11 +249,61 @@ static QInterval h_read(QkCall *c, uint32_t slot)
 
 static bool changing(int mode) { return mode == M_ADVANCE || mode == M_MAP; }
 
+static uint64_t h_read_set(QkCall *c, uint32_t slot)
+{
+    if (!slot_ok(c, slot)) return 0;
+    Att *a = c->att;
+    const QkSlot *s = &a->k->slots[slot];
+    QnCell cell = a->bind[slot];
+    if (!set_cell(c->w, cell)) {
+        call_err(c, QK_HOST_EROLE, "slot '%s' is not a set", s->name);
+        return 0;
+    }
+    if (c->mode == M_PREDICT && s->role == QK_IN) set_assume(a, slot, cell, qn_get(c->w->net, cell), false);
+    return qn_get_set(c->w->net, cell);
+}
+
+static int h_atom(QkCall *c, uint32_t slot, const char *name)
+{
+    if (!slot_ok(c, slot)) return -1;
+    QnCell cell = c->att->bind[slot];
+    if (!set_cell(c->w, cell)) {
+        call_err(c, QK_HOST_EROLE, "slot '%s' is not a set", c->att->k->slots[slot].name);
+        return -1;
+    }
+    const Kind *k = &c->w->kinds[c->w->cells[cell].kind];
+    for (unsigned i = 0; i < k->natoms; i++)
+        if (!strcmp(k->atoms[i], name)) return (int) i;
+    return -1;
+}
+
+static void touch(QWorld *w, QnCell c);
+
+static int h_write_atom(QkCall *c, uint32_t slot, uint32_t atom)
+{
+    if (!slot_ok(c, slot)) return QK_HOST_EINDEX;
+    Att *a = c->att;
+    const QkSlot *s = &a->k->slots[slot];
+    QnCell cell = a->bind[slot];
+    if (!changing(c->mode)) return call_err(c, QK_HOST_EMODE, "write to slot '%s' outside advance", s->name);
+    if (s->role != QK_OUT && s->role != QK_STATE)
+        return call_err(c, QK_HOST_EROLE, "write to slot '%s', which is not an output or a state", s->name);
+    if (!set_cell(c->w, cell)) return call_err(c, QK_HOST_EROLE, "slot '%s' is not a set", s->name);
+    if (atom >= c->w->kinds[c->w->cells[cell].kind].natoms)
+        return call_err(c, QK_HOST_EVALUE, "atom %u out of range for slot '%s'", atom, s->name);
+    c->w->wval[cell] = atom;
+    c->w->written[cell] = true;
+    touch(c->w, cell);
+    return QK_HOST_OK;
+}
+
 static int h_write(QkCall *c, uint32_t slot, int64_t value)
 {
     if (!slot_ok(c, slot)) return QK_HOST_EINDEX;
     Att *a = c->att;
     const QkSlot *s = &a->k->slots[slot];
+    if (set_cell(c->w, a->bind[slot]))
+        return call_err(c, QK_HOST_EROLE, "slot '%s' is a set; write it with write_atom", s->name);
     if (!changing(c->mode)) return call_err(c, QK_HOST_EMODE, "write to slot '%s' outside advance", s->name);
     if (s->role != QK_OUT && s->role != QK_STATE)
         return call_err(c, QK_HOST_EROLE, "write to slot '%s', which is not an output or a state", s->name);
@@ -329,7 +392,8 @@ QWorld *qw_new(uint64_t seed, int8_t tick_scale)
     w->seed = seed;
     w->tick = tick_scale;
     w->host = (QkHost) { QK_ABI_VERSION, sizeof(QkHost), h_read,   h_write,      h_transfer, h_tell,
-                         h_assume,       h_random,        h_now,  h_tick_scale, h_log };
+                         h_assume,       h_random,        h_now,  h_tick_scale, h_log,
+                         h_atom,         h_read_set,      h_write_atom };
     return w;
 }
 
@@ -357,7 +421,11 @@ void qw_free(QWorld *w)
         free(p->name);
     }
     for (size_t i = 0; i < w->nbases; i++) free(w->bases[i]);
-    for (size_t i = 0; i < w->nkinds; i++) free(w->kinds[i].name);
+    for (size_t i = 0; i < w->nkinds; i++) {
+        for (unsigned j = 0; j < w->kinds[i].natoms; j++) free(w->kinds[i].atoms[j]);
+        free(w->kinds[i].atoms);
+        free(w->kinds[i].name);
+    }
     for (size_t i = 0; i < w->ncells; i++) free(w->cells[i].path);
     for (size_t i = 0; i < w->nnctx; i++) free(w->nctx[i]);
     free(w->bases);
@@ -414,8 +482,50 @@ QwStatus qw_kind(QWorld *w, const char *name, const char *dim, int scale, bool c
     if (!(k->name = dupstr(name))) return QW_ENOMEM;
     k->type = qtype_make((uint32_t) w->nkinds + 1, d, (int8_t) scale);
     k->conserved = conserved;
+    k->atoms = NULL;
+    k->natoms = 0;
     *out = (QwKind) w->nkinds++;
     return QW_OK;
+}
+
+QwStatus qw_enum_kind(QWorld *w, const char *name, const char *const *atoms, unsigned n, QwKind *out)
+{
+    if (!valid_name(name)) return fail(w, QW_ENAME, "invalid kind name '%s'", name);
+    for (size_t i = 0; i < w->nkinds; i++)
+        if (!strcmp(w->kinds[i].name, name)) return fail(w, QW_EDUP, "kind '%s' already exists", name);
+    if (n < 1 || n > QN_MAXATOMS) return fail(w, QW_ETYPE, "kind '%s' needs 1 to %d atoms", name, QN_MAXATOMS);
+    for (unsigned i = 0; i < n; i++) {
+        if (!valid_name(atoms[i])) return fail(w, QW_ENAME, "kind '%s': invalid atom name '%s'", name, atoms[i]);
+        for (unsigned j = 0; j < i; j++)
+            if (!strcmp(atoms[i], atoms[j])) return fail(w, QW_EDUP, "kind '%s': atom '%s' twice", name, atoms[i]);
+    }
+    if (!grow((void **) &w->kinds, &w->capkinds, w->nkinds + 1, sizeof *w->kinds)) return QW_ENOMEM;
+    Kind *k = &w->kinds[w->nkinds];
+    memset(k, 0, sizeof *k);
+    if (!(k->name = dupstr(name)) || !(k->atoms = calloc(n, sizeof *k->atoms))) {
+        free(k->name);
+        return QW_ENOMEM;
+    }
+    for (unsigned i = 0; i < n; i++)
+        if (!(k->atoms[i] = dupstr(atoms[i]))) {
+            for (unsigned j = 0; j < i; j++) free(k->atoms[j]);
+            free(k->atoms);
+            free(k->name);
+            return QW_ENOMEM;
+        }
+    k->natoms = n;
+    k->type = qtype_make((uint32_t) w->nkinds + 1, qdim_none(), 0);
+    *out = (QwKind) w->nkinds++;
+    return QW_OK;
+}
+
+int qw_atom(const QWorld *w, QwKind kind, const char *name)
+{
+    if (kind >= w->nkinds) return -1;
+    const Kind *k = &w->kinds[kind];
+    for (unsigned i = 0; i < k->natoms; i++)
+        if (!strcmp(k->atoms[i], name)) return (int) i;
+    return -1;
 }
 
 QwStatus qw_kind_type(const QWorld *w, QwKind kind, QType *out)
@@ -512,7 +622,8 @@ QwStatus qw_find(const QWorld *w, const char *path, QnCell *out)
 
 const char *qw_cell_path(const QWorld *w, QnCell c) { return c < w->ncells ? w->cells[c].path : "?"; }
 
-QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out)
+static QwStatus add_cell(QWorld *w, const char *path, QwKind kind, bool is_set, QInterval base, uint64_t mask,
+                         QnCell *out)
 {
     const char *dot = strchr(path, '.');
     QwPhen owner;
@@ -527,6 +638,9 @@ QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCel
     int model = find_model(p, second, dot2 ? (size_t) (dot2 - second) : strlen(second));
     if (model != NO_MODEL && !dot2) return fail(w, QW_ENAME, "cell path '%s' is the name of a model", path);
     const Kind *k = &w->kinds[kind];
+    if (is_set != (k->natoms > 0))
+        return fail(w, QW_ETYPE, "cell '%s': kind '%s' %s", path, k->name,
+                    is_set ? "is not an enumeration" : "is an enumeration; use qw_set_cell");
     if (k->conserved && (!qi_is_point(base) || base.lo == Q_NINF || base.hi == Q_INF))
         return fail(w, QW_ESTOCK, "stock '%s' needs an exact value", path);
     if (k->conserved && model != NO_MODEL && model != p->active && base.lo != 0)
@@ -543,8 +657,8 @@ QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCel
         w->capstage = c1;
     }
     QnCell c;
-    QnStatus s = qn_cell(w->net, &k->type, base, &c);
-    if (s == QN_EVALUE) return fail(w, QW_ETYPE, "cell '%s': invalid interval", path);
+    QnStatus s = is_set ? qn_set_cell(w->net, k->type.kind, k->natoms, mask, &c) : qn_cell(w->net, &k->type, base, &c);
+    if (s == QN_EVALUE) return fail(w, QW_ETYPE, "cell '%s': invalid value", path);
     if (s) return fail(w, QW_ENOMEM, "cell '%s': %s", path, qn_status_str(s));
     CellInfo *ci = &w->cells[w->ncells];
     if (!(ci->path = dupstr(path))) return QW_ENOMEM;
@@ -557,6 +671,16 @@ QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCel
     w->ncells++;
     if (out) *out = c;
     return QW_OK;
+}
+
+QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out)
+{
+    return add_cell(w, path, kind, false, base, 0, out);
+}
+
+QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out)
+{
+    return add_cell(w, path, kind, true, qi_top(), base, out);
 }
 
 QwStatus qw_connect(QWorld *w, QwPhen pid, const char *port, const char *target)
@@ -693,6 +817,26 @@ static QwStatus bind_kernel(QWorld *w, QwPhen pid, int m, const QkKernel *k, con
         }
         const CellInfo *ci = &w->cells[c];
         const Kind *kind = &w->kinds[ci->kind];
+        bool atoms_slot = !strcmp(s->dimension, "atoms");
+        if (atoms_slot != (kind->natoms > 0)) {
+            st = fail(w, QW_ETYPE, "%s: slot '%s' %s, but '%s' is %s", pn, s->name,
+                      atoms_slot ? "holds atoms" : "holds a quantity", path,
+                      kind->natoms ? "a set cell" : "a quantity cell");
+            goto out;
+        }
+        if (atoms_slot) {
+            if (s->role == QK_STOCK || s->role == QK_LINK) {
+                st = fail(w, QW_ETYPE, "%s: slot '%s' holds atoms, which cannot be a stock", pn, s->name);
+                goto out;
+            }
+            if ((s->role == QK_STATE || s->role == QK_OUT) && ci->owner != pid) {
+                st = fail(w, QW_EOWNER, "%s: slot '%s' would write '%s', which belongs to %s", pn, s->name, path,
+                          w->phens[ci->owner].name);
+                goto out;
+            }
+            bind[i] = c;
+            continue;
+        }
         QDim d;
         if (parse_dim(w, s->dimension, &d) != Q_OK) {
             st = fail(w, QW_ETYPE, "%s: slot '%s' of kernel '%s': cannot read dimension '%s'", pn, s->name, k->name,
@@ -883,7 +1027,7 @@ static QwStatus check_valid(QWorld *w, const Phen *p, const Att *a)
 {
     for (uint32_t i = 0; i < a->k->nslots; i++) {
         const QkSlot *s = &a->k->slots[i];
-        if (s->role == QK_LINK) continue;
+        if (s->role == QK_LINK || set_cell(w, a->bind[i])) continue;
         QInterval v = qi_conv(qn_get(w->net, a->bind[i]), &a->to_slot[i]);
         if (!qi_subset(v, s->valid)) {
             char lo[64], hi[64];
@@ -937,7 +1081,8 @@ static void invalidate(QWorld *w)
                 continue;
             }
             for (size_t j = 0; j < a->nas; j++)
-                if (!qi_subset(qn_get(w->net, a->as[j].cell), a->as[j].range)) {
+                if (set_cell(w, a->as[j].cell) ? (qn_get_set(w->net, a->as[j].cell) & ~word(a->as[j].range.lo)) != 0
+                                               : !qi_subset(qn_get(w->net, a->as[j].cell), a->as[j].range)) {
                     a->predicted = false;
                     break;
                 }
@@ -994,9 +1139,11 @@ static int cmp_cell(const void *a, const void *b)
 /* Stages the touched cells in order of cell index, and logs each change.
  * The cost grows with the number of touched cells only. If a stock goes out
  * of range, nothing is staged or logged. On return, the staging is clear. */
-static QwStatus commit(QWorld *w)
+/* Checks that the staged changes can commit: no stock out of range, and room
+ * in the change log. On failure, the staging is clear. After a success,
+ * commit cannot fail. */
+static QwStatus commit_check(QWorld *w)
 {
-    qsort(w->changed, w->nchanged, sizeof *w->changed, cmp_cell);
     for (size_t i = 0; i < w->nchanged; i++) {
         QnCell c = w->changed[i];
         int64_t v;
@@ -1010,10 +1157,22 @@ static QwStatus commit(QWorld *w)
         clear_staging(w);
         return fail(w, QW_ENOMEM, "no memory for the change log");
     }
+    return QW_OK;
+}
+
+static QwStatus commit(QWorld *w)
+{
+    QwStatus st = commit_check(w);
+    if (st) return st;
+    qsort(w->changed, w->nchanged, sizeof *w->changed, cmp_cell);
     for (size_t i = 0; i < w->nchanged; i++) {
         QnCell c = w->changed[i];
         QInterval base = qn_base(w->net, c);
-        if (w->written[c]) {
+        if (w->written[c] && set_cell(w, c)) {
+            uint64_t mask = (uint64_t) 1 << w->wval[c];
+            qn_stage_set(w->net, c, mask);
+            log_change(w, c, QW_CHANGE_VALUE, base, qn_set_value(mask, word(base.hi)), 0);
+        } else if (w->written[c]) {
             QInterval v = qi_point(w->wval[c]);
             qn_stage(w->net, c, v);
             log_change(w, c, QW_CHANGE_VALUE, base, v, 0);
@@ -1128,6 +1287,9 @@ QwStatus qw_switch(QWorld *w, QwPhen pid, const char *model, const QkKernel *map
         }
     }
 
+    /* the commit in step 5 must not fail after the switch takes effect */
+    if ((st = commit_check(w))) goto fail_map;
+
     /* 4. make the new model active and bind every kernel again */
     p->active = to;
     size_t natt = 0;
@@ -1206,6 +1368,7 @@ QwStatus qw_input(QWorld *w, const char *path, QInterval v)
     if (qw_find(w, path, &c) != QW_OK) return fail(w, QW_ENAME, "no cell '%s'", path);
     if (w->kinds[w->cells[c].kind].conserved)
         return fail(w, QW_ESTOCK, "'%s' is a stock; a stock changes only by transfers", path);
+    if (set_cell(w, c)) return fail(w, QW_ETYPE, "'%s' is a set cell; use qw_input_set", path);
     if (!qi_valid(v)) return fail(w, QW_ETYPE, "invalid interval for '%s'", path);
     if (!log_reserve(w, 1)) return fail(w, QW_ENOMEM, "no memory for the change log");
     size_t logged = w->nlog;
@@ -1216,6 +1379,35 @@ QwStatus qw_input(QWorld *w, const char *path, QInterval v)
     QwStatus st = settle(w);
     invalidate(w);
     return st;
+}
+
+QwStatus qw_input_set(QWorld *w, const char *path, uint64_t mask)
+{
+    QnCell c;
+    if (qw_find(w, path, &c) != QW_OK) return fail(w, QW_ENAME, "no cell '%s'", path);
+    if (!set_cell(w, c)) return fail(w, QW_ETYPE, "'%s' is not a set cell", path);
+    QInterval base = qn_base(w->net, c);
+    uint64_t universe = word(base.hi);
+    if (!mask || (mask & ~universe)) return fail(w, QW_ETYPE, "invalid atoms for '%s'", path);
+    if (!log_reserve(w, 1)) return fail(w, QW_ENOMEM, "no memory for the change log");
+    size_t logged = w->nlog;
+    log_change(w, c, QW_CHANGE_VALUE, base, qn_set_value(mask, universe), 0);
+    qn_stage_set(w->net, c, mask);
+    qn_begin_epoch(w->net);
+    log_stamp(w, logged);
+    QwStatus st = settle(w);
+    invalidate(w);
+    return st;
+}
+
+uint64_t qw_get_set(const QWorld *w, const char *path)
+{
+    char resolved[512];
+    bool via = false;
+    resolve_ports(w, path, resolved, sizeof resolved, &via);
+    QnCell c;
+    if (qw_find(w, resolved, &c) != QW_OK) return 0;
+    return qn_get_set(w->net, c);
 }
 
 QInterval qw_get(const QWorld *w, const char *path)
@@ -1234,7 +1426,7 @@ int64_t qw_total(const QWorld *w, QwKind kind)
 {
     int64_t t = 0;
     for (size_t c = 0; c < w->ncells; c++)
-        if (w->cells[c].kind == kind) {
+        if (w->cells[c].kind == kind && !set_cell(w, (QnCell) c)) {
             int64_t v;
             if (qp_add(t, qn_base(w->net, (QnCell) c).lo, &v) == Q_OK) t = v;
         }

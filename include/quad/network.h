@@ -77,6 +77,8 @@ QnStatus qn_custom(QNet *net, const QnCell *cells, size_t n, QnFn fn, void *ctx)
 #define QN_MAXATOMS 64
 
 QnStatus qn_set_cell(QNet *net, uint32_t kind, unsigned natoms, uint64_t base, QnCell *out);
+/* The 16-byte value of a set cell, as qn_get gives it */
+QInterval qn_set_value(uint64_t mask, uint64_t universe);
 bool     qn_is_set(const QNet *net, QnCell c);
 uint64_t qn_get_set(const QNet *net, QnCell c);     /* 0 for an interval cell */
 uint64_t qn_base_set(const QNet *net, QnCell c);

@@ -75,6 +75,13 @@ typedef struct QkHost {
     int64_t   (*now)(QkCall *call);
     int8_t    (*tick_scale)(QkCall *call);
     void      (*log)(QkCall *call, const char *message);
+
+    /* Set slots (ADR 0012). A slot whose dimension is "atoms" binds to a set
+     * cell. A kernel checks that `size` covers these fields before it uses
+     * them. */
+    int       (*atom)(QkCall *call, uint32_t slot, const char *name);   /* the atom's index, or -1 */
+    uint64_t  (*read_set)(QkCall *call, uint32_t slot);                /* the mask of possible atoms */
+    int       (*write_atom)(QkCall *call, uint32_t slot, uint32_t atom); /* OUT, STATE; advance, map */
 } QkHost;
 
 typedef struct QkKernel {
@@ -91,6 +98,9 @@ typedef struct QkKernel {
     QkResult (*create)(const struct QkKernel *self, const QkHost *host, QkCall *call, QkInstance **out);
     void     (*destroy)(QkInstance *inst);
     QkResult (*predict)(QkInstance *inst, QkCall *call, QkPrediction *out);
+    /* `to` can be any time up to the horizon. Other kernels cause boundaries
+     * too, so advance must give the right result for any step length, and
+     * change discrete state only at its own event times. */
     QkResult (*advance)(QkInstance *inst, QkCall *call, int64_t to);
     QkResult (*map)(QkInstance *inst, QkCall *call);
     void     (*narrow)(QkInstance *inst, QkCall *call);
