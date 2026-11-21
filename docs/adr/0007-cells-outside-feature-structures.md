@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Changing state is in cells, outside the feature-structure graph
@@ -13,6 +13,7 @@ Feature structures describe phenomena, models, ports, and interactions. A propag
 - Propagators and evaluators refer to cells by index. Cells are stored as arrays of values, not as linked nodes.
 - After load, feature structures do not change. Unification at run time is still available. For example, agents can exchange partial descriptions, and an operation can be matched against a description. Such unification creates new structures and never changes a cell.
 - To match a pattern against current state, the runtime builds a description from the cells. Bruggadung's runtime does the same, but through text. Quadrilateral builds the description through handles.
+- Cells are invisible to the author. Quadrilateral source, error messages, traces, and EXPLAIN output name a value by its phenomenon and feature path, never by a cell index. When source reads a state value, it gets a feature-structure value. The split between cells and feature structures is an implementation choice, and the language does not expose it.
 
 ## Consequences
 

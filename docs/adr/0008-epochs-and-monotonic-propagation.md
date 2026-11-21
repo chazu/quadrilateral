@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Propagation is monotonic inside an epoch, and every non-monotonic step happens at an epoch boundary
