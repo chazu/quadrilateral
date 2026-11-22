@@ -10,7 +10,15 @@
 #define NO_MODEL (-1)
 
 typedef struct { char *name; QType type; bool conserved; char **atoms; unsigned natoms; } Kind;   /* natoms 0: a quantity */
-typedef struct { char *path; QwKind kind; QwPhen owner; int model; } CellInfo;
+typedef struct {
+    char     *path;
+    uint64_t  hash;        /* of the path, for qw_hash */
+    QwKind    kind;
+    QwPhen    owner;
+    int       model;
+    QInterval init;        /* the declared base; an instance's cell returns to it at an end */
+    bool      host_only;   /* "<key>.alive": only the host writes it */
+} CellInfo;
 typedef struct { char *port, *target; } Port;                   /* qw_connect */
 typedef struct { char *port; int model; char *target; } PortMap;   /* qw_port */
 typedef struct { uint32_t slot; QnCell cell; QInterval range; bool explicit_; } Assume;
@@ -43,6 +51,20 @@ typedef struct {
     int      active;            /* a model index, or NO_MODEL if the phenomenon has no models */
     Att      base;
     uint64_t predicts;
+    uint64_t ident;             /* a hash of the name: the identity for random streams (ADR 0013) */
+    QnCell  *cells;             /* the cells that the phenomenon owns */
+    size_t   ncells, capcells;
+
+    /* instances (ADR 0013) */
+    bool            instance;
+    bool            alive;      /* always true for a phenomenon that is not an instance */
+    QnGroup         group;      /* the instance's propagators outside its models */
+    QnCell          alive_cell;
+    bool            has_cond;
+    QnCell          cond;
+    const QkKernel *start_map, *end_map;
+    uint64_t        flipped;    /* the lifecycle step in which the instance last changed */
+    uint64_t        mark;       /* scratch for one round of the lifecycle step */
 } Phen;
 
 typedef struct { QWorld *w; QwPhen id; int model; } NarrowCtx;
@@ -75,7 +97,13 @@ struct QWorld {
     size_t     nnctx, capnctx;
 
     int64_t    now;
-    uint64_t   boundaries, advances, switches;
+    uint64_t   boundaries, advances, switches, starts, ends;
+
+    QwKind     boolean;     /* the built-in kind */
+    QnGroup    build_group; /* the group of new propagators outside a model: 0, or an instance's */
+    QwPhen    *conds;       /* the instances that have an existence condition */
+    size_t     nconds, capconds;
+    uint64_t   life_step, life_round;
 
     /* staging for one boundary or switch, one entry for each cell */
     int64_t   *delta, *wval;
@@ -139,6 +167,7 @@ const char *qw_status_str(QwStatus s)
     case QW_ECONTRADICTION: return "contradiction";
     case QW_ESTOCK:         return "stock changed other than by a transfer";
     case QW_ETIME:          return "invalid time";
+    case QW_ELIFE:          return "instance in the wrong state";
     case QW_ENOMEM:         return "out of memory";
     }
     return "unknown status";
@@ -150,6 +179,9 @@ int64_t qw_now(const QWorld *w) { return w->now; }
 uint64_t qw_boundaries(const QWorld *w) { return w->boundaries; }
 uint64_t qw_advances(const QWorld *w) { return w->advances; }
 uint64_t qw_switches(const QWorld *w) { return w->switches; }
+uint64_t qw_starts(const QWorld *w) { return w->starts; }
+uint64_t qw_ends(const QWorld *w) { return w->ends; }
+QwKind qw_boolean(const QWorld *w) { return w->boolean; }
 
 /* Adds cell c to the list of touched cells, once. The list has room for
  * every cell, so this cannot fail. */
@@ -363,10 +395,12 @@ static int h_assume(QkCall *c, uint32_t slot, QInterval range)
     return QK_HOST_OK;
 }
 
-/* An advance draws with its event count. A map draws with the epoch (ADR 0010). */
+/* An advance draws with its event count. A map draws with the epoch (ADR 0010).
+ * The identity is a hash of the phenomenon's name, never its index, so the
+ * draws do not depend on the order of creation (ADR 0013). */
 static QRCursor h_random(QkCall *c, const char *stream)
 {
-    QRStream s = qr_stream(c->w->seed, c->id, stream);
+    QRStream s = qr_stream(c->w->seed, call_phen(c)->ident, stream);
     return qr_cursor(&s, c->mode == M_MAP ? qn_epoch(c->w->net) : c->att->events);
 }
 
@@ -394,6 +428,11 @@ QWorld *qw_new(uint64_t seed, int8_t tick_scale)
     w->host = (QkHost) { QK_ABI_VERSION, sizeof(QkHost), h_read,   h_write,      h_transfer, h_tell,
                          h_assume,       h_random,        h_now,  h_tick_scale, h_log,
                          h_atom,         h_read_set,      h_write_atom };
+    static const char *const atoms[2] = { "false", "true" };
+    if (qw_enum_kind(w, "boolean", atoms, 2, &w->boolean) != QW_OK) {
+        qw_free(w);
+        return NULL;
+    }
     return w;
 }
 
@@ -418,6 +457,7 @@ void qw_free(QWorld *w)
         free(p->models);
         free(p->ports);
         free(p->pmaps);
+        free(p->cells);
         free(p->name);
     }
     for (size_t i = 0; i < w->nbases; i++) free(w->bases[i]);
@@ -432,6 +472,7 @@ void qw_free(QWorld *w)
     free(w->kinds);
     free(w->cells);
     free(w->phens);
+    free(w->conds);
     free(w->nctx);
     free(w->delta);
     free(w->wval);
@@ -448,6 +489,19 @@ static bool valid_name(const char *s)
     if (!*s) return false;
     for (; *s; s++)
         if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') || *s == '_'))
+            return false;
+    return true;
+}
+
+/* The name of a phenomenon. An instance's key has the form
+ * "rule(participant,participant)", so a name can also contain '(', ')' and
+ * ','. The world does not interpret the key. */
+static bool valid_key(const char *s)
+{
+    if (!*s) return false;
+    for (; *s; s++)
+        if (!((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || (*s >= '0' && *s <= '9') || *s == '_' ||
+              *s == '(' || *s == ')' || *s == ','))
             return false;
     return true;
 }
@@ -552,19 +606,28 @@ static int find_model(const Phen *p, const char *name, size_t len)
     return NO_MODEL;
 }
 
-QwStatus qw_phenomenon(QWorld *w, const char *name, QwPhen *out)
+static QwStatus new_phen(QWorld *w, const char *name, QwPhen *out)
 {
-    if (!valid_name(name)) return fail(w, QW_ENAME, "invalid phenomenon name '%s'", name);
+    if (!valid_key(name)) return fail(w, QW_ENAME, "invalid phenomenon name '%s'", name);
     QwPhen dup;
     if (find_phen(w, name, strlen(name), &dup)) return fail(w, QW_EDUP, "phenomenon '%s' already exists", name);
+    uint64_t ident = qr_name_hash(name, strlen(name));
+    for (size_t i = 0; i < w->nphens; i++)
+        if (w->phens[i].ident == ident)
+            return fail(w, QW_EDUP, "the names '%s' and '%s' have the same hash, so their random streams would be equal",
+                        name, w->phens[i].name);
     if (!grow((void **) &w->phens, &w->capphens, w->nphens + 1, sizeof *w->phens)) return QW_ENOMEM;
     Phen *p = &w->phens[w->nphens];
     memset(p, 0, sizeof *p);
     p->active = NO_MODEL;
+    p->alive = true;
+    p->ident = ident;
     if (!(p->name = dupstr(name))) return QW_ENOMEM;
     *out = (QwPhen) w->nphens++;
     return QW_OK;
 }
+
+QwStatus qw_phenomenon(QWorld *w, const char *name, QwPhen *out) { return new_phen(w, name, out); }
 
 QwStatus qw_model(QWorld *w, QwPhen pid, const char *name)
 {
@@ -586,7 +649,7 @@ QwStatus qw_model(QWorld *w, QwPhen pid, const char *name)
     memset(m, 0, sizeof *m);
     if (!(m->name = dupstr(name))) return QW_ENOMEM;
     bool first = p->nmodels == 0;
-    if (qn_new_group(w->net, first, &m->group) != QN_OK) return QW_ENOMEM;
+    if (qn_new_group(w->net, first && p->alive, &m->group) != QN_OK) return QW_ENOMEM;
     if (first) p->active = 0;
     p->nmodels++;
     return QW_OK;
@@ -602,7 +665,7 @@ QwStatus qw_model_begin(QWorld *w, QwPhen pid, const char *model)
     return QW_OK;
 }
 
-void qw_model_end(QWorld *w) { qn_set_group(w->net, 0); }
+void qw_model_end(QWorld *w) { qn_set_group(w->net, w->build_group); }
 
 const char *qw_active_model(const QWorld *w, QwPhen pid)
 {
@@ -623,17 +686,19 @@ QwStatus qw_find(const QWorld *w, const char *path, QnCell *out)
 const char *qw_cell_path(const QWorld *w, QnCell c) { return c < w->ncells ? w->cells[c].path : "?"; }
 
 static QwStatus add_cell(QWorld *w, const char *path, QwKind kind, bool is_set, QInterval base, uint64_t mask,
-                         QnCell *out)
+                         bool host_only, QnCell *out)
 {
     const char *dot = strchr(path, '.');
     QwPhen owner;
     if (!dot || !dot[1]) return fail(w, QW_ENAME, "cell path '%s' has no phenomenon prefix", path);
     if (!find_phen(w, path, (size_t) (dot - path), &owner))
         return fail(w, QW_ENAME, "cell path '%s' names no phenomenon", path);
+    if (!host_only && !strcmp(dot + 1, "alive"))
+        return fail(w, QW_ENAME, "cell path '%s': the feature name 'alive' is reserved", path);
     QnCell dup;
     if (qw_find(w, path, &dup) == QW_OK) return fail(w, QW_EDUP, "cell '%s' already exists", path);
     if (kind >= w->nkinds) return fail(w, QW_ENAME, "cell '%s': no such kind", path);
-    const Phen *p = &w->phens[owner];
+    Phen *p = &w->phens[owner];
     const char *second = dot + 1, *dot2 = strchr(second, '.');
     int model = find_model(p, second, dot2 ? (size_t) (dot2 - second) : strlen(second));
     if (model != NO_MODEL && !dot2) return fail(w, QW_ENAME, "cell path '%s' is the name of a model", path);
@@ -645,7 +710,10 @@ static QwStatus add_cell(QWorld *w, const char *path, QwKind kind, bool is_set, 
         return fail(w, QW_ESTOCK, "stock '%s' needs an exact value", path);
     if (k->conserved && model != NO_MODEL && model != p->active && base.lo != 0)
         return fail(w, QW_ESTOCK, "stock '%s' belongs to an inactive model, so it must be zero", path);
+    if (k->conserved && p->instance && base.lo != 0)
+        return fail(w, QW_ESTOCK, "stock '%s' belongs to an instance, so it must be declared as zero", path);
     if (!grow((void **) &w->cells, &w->capcells, w->ncells + 1, sizeof *w->cells)) return QW_ENOMEM;
+    if (!grow((void **) &p->cells, &p->capcells, p->ncells + 1, sizeof *p->cells)) return QW_ENOMEM;
     size_t need = w->ncells + 1;
     if (need > w->capstage) {
         size_t c1 = w->capstage, c2 = w->capstage, c3 = w->capstage, c4 = w->capstage, c5 = w->capstage;
@@ -662,9 +730,13 @@ static QwStatus add_cell(QWorld *w, const char *path, QwKind kind, bool is_set, 
     if (s) return fail(w, QW_ENOMEM, "cell '%s': %s", path, qn_status_str(s));
     CellInfo *ci = &w->cells[w->ncells];
     if (!(ci->path = dupstr(path))) return QW_ENOMEM;
+    ci->hash = qr_name_hash(path, strlen(path));
     ci->kind = kind;
     ci->owner = owner;
     ci->model = model;
+    ci->init = qn_base(w->net, c);
+    ci->host_only = host_only;
+    p->cells[p->ncells++] = c;
     w->delta[c] = w->wval[c] = 0;
     w->written[c] = false;
     w->touched[c] = false;
@@ -675,12 +747,12 @@ static QwStatus add_cell(QWorld *w, const char *path, QwKind kind, bool is_set, 
 
 QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out)
 {
-    return add_cell(w, path, kind, false, base, 0, out);
+    return add_cell(w, path, kind, false, base, 0, false, out);
 }
 
 QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out)
 {
-    return add_cell(w, path, kind, true, qi_top(), base, out);
+    return add_cell(w, path, kind, true, qi_top(), base, false, out);
 }
 
 QwStatus qw_connect(QWorld *w, QwPhen pid, const char *port, const char *target)
@@ -714,6 +786,14 @@ QwStatus qw_port(QWorld *w, QwPhen pid, const char *port, const char *model, con
     pm->model = m;
     p->npmaps++;
     return QW_OK;
+}
+
+/* The phenomenon that the target of a port names: the first component of
+ * the target path. */
+static bool port_phen(const QWorld *w, const char *target, QwPhen *out)
+{
+    const char *dot = strchr(target, '.');
+    return find_phen(w, target, dot ? (size_t) (dot - target) : strlen(target), out);
 }
 
 /* "P.port.rest" becomes "<target>.rest" when P maps `port` for its active
@@ -834,6 +914,10 @@ static QwStatus bind_kernel(QWorld *w, QwPhen pid, int m, const QkKernel *k, con
                           w->phens[ci->owner].name);
                 goto out;
             }
+            if ((s->role == QK_STATE || s->role == QK_OUT) && ci->host_only) {
+                st = fail(w, QW_EOWNER, "%s: slot '%s' would write '%s', which only the host writes", pn, s->name, path);
+                goto out;
+            }
             bind[i] = c;
             continue;
         }
@@ -949,6 +1033,13 @@ static QwStatus attach(QWorld *w, QwPhen pid, int m, const QkKernel *k)
     QwStatus st = check_contract(w, pn, k);
     if (st) return st;
     if (k->flags & QK_MAP) return fail(w, QW_EKERNEL, "%s: kernel '%s' is a map kernel; use qw_switch", pn, k->name);
+    if (!p->instance)
+        for (size_t i = 0; i < p->nports; i++) {
+            QwPhen q;
+            if (port_phen(w, p->ports[i].target, &q) && w->phens[q].instance)
+                return fail(w, QW_ELIFE, "%s: port '%s' connects to the instance '%s', but %s is not an instance", pn,
+                            p->ports[i].port, w->phens[q].name, pn);
+        }
     QnCell *bind;
     QConv *ts, *tc;
     bool via;
@@ -959,7 +1050,7 @@ static QwStatus attach(QWorld *w, QwPhen pid, int m, const QkKernel *k)
     a->to_cell = tc;
     a->via_model = via;
     a->predicted = false;
-    if (k->create) {
+    if (k->create && p->alive) {   /* a dormant instance creates its kernels at its start */
         QkCall call = { w, pid, a, M_CREATE, 0, { 0 } };
         if (k->create(k, &w->host, &call, &a->inst) != QK_OK || call.err) {
             st = fail(w, QW_EKERNEL, "%s: kernel '%s' failed to start: %s", pn, k->name, call.msg);
@@ -975,9 +1066,9 @@ static QwStatus attach(QWorld *w, QwPhen pid, int m, const QkKernel *k)
         if (!nc) return QW_ENOMEM;
         *nc = (NarrowCtx) { w, pid, m };
         w->nctx[w->nnctx++] = nc;
-        if (m != NO_MODEL) qn_set_group(w->net, p->models[m].group);
+        qn_set_group(w->net, m != NO_MODEL ? p->models[m].group : p->group);
         QnStatus s = qn_custom(w->net, a->bind, k->nslots, narrow_trampoline, nc);
-        qn_set_group(w->net, 0);
+        qn_set_group(w->net, w->build_group);
         if (s != QN_OK) return QW_ENOMEM;
     }
     return QW_OK;
@@ -1019,6 +1110,7 @@ static QwStatus settle(QWorld *w)
 static Att *running(QWorld *w, size_t pid, int which)
 {
     Phen *p = &w->phens[pid];
+    if (!p->alive) return NULL;
     Att *a = which == 0 ? &p->base : (p->active == NO_MODEL ? NULL : &p->models[p->active].att);
     return a && a->k && (a->k->flags & QK_EVOLVE) ? a : NULL;
 }
@@ -1152,6 +1244,11 @@ static QwStatus commit_check(QWorld *w)
             clear_staging(w);
             return st;
         }
+        if (w->delta[c] && !w->phens[w->cells[c].owner].alive) {
+            QwStatus st = fail(w, QW_ESTOCK, "transfer to the stock '%s' of a dormant instance", w->cells[c].path);
+            clear_staging(w);
+            return st;
+        }
     }
     if (!log_reserve(w, w->nchanged)) {
         clear_staging(w);
@@ -1188,11 +1285,14 @@ static QwStatus commit(QWorld *w)
     return QW_OK;
 }
 
+static QwStatus lifecycle(QWorld *w);
+
 QwStatus qw_run(QWorld *w, int64_t until)
 {
     if (until < w->now) return fail(w, QW_ETIME, "cannot run back to %lld from %lld", (long long) until, (long long) w->now);
     QwStatus st = settle(w);
     if (st) return st;
+    if ((st = lifecycle(w))) return st;
     while (w->now < until) {
         int64_t b = until;
         for (size_t i = 0; i < w->nphens; i++)
@@ -1230,6 +1330,7 @@ QwStatus qw_run(QWorld *w, int64_t until)
         log_stamp(w, logged);
         if ((st = settle(w))) return st;
         invalidate(w);
+        if ((st = lifecycle(w))) return st;
     }
     return QW_OK;
 }
@@ -1246,6 +1347,7 @@ QwStatus qw_switch(QWorld *w, QwPhen pid, const char *model, const QkKernel *map
     int to = find_model(p, model, strlen(model)), from = p->active;
     if (to == NO_MODEL) return fail(w, QW_ENAME, "%s: no model '%s'", pn, model);
     if (to == from) return fail(w, QW_EDUP, "%s: model '%s' is already active", pn, model);
+    if (!p->alive) return fail(w, QW_ELIFE, "%s: a dormant instance cannot switch its model", pn);
     QwStatus st = check_contract(w, pn, map);
     if (st) return st;
     if (!(map->flags & QK_MAP)) return fail(w, QW_EKERNEL, "%s: kernel '%s' is not a map kernel", pn, map->name);
@@ -1360,6 +1462,434 @@ fail_map:
     return st;
 }
 
+/* --- instances (ADR 0013) -------------------------------------------------------------- */
+
+QwStatus qw_instance(QWorld *w, const char *key, QwPhen *out)
+{
+    if (strlen(key) > 255) return fail(w, QW_ENAME, "the key of an instance can have 255 characters at most");
+    QwPhen pid;
+    QwStatus st = new_phen(w, key, &pid);
+    if (st) return st;
+    Phen *p = &w->phens[pid];
+    p->instance = true;
+    p->alive = false;
+    if (qn_new_group(w->net, false, &p->group) != QN_OK) return QW_ENOMEM;
+    char path[300];
+    snprintf(path, sizeof path, "%s.alive", key);
+    if ((st = add_cell(w, path, w->boolean, true, qi_top(), 1, true, &p->alive_cell))) return st;
+    *out = pid;
+    return QW_OK;
+}
+
+static Phen *instance_of(QWorld *w, QwPhen pid)
+{
+    if (pid >= w->nphens) {
+        fail(w, QW_ENAME, "no such phenomenon");
+        return NULL;
+    }
+    if (!w->phens[pid].instance) {
+        fail(w, QW_ELIFE, "%s is not an instance", w->phens[pid].name);
+        return NULL;
+    }
+    return &w->phens[pid];
+}
+
+QwStatus qw_build_begin(QWorld *w, QwPhen pid)
+{
+    Phen *p = instance_of(w, pid);
+    if (!p) return pid >= w->nphens ? QW_ENAME : QW_ELIFE;
+    w->build_group = p->group;
+    qn_set_group(w->net, p->group);
+    return QW_OK;
+}
+
+void qw_build_end(QWorld *w)
+{
+    w->build_group = 0;
+    qn_set_group(w->net, 0);
+}
+
+QwStatus qw_instance_maps(QWorld *w, QwPhen pid, const QkKernel *start, const QkKernel *end)
+{
+    Phen *p = instance_of(w, pid);
+    if (!p) return pid >= w->nphens ? QW_ENAME : QW_ELIFE;
+    const QkKernel *maps[2] = { start, end };
+    for (int i = 0; i < 2; i++) {
+        if (!maps[i]) continue;
+        QwStatus st = check_contract(w, p->name, maps[i]);
+        if (st) return st;
+        if (!(maps[i]->flags & QK_MAP))
+            return fail(w, QW_EKERNEL, "%s: kernel '%s' is not a map kernel", p->name, maps[i]->name);
+    }
+    p->start_map = start;
+    p->end_map = end;
+    return QW_OK;
+}
+
+QwStatus qw_exists_when(QWorld *w, QwPhen pid, const char *condition)
+{
+    Phen *p = instance_of(w, pid);
+    if (!p) return pid >= w->nphens ? QW_ENAME : QW_ELIFE;
+    if (p->has_cond) return fail(w, QW_EDUP, "%s: already has an existence condition", p->name);
+    QnCell c;
+    if (qw_find(w, condition, &c) != QW_OK) return fail(w, QW_ENAME, "%s: no cell '%s'", p->name, condition);
+    if (w->cells[c].kind != w->boolean)
+        return fail(w, QW_ETYPE, "%s: the condition '%s' is not a boolean cell", p->name, condition);
+    if (!grow((void **) &w->conds, &w->capconds, w->nconds + 1, sizeof *w->conds)) return QW_ENOMEM;
+    w->conds[w->nconds++] = pid;
+    p->cond = c;
+    p->has_cond = true;
+    return QW_OK;
+}
+
+bool qw_alive(const QWorld *w, QwPhen pid) { return pid < w->nphens && w->phens[pid].alive; }
+
+/* Phenomenon `from` has a port that connects to phenomenon `to`. */
+static bool connects_to(const QWorld *w, QwPhen from, QwPhen to)
+{
+    const Phen *p = &w->phens[from];
+    QwPhen q;
+    for (size_t i = 0; i < p->nports; i++)
+        if (port_phen(w, p->ports[i].target, &q) && q == to && q != from) return true;
+    return false;
+}
+
+/* A dormant instance has no kernel instances, so no private kernel state
+ * survives an end. */
+static void destroy_kernels(QWorld *w, QwPhen pid)
+{
+    for (int m = NO_MODEL; m < (int) w->phens[pid].nmodels; m++) {
+        Att *a = att_of(w, pid, m);
+        if (a->k && a->k->destroy && a->inst) a->k->destroy(a->inst);
+        a->inst = NULL;
+        a->predicted = false;
+        a->nas = 0;
+    }
+}
+
+static QwStatus create_kernels(QWorld *w, QwPhen pid)
+{
+    for (int m = NO_MODEL; m < (int) w->phens[pid].nmodels; m++) {
+        Att *a = att_of(w, pid, m);
+        if (!a->k || !a->k->create) continue;
+        QkCall call = { w, pid, a, M_CREATE, 0, { 0 } };
+        if (a->k->create(a->k, &w->host, &call, &a->inst) != QK_OK || call.err) {
+            QwStatus st = fail(w, QW_EKERNEL, "%s: kernel '%s' failed to start: %s", w->phens[pid].name, a->k->name,
+                               call.msg);
+            a->inst = NULL;
+            destroy_kernels(w, pid);
+            return st;
+        }
+    }
+    return QW_OK;
+}
+
+/* Binds and runs the start map or the end map of an instance. Its writes
+ * and transfers are staged. The caller commits them or clears the staging. */
+static QwStatus run_map(QWorld *w, QwPhen pid, const QkKernel *map)
+{
+    Phen *p = &w->phens[pid];
+    Att ma;
+    memset(&ma, 0, sizeof ma);
+    ma.k = map;
+    QwStatus st = bind_kernel(w, pid, NO_MODEL, map, NULL, 0, &ma.bind, &ma.to_slot, &ma.to_cell, &ma.via_model);
+    if (st) return st;
+    QkCall call = { w, pid, &ma, M_CREATE, 0, { 0 } };
+    if (map->create && (map->create(map, &w->host, &call, &ma.inst) != QK_OK || call.err)) {
+        st = fail(w, QW_EKERNEL, "%s: map kernel '%s' failed to start: %s", p->name, map->name, call.msg);
+        ma.inst = NULL;
+    } else {
+        call.mode = M_MAP;
+        QkResult r = map->map(ma.inst, &call);
+        if (r != QK_OK || call.err) st = kernel_failed(w, p, &ma, "map", &call, r);
+    }
+    if (map->destroy && ma.inst) map->destroy(ma.inst);
+    ma.inst = NULL;
+    ma.k = NULL;
+    free_att(&ma);
+    return st;
+}
+
+static void set_groups(QWorld *w, const Phen *p, bool on)
+{
+    qn_group_enable(w->net, p->group, on);
+    if (p->active != NO_MODEL) qn_group_enable(w->net, p->models[p->active].group, on);
+}
+
+/* Stages a write of the cell "<key>.alive". */
+static void stage_alive(QWorld *w, const Phen *p, bool alive)
+{
+    w->wval[p->alive_cell] = alive;
+    w->written[p->alive_cell] = true;
+    touch(w, p->alive_cell);
+}
+
+/* The start of a dormant instance (ADR 0013 section 3). If it fails, nothing
+ * changes. */
+static QwStatus do_start(QWorld *w, QwPhen pid)
+{
+    Phen *p = &w->phens[pid];
+    for (size_t i = 0; i < p->nports; i++) {
+        QwPhen q;
+        if (port_phen(w, p->ports[i].target, &q) && q != pid && !w->phens[q].alive)
+            return fail(w, QW_ELIFE, "%s: cannot start while its participant '%s' is dormant", p->name,
+                        w->phens[q].name);
+    }
+    QwStatus st = create_kernels(w, pid);
+    if (st) return st;
+    if (p->start_map && (st = run_map(w, pid, p->start_map))) {
+        clear_staging(w);
+        destroy_kernels(w, pid);
+        return st;
+    }
+    stage_alive(w, p, true);
+    p->alive = true;   /* the commit refuses a transfer to a dormant instance */
+    size_t logged = w->nlog;
+    if ((st = commit(w))) {
+        p->alive = false;
+        destroy_kernels(w, pid);
+        return st;
+    }
+    set_groups(w, p, true);
+    qn_begin_epoch(w->net);
+    log_stamp(w, logged);
+    w->starts++;
+    st = settle(w);
+    invalidate(w);
+    return st;
+}
+
+static int cmp_change(const void *a, const void *b)
+{
+    QnCell x = ((const QwChange *) a)->cell, y = ((const QwChange *) b)->cell;
+    return (x > y) - (x < y);
+}
+
+/* The end of an alive instance (ADR 0013 section 4). If it fails, nothing
+ * changes. In the lifecycle step, `cascade` is true: the instances that
+ * connect to this one are already ending. */
+static QwStatus do_end(QWorld *w, QwPhen pid, bool cascade)
+{
+    Phen *p = &w->phens[pid];
+    const char *pn = p->name;
+    if (!cascade)
+        for (size_t q = 0; q < w->nphens; q++)
+            if (w->phens[q].instance && w->phens[q].alive && connects_to(w, (QwPhen) q, pid))
+                return fail(w, QW_ELIFE, "%s: cannot end while '%s', which connects to it, is alive", pn,
+                            w->phens[q].name);
+    QwStatus st;
+    if (p->end_map && (st = run_map(w, pid, p->end_map))) {
+        clear_staging(w);
+        return st;
+    }
+    for (size_t i = 0; i < p->ncells; i++) {
+        QnCell c = p->cells[i];
+        if (!w->kinds[w->cells[c].kind].conserved) {
+            w->written[c] = false;   /* the host sets the cell to its declared value, below */
+            continue;
+        }
+        int64_t v;
+        if (qp_add(qn_base(w->net, c).lo, w->delta[c], &v) != Q_OK || v != 0) {
+            st = fail(w, QW_ESTOCK, "%s: %lld quanta remain in the stock '%s' at the end", pn, (long long) v,
+                      w->cells[c].path);
+            clear_staging(w);
+            return st;
+        }
+    }
+    stage_alive(w, p, false);
+    if (!log_reserve(w, w->nchanged + p->ncells)) {
+        clear_staging(w);
+        return fail(w, QW_ENOMEM, "no memory for the change log");
+    }
+    size_t logged = w->nlog;
+    if ((st = commit(w))) return st;
+
+    /* A dormant instance holds no state: every cell that is not a stock
+     * returns to its declared value. */
+    for (size_t i = 0; i < p->ncells; i++) {
+        QnCell c = p->cells[i];
+        const CellInfo *ci = &w->cells[c];
+        if (w->kinds[ci->kind].conserved || c == p->alive_cell) continue;
+        QInterval base = qn_base(w->net, c);
+        if (base.lo == ci->init.lo && base.hi == ci->init.hi) continue;
+        if (set_cell(w, c)) qn_stage_set(w->net, c, word(ci->init.lo));
+        else qn_stage(w->net, c, ci->init);
+        log_change(w, c, QW_CHANGE_VALUE, base, ci->init, 0);
+    }
+    set_groups(w, p, false);
+    p->alive = false;
+    destroy_kernels(w, pid);
+    qn_begin_epoch(w->net);
+    log_stamp(w, logged);
+    if (w->nlog > logged) qsort(w->log_entries + logged, w->nlog - logged, sizeof *w->log_entries, cmp_change);
+    w->ends++;
+    st = settle(w);
+    invalidate(w);
+    return st;
+}
+
+QwStatus qw_start(QWorld *w, QwPhen pid)
+{
+    Phen *p = instance_of(w, pid);
+    if (!p) return pid >= w->nphens ? QW_ENAME : QW_ELIFE;
+    if (p->has_cond) return fail(w, QW_ELIFE, "%s: has an existence condition, so the world starts it", p->name);
+    if (p->alive) return fail(w, QW_ELIFE, "%s: is already alive", p->name);
+    QwStatus st = settle(w);
+    return st ? st : do_start(w, pid);
+}
+
+QwStatus qw_end(QWorld *w, QwPhen pid)
+{
+    Phen *p = instance_of(w, pid);
+    if (!p) return pid >= w->nphens ? QW_ENAME : QW_ELIFE;
+    if (p->has_cond) return fail(w, QW_ELIFE, "%s: has an existence condition, so the world ends it", p->name);
+    if (!p->alive) return fail(w, QW_ELIFE, "%s: is dormant", p->name);
+    QwStatus st = settle(w);
+    return st ? st : do_end(w, pid, false);
+}
+
+/* --- the lifecycle step (ADR 0013 section 5) --------------------------------------------- */
+
+typedef struct { QwPhen id; int depth; const char *name; } LifeItem;
+typedef struct { LifeItem *items; size_t n, cap; } LifeList;
+
+static bool life_push(LifeList *l, QwPhen id, const char *name)
+{
+    if (!grow((void **) &l->items, &l->cap, l->n + 1, sizeof *l->items)) return false;
+    l->items[l->n++] = (LifeItem) { id, 0, name };
+    return true;
+}
+
+/* The length of the longest chain of instances from `id` through ports to
+ * participants. An instance has a larger depth than each of its
+ * participants. In a cycle of ports, the key order decides. */
+static int life_depth(const QWorld *w, QwPhen id, int *memo)
+{
+    if (memo[id] >= 0) return memo[id];
+    if (memo[id] == -2) return 0;
+    memo[id] = -2;
+    const Phen *p = &w->phens[id];
+    int d = 0;
+    for (size_t i = 0; i < p->nports; i++) {
+        QwPhen q;
+        if (!port_phen(w, p->ports[i].target, &q) || q == id || !w->phens[q].instance) continue;
+        int dq = 1 + life_depth(w, q, memo);
+        if (dq > d) d = dq;
+    }
+    return memo[id] = d;
+}
+
+/* Starts: in key order. An instance starts only when its participants are
+ * alive, so it is never in one round with a participant that starts. */
+static int cmp_start(const void *a, const void *b)
+{
+    return strcmp(((const LifeItem *) a)->name, ((const LifeItem *) b)->name);
+}
+
+/* Ends: an instance before its participants, then in key order. */
+static int cmp_end(const void *a, const void *b)
+{
+    const LifeItem *x = a, *y = b;
+    return x->depth != y->depth ? (x->depth < y->depth) - (x->depth > y->depth) : strcmp(x->name, y->name);
+}
+
+/* The mask of a boolean cell: bit 0 is "false" and bit 1 is "true". */
+enum { COND_FALSE = 1, COND_TRUE = 2 };
+
+/* One round: decides every start and end from the current fixed point, then
+ * applies them. Sets *changed if an instance changed. */
+static QwStatus life_round(QWorld *w, bool *changed)
+{
+    LifeList ends = { 0 }, starts = { 0 };
+    int *memo = NULL;
+    QwStatus st = QW_ENOMEM;
+    uint64_t round = ++w->life_round;
+
+    /* the ends: each alive instance whose condition is false ... */
+    for (size_t i = 0; i < w->nconds; i++) {
+        Phen *p = &w->phens[w->conds[i]];
+        if (!p->alive || qn_get_set(w->net, p->cond) != COND_FALSE) continue;
+        if (!life_push(&ends, w->conds[i], p->name)) goto out;
+        p->mark = round;
+    }
+    /* ... and each alive instance that connects to an instance that ends */
+    for (size_t k = 0; k < ends.n; k++)
+        for (size_t q = 0; q < w->nphens; q++) {
+            Phen *d = &w->phens[q];
+            if (!d->instance || !d->alive || d->mark == round || !connects_to(w, (QwPhen) q, ends.items[k].id)) continue;
+            if (!life_push(&ends, (QwPhen) q, d->name)) goto out;
+            d->mark = round;
+        }
+    /* the starts: each dormant instance whose condition is true and whose
+     * participants are alive and stay alive. An unknown condition changes
+     * nothing: a decision from the absence of information (ADR 0008). */
+    for (size_t i = 0; i < w->nconds; i++) {
+        QwPhen id = w->conds[i];
+        Phen *p = &w->phens[id];
+        if (p->alive || qn_get_set(w->net, p->cond) != COND_TRUE) continue;
+        bool ready = true;
+        for (size_t j = 0; j < p->nports && ready; j++) {
+            QwPhen q;
+            if (port_phen(w, p->ports[j].target, &q) && q != id && (!w->phens[q].alive || w->phens[q].mark == round))
+                ready = false;
+        }
+        if (ready && !life_push(&starts, id, p->name)) goto out;
+    }
+    st = QW_OK;
+    if (!ends.n && !starts.n) goto out;
+    *changed = true;
+
+    for (int pass = 0; pass < 2; pass++) {
+        const LifeList *l = pass == 0 ? &ends : &starts;
+        for (size_t i = 0; i < l->n; i++)
+            if (w->phens[l->items[i].id].flipped == w->life_step) {
+                st = fail(w, QW_ELIFE, "%s: the existence conditions do not settle; the instance would %s again at one boundary",
+                          l->items[i].name, pass == 0 ? "end" : "start");
+                goto out;
+            }
+    }
+    if (!(memo = malloc(w->nphens * sizeof *memo))) {
+        st = QW_ENOMEM;
+        goto out;
+    }
+    for (size_t i = 0; i < w->nphens; i++) memo[i] = -1;
+    for (size_t i = 0; i < ends.n; i++) ends.items[i].depth = life_depth(w, ends.items[i].id, memo);
+    if (ends.n) qsort(ends.items, ends.n, sizeof *ends.items, cmp_end);
+    if (starts.n) qsort(starts.items, starts.n, sizeof *starts.items, cmp_start);
+
+    for (size_t i = 0; i < ends.n && !st; i++) {
+        w->phens[ends.items[i].id].flipped = w->life_step;
+        st = do_end(w, ends.items[i].id, true);
+    }
+    for (size_t i = 0; i < starts.n && !st; i++) {
+        w->phens[starts.items[i].id].flipped = w->life_step;
+        st = do_start(w, starts.items[i].id);
+    }
+out:
+    free(memo);
+    free(ends.items);
+    free(starts.items);
+    return st;
+}
+
+/* Step 6 of a boundary: starts and ends the instances that have an
+ * existence condition. A change can make another condition true or false,
+ * so the rounds repeat until nothing changes. An instance changes at most
+ * once in one step, so the step ends.
+ *
+ * Reserved: the relation engine will declare instances for new candidates
+ * here, before the first round (ADR 0013 section 5). */
+static QwStatus lifecycle(QWorld *w)
+{
+    if (!w->nconds) return QW_OK;
+    w->life_step++;
+    for (;;) {
+        bool changed = false;
+        QwStatus st = life_round(w, &changed);
+        if (st || !changed) return st;
+    }
+}
+
 /* --- inputs and inspection ------------------------------------------------------------ */
 
 QwStatus qw_input(QWorld *w, const char *path, QInterval v)
@@ -1386,6 +1916,7 @@ QwStatus qw_input_set(QWorld *w, const char *path, uint64_t mask)
     QnCell c;
     if (qw_find(w, path, &c) != QW_OK) return fail(w, QW_ENAME, "no cell '%s'", path);
     if (!set_cell(w, c)) return fail(w, QW_ETYPE, "'%s' is not a set cell", path);
+    if (w->cells[c].host_only) return fail(w, QW_EOWNER, "only the host writes '%s'", path);
     QInterval base = qn_base(w->net, c);
     uint64_t universe = word(base.hi);
     if (!mask || (mask & ~universe)) return fail(w, QW_ETYPE, "invalid atoms for '%s'", path);
@@ -1444,14 +1975,18 @@ static uint64_t fnv(uint64_t h, uint64_t v)
 
 uint64_t qw_hash(const QWorld *w)
 {
-    uint64_t h = 0xcbf29ce484222325ULL;
-    h = fnv(h, (uint64_t) w->now);
-    h = fnv(h, qn_epoch(w->net));
-    for (size_t i = 0; i < w->nphens; i++) h = fnv(h, (uint64_t) (int64_t) w->phens[i].active);
+    /* Each phenomenon and each cell gives one hash, from its name or path
+     * and its state. The sum of those hashes does not depend on the order of
+     * declaration (ADR 0013). */
+    const uint64_t seed = 0xcbf29ce484222325ULL;
+    uint64_t sum = 0;
+    for (size_t i = 0; i < w->nphens; i++)
+        sum += fnv(fnv(seed, w->phens[i].ident), (uint64_t) (int64_t) w->phens[i].active);
     for (size_t c = 0; c < w->ncells; c++) {
         QInterval b = qn_base(w->net, (QnCell) c);
-        h = fnv(h, (uint64_t) b.lo);
-        h = fnv(h, (uint64_t) b.hi);
+        sum += fnv(fnv(fnv(seed, w->cells[c].hash), (uint64_t) b.lo), (uint64_t) b.hi);
     }
-    return h;
+    uint64_t h = fnv(seed, (uint64_t) w->now);
+    h = fnv(h, qn_epoch(w->net));
+    return fnv(h, sum);
 }

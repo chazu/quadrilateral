@@ -21,6 +21,11 @@
  * phenomenon can connect to "roomB.west" and reach the active model's cells.
  * qw_switch changes the active model with a map kernel.
  *
+ * A phenomenon can be an instance (ADR 0013): it is declared dormant, it
+ * starts and ends at a boundary, and its name is its key, for example
+ * "combustion(building7)". An existence condition starts and ends it inside
+ * qw_run, or qw_start and qw_end do, as inputs from outside.
+ *
  * The scheduler is the first version of ADR 0006: every evolving kernel
  * advances to one shared boundary. A phenomenon runs at most two kernels:
  * its own, and its active model's. Each group of ADR 0009 section 9 has one
@@ -49,6 +54,7 @@ typedef enum {
     QW_ECONTRADICTION,  /* propagation found an empty domain */
     QW_ESTOCK,          /* a stock changed other than by a transfer */
     QW_ETIME,           /* a time before now, or past the end of the clock */
+    QW_ELIFE,           /* an instance in the wrong state, or existence conditions that do not settle */
     QW_ENOMEM,
 } QwStatus;
 
@@ -97,9 +103,56 @@ QwStatus qw_port(QWorld *w, QwPhen p, const char *port, const char *model, const
 QwStatus qw_switch(QWorld *w, QwPhen p, const char *model, const QkKernel *map);
 const char *qw_active_model(const QWorld *w, QwPhen p);   /* NULL without models */
 
+/* --- instances (ADR 0013) ---------------------------------------------------------- */
+
+/* The built-in enumeration kind "boolean": atom 0 is "false", atom 1 "true". */
+QwKind qw_boolean(const QWorld *w);
+
+/* Declares an instance: a phenomenon that starts and ends during a run. Its
+ * key is its name. A name can contain letters, digits, '_', '(', ')' and ','.
+ * A new instance is dormant. The call also creates the cell "<key>.alive", a
+ * boolean that only the host writes; the feature name "alive" is reserved.
+ *
+ * The building functions above add the instance's cells, ports, models and
+ * kernels, at any boundary: before the run or between calls to qw_run. A
+ * stock of an instance must be declared as zero. While the instance is
+ * dormant, its kernels do not run and do not exist. A phenomenon that is not
+ * an instance cannot connect a port to an instance. */
+QwStatus qw_instance(QWorld *w, const char *key, QwPhen *out);
+/* Propagators added between begin and end belong to the instance, and run
+ * only while it is alive. qw_model_begin and qw_model_end work inside. */
+QwStatus qw_build_begin(QWorld *w, QwPhen p);
+void     qw_build_end(QWorld *w);
+/* The map kernels of the start and of the end; each can be NULL. A map's
+ * slot "x" binds to "<key>.x", or through a port of the instance to a
+ * participant. The start map can move stocks from the participants into the
+ * instance. The end map must move every stock out: if a stock of the
+ * instance is not exactly zero afterwards, the end fails and nothing
+ * changes. */
+QwStatus qw_instance_maps(QWorld *w, QwPhen p, const QkKernel *start, const QkKernel *end);
+/* The existence condition: the path of a boolean cell. At each boundary of
+ * qw_run, and when qw_run begins, the instance starts if the condition is
+ * true and every participant is alive, and it ends if the condition is
+ * false. An unknown condition changes nothing. When an instance ends, the
+ * alive instances that connect to it end first. Starts and ends repeat until
+ * nothing changes; an instance that would change twice at one boundary is
+ * the error QW_ELIFE. */
+QwStatus qw_exists_when(QWorld *w, QwPhen p, const char *condition);
+/* Inputs from outside the simulation: start or end an instance that has no
+ * condition, at the current time. A start fails while a participant is
+ * dormant. An end fails while an alive instance connects to this one. At an
+ * end, every cell of the instance that is not a stock returns to its
+ * declared value. */
+QwStatus qw_start(QWorld *w, QwPhen p);
+QwStatus qw_end(QWorld *w, QwPhen p);
+bool     qw_alive(const QWorld *w, QwPhen p);   /* true for a phenomenon that is not an instance */
+uint64_t qw_starts(const QWorld *w);
+uint64_t qw_ends(const QWorld *w);
+
 /* --- running ------------------------------------------------------------------- */
 
-/* Advances the world to `until`, boundary by boundary. */
+/* Advances the world to `until`, boundary by boundary. Existence conditions
+ * are checked when the call begins and after each boundary. */
 QwStatus qw_run(QWorld *w, int64_t until);
 
 /* An input from outside the simulation: replaces a value at the current time,
@@ -116,14 +169,17 @@ uint64_t  qw_advances(const QWorld *w);                  /* advance calls so far
 uint64_t  qw_switches(const QWorld *w);
 int64_t   qw_total(const QWorld *w, QwKind kind);        /* the sum of every cell of a kind */
 
-/* A hash of all authoritative state: the clock, the epoch, and every cell's
- * base. Two runs with the same inputs must give the same hash (ADR 0004). */
+/* A hash of all authoritative state: the clock, the epoch, each active
+ * model, and every cell's base with its path. It does not depend on the
+ * order in which phenomena and cells were declared (ADR 0013). Two runs with
+ * the same inputs must give the same hash (ADR 0004). */
 uint64_t qw_hash(const QWorld *w);
 
 /* --- the change log (ADR 0011 section 6) ------------------------------------------ */
 
 /* The world commits authoritative changes at a boundary of qw_run, at a
- * successful qw_switch, and at qw_input. When logging is on, each commit
+ * successful qw_switch, at qw_input, and at the start or the end of an
+ * instance. When logging is on, each commit
  * records one entry for each cell whose base changed.
  *
  * `epoch` is the epoch in which the change takes effect: the epoch number
