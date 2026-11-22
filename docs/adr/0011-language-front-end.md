@@ -13,7 +13,7 @@ Phases 1 to 5 built the semantic core as a C API: quantity types, propagators, e
 - The syntax and the core semantics come from Triangle, which follows CUE: types (`#Name`), unification (`&`), disjunction (`|`), defaults (`*`), bounds, tags, references, comprehensions, packages, attributes, and docstrings. Source files have the extension `.quad`.
 - References share in both directions, as in Triangle: `size: .instrument.size` makes one node. This is relational semantics, and it matches propagation.
 - The result of loading does not depend on the order of files or declarations. Triangle guarantees this, and Quadrilateral keeps it (ADR 0004).
-- A number with a unit converts exactly to the quantity type of its field (ADR 0001). A literal that is not a whole number of quanta is an error. Kinds are declared in source, with the dimension grammar of ADR 0009 section 10. The syntax of compound units in literals, such as `J/K`, is an open detail.
+- A number with a unit converts exactly to the quantity type of its field (ADR 0001). A literal that is not a whole number of quanta is an error. Kinds are declared in source, with the dimension grammar of ADR 0009 section 10. ADR 0014 decides the syntax of units in literals: `1000J/K`.
 - Not borrowed at first: Triangle's TDL front end, and component generation for Odin.
 
 ### 2. The prelude
