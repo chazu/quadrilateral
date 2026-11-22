@@ -18,33 +18,35 @@ Phases 1 to 5 built the semantic core as a C API: quantity types, propagators, e
 
 ### 2. The prelude
 
-A prelude defines the types that the elaborator recognizes: `#Kind`, `#Phenomenon`, `#Port`, `#Interaction`, `#Model`, `#Reaction`, and `#Rule`. They are ordinary types, so an author specializes them by unification, for example `#WoodCombustion: #Combustion & {…}`. This keeps the decision that a process is a typed feature structure.
+A prelude defines the types that the elaborator recognizes: `#Phenomenon`, `#Port`, `#Interaction`, `#Model`, `#Reaction`, and `#Rule`. A kind is not a prelude type: a declaration with the prefix `%` declares it (ADR 0015). They are ordinary types, so an author specializes them by unification, for example `#WoodCombustion: #Combustion & {…}`. This keeps the decision that a process is a typed feature structure.
 
 An illustrative sketch of the wall of design section 9.2. The syntax is not final.
 
 ```cue
-energy:      #Kind & { dimension: "J",   scale: -3, conserved: true }
-temperature: #Kind & { dimension: "K",   scale: -6 }
-capacity:    #Kind & { dimension: "J/K", scale: -3 }
+%energy:      { dimension: "J",   scale: -3, conserved: true }
+%temperature: { dimension: "K",   scale: -6 }
+%capacity:    { dimension: "J/K", scale: -3 }
 
-#ThermalPort: #Port & {
-    temperature: temperature   // an observation: intensive, read only
-    capacity:    capacity
-    energy:      energy        // a stock: reached only through transfers
+// A type introduces each feature once (ADR 0015), so one supertype has the
+// three fields that the port and the room share.
+#Thermal: {
+    temperature: %temperature   // an observation: intensive, read only
+    capacity:    %capacity
+    energy:      %energy        // a stock: reached only through transfers
 }
 
-#LumpedRoom: #Phenomenon & {
-    energy:      energy
-    capacity:    capacity
-    temperature: temperature
+#ThermalPort: #Port & #Thermal
+
+#LumpedRoom: #Phenomenon & #Thermal & {
     laws: [ .energy == .capacity * .temperature ]
-    ports: west: #ThermalPort & { temperature: .temperature, capacity: .capacity, energy: .energy }
+    west: #ThermalPort & { temperature: .temperature, capacity: .capacity, energy: .energy }
 }
 
 #ConductiveWall: #Phenomenon & {
-    ports: { hot: #ThermalPort, cold: #ThermalPort }
-    conductance: thermal_conductance
-    interaction: #EnergyTransfer & { source: .ports.hot.energy, sink: .ports.cold.energy }
+    hot:  #ThermalPort
+    cold: #ThermalPort
+    conductance: %thermal_conductance
+    interaction: #EnergyTransfer & { source: .hot.energy, sink: .cold.energy }
     evaluator: "native.conduction"
 }
 ```

@@ -1,0 +1,1456 @@
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "front/front.h"
+#include "test.h"
+
+/* Stage 2 of the front end: kinds, the type hierarchy, and the unifier
+ * (ADR 0011 section 3, ADR 0015). */
+
+#define STR_EQ(got, want)                                                              \
+    do {                                                                               \
+        const char *g_ = (got), *w_ = (want);                                          \
+        t_checks++;                                                                    \
+        if (strcmp(g_, w_)) {                                                          \
+            t_failures++;                                                              \
+            fprintf(stderr, "%s:%d:\n  got    %s\n  wanted %s\n", __FILE__, __LINE__, g_, w_); \
+        }                                                                              \
+    } while (0)
+
+static const char *const KINDS =
+    "%length: { dimension: \"m\" }\n"
+    "%mass: { dimension: \"kg\" }\n"
+    "%energy: { dimension: \"J\", scale: -3, conserved: true }\n";
+
+/* Loads sources. The result is valid until qf_free. */
+static Front *load(const char *const *sources, size_t n, bool *ok)
+{
+    static const char *const names[] = { "a.quad", "b.quad", "c.quad", "d.quad", "e.quad", "f.quad", "g.quad", "h.quad" };
+    Front *f = qf_new();
+    *ok = qf_load(f, names, sources, n);
+    return f;
+}
+
+static Front *load1(const char *src, bool *ok)
+{
+    return load(&src, 1, ok);
+}
+
+/* The first diagnostic of a content with an error, or "loaded". */
+static const char *load_error(const char *src)
+{
+    static char out[1024];
+    bool ok;
+    Front *f = load1(src, &ok);
+    CHECK(ok == (f->nerrors == 0));
+    snprintf(out, sizeof out, "%s", ok ? "loaded" : f->diags.n ? f->diags.v[0].msg : "no diagnostic");
+    qf_free(f);
+    return out;
+}
+
+/* The text form of an instance of a content, or the first diagnostic. */
+static const char *inst_text(const char *src, const char *name)
+{
+    static Buf out;
+    out.len = 0;
+    qf_buf_puts(&out, "");
+    bool ok;
+    Front *f = load1(src, &ok);
+    uint32_t i = ok ? qf_instance(f, name) : QF_BOTTOM;
+    if (i != QF_BOTTOM) qf_node_print(f, &out, f->insts.v[i].node);
+    else qf_buf_puts(&out, f->diags.n ? f->diags.v[0].msg : "no such instance");
+    qf_free(f);
+    return out.s;
+}
+
+static const char *with_kinds(const char *rest)
+{
+    static char buf[4096];
+    snprintf(buf, sizeof buf, "%s%s", KINDS, rest);
+    return buf;
+}
+
+/* A path of features from labels: "west.energy". */
+static size_t path_of(Front *f, const char *text, uint32_t *out)
+{
+    size_t n = 0;
+    while (*text) {
+        const char *e = strchr(text, '.');
+        size_t len = e ? (size_t) (e - text) : strlen(text);
+        out[n] = feat_lookup(f, qf_intern(f, text, len));
+        CHECK(out[n] != QF_BOTTOM);
+        n++;
+        text += len + (e ? 1 : 0);
+    }
+    return n;
+}
+
+static const QfNode *at(Front *f, const QfNode *n, const char *text)
+{
+    uint32_t p[16];
+    size_t len = path_of(f, text, p);
+    return qf_at(f->op, n, p, len);
+}
+
+static const QfNode *inst(Front *f, const char *name)
+{
+    uint32_t i = qf_instance(f, name);
+    CHECK(i != QF_BOTTOM);
+    return i == QF_BOTTOM ? NULL : f->insts.v[i].node;
+}
+
+static const char *node_text(const Front *f, const QfNode *n)
+{
+    static Buf out;
+    out.len = 0;
+    qf_buf_puts(&out, "");
+    if (n) qf_node_print(f, &out, n);
+    else qf_buf_puts(&out, "(none)");
+    return out.s;
+}
+
+/* --- units (ADR 0015 section 4) --------------------------------------------------------------- */
+
+static const char *unit_text(const Front *f, const char *text)
+{
+    static Buf out;
+    out.len = 0;
+    QfUnit u;
+    char err[400];
+    if (!qf_unit_parse(f, text, &u, err, sizeof err)) { qf_buf_puts(&out, err); return out.s; }
+    qf_dim_format(f, &out, &u.dim);
+    qf_buf_printf(&out, " x %lld e%d", (long long) u.mult, u.exp10);
+    return out.s;
+}
+
+void test_units(void)
+{
+    Front *f = qf_new();
+    STR_EQ(unit_text(f, "m"), "m x 1 e0");
+    STR_EQ(unit_text(f, "mm"), "m x 1 e-3");
+    STR_EQ(unit_text(f, "km"), "m x 1 e3");
+    STR_EQ(unit_text(f, "g"), "kg x 1 e-3");
+    STR_EQ(unit_text(f, "kg"), "kg x 1 e0");
+    STR_EQ(unit_text(f, "ug"), "kg x 1 e-9");
+    STR_EQ(unit_text(f, "J"), "m^2 kg s^-2 x 1 e0");
+    STR_EQ(unit_text(f, "kJ"), "m^2 kg s^-2 x 1 e3");
+    STR_EQ(unit_text(f, "W/K"), "m^2 kg s^-3 K^-1 x 1 e0");
+    STR_EQ(unit_text(f, "kg*m^2/s^2"), "m^2 kg s^-2 x 1 e0");
+    STR_EQ(unit_text(f, "m^-1"), "m^-1 x 1 e0");
+    STR_EQ(unit_text(f, "L"), "m^3 x 1 e-3");
+    STR_EQ(unit_text(f, "mL"), "m^3 x 1 e-6");
+    /* a symbol as a whole comes before a prefix and a symbol */
+    STR_EQ(unit_text(f, "min"), "s x 60 e0");
+    STR_EQ(unit_text(f, "mol"), "mol x 1 e0");
+    STR_EQ(unit_text(f, "cd"), "cd x 1 e0");
+    STR_EQ(unit_text(f, "h"), "s x 3600 e0");
+    STR_EQ(unit_text(f, "d"), "s x 86400 e0");
+    STR_EQ(unit_text(f, "hPa"), "m^-1 kg s^-2 x 1 e2");
+    STR_EQ(unit_text(f, "km/h^0"), "m x 1 e3");
+    STR_EQ(unit_text(f, "min^2"), "s^2 x 3600 e0");
+    /* every term after the first '/' divides, and each has its own '/' */
+    STR_EQ(unit_text(f, "J/kg/K"), "m^2 s^-2 K^-1 x 1 e0");
+    STR_EQ(unit_text(f, "J/kg*K"), "in the unit 'J/kg*K', a '*' after a '/' has two readings. Give each divisor its "
+                                   "own '/': J/kg/K");
+    STR_EQ(unit_text(f, "kg*m/s^2*K*mol"), "in the unit 'kg*m/s^2*K*mol', a '*' after a '/' has two readings. Give "
+                                           "each divisor its own '/': kg*m/s^2/K/mol");
+    /* units with no dimension */
+    STR_EQ(unit_text(f, "pct"), "1 x 1 e-2");
+    STR_EQ(unit_text(f, "ppm"), "1 x 1 e-6");
+    STR_EQ(unit_text(f, "kpct"), "unknown unit 'kpct'");
+    STR_EQ(unit_text(f, "g/kg*pct"), "in the unit 'g/kg*pct', a '*' after a '/' has two readings. Give each divisor "
+                                     "its own '/': g/kg/pct");
+    STR_EQ(unit_text(f, "W/m^2/K^4"), "kg s^-3 K^-4 x 1 e0");
+    STR_EQ(unit_text(f, "kJ/g"), "m^2 s^-2 x 1 e6");
+
+    STR_EQ(unit_text(f, "furlong"), "unknown unit 'furlong'");
+    STR_EQ(unit_text(f, "kmin"), "unknown unit 'kmin'");           /* min takes no prefix */
+    STR_EQ(unit_text(f, "m3"), "unknown unit 'm3'");
+    STR_EQ(unit_text(f, "m/x"), "unknown unit 'x' in 'm/x'. If 'x' is a name, put spaces around the operator, "
+                                "because an operator with a name directly after it continues the unit");
+    STR_EQ(unit_text(f, "m/min"), "the unit 'min' cannot be a divisor in 'm/min', because its factor is not a "
+                                  "power of ten. Write the value with 's'");
+    STR_EQ(unit_text(f, "m^200"), "the exponent in the unit 'm^200' is too large");
+    STR_EQ(unit_text(f, "m^90*m^90"), "the exponents of the unit 'm^90*m^90' are too large");
+    STR_EQ(unit_text(f, "d^4"), "the factor of the unit 'd^4' is too large");
+
+    CHECK(qf_unit_symbol(f, "s") && qf_unit_symbol(f, "kg") && qf_unit_symbol(f, "min") && qf_unit_symbol(f, "mK"));
+    CHECK(!qf_unit_symbol(f, "x") && !qf_unit_symbol(f, "sec") && !qf_unit_symbol(f, "coin"));
+
+    /* a literal: the digits, the fraction and the unit give one exact decimal */
+    QDim dim;
+    int64_t v;
+    int e;
+    char err[400];
+    XNum n = { 35, 2, qf_sym(f, "kg") };
+    CHECK(qf_literal(f, &n, &dim, &v, &e, err, sizeof err) && v == 35 && e == -2 && dim.exp[Q_BASE_MASS] == 1);
+    XNum m = { 3, 0, qf_sym(f, "min") };
+    CHECK(qf_literal(f, &m, &dim, &v, &e, err, sizeof err) && v == 180 && e == 0 && dim.exp[Q_BASE_TIME] == 1);
+    XNum p = { 1989, -27, qf_sym(f, "g") };
+    CHECK(qf_literal(f, &p, &dim, &v, &e, err, sizeof err) && v == 1989 && e == 24);
+    XNum plain = { -5, 1, NULL };
+    CHECK(qf_literal(f, &plain, &dim, &v, &e, err, sizeof err) && v == -5 && e == -1 && qdim_is_none(&dim));
+    XNum big = { INT64_MAX / 2, 0, qf_sym(f, "d") };
+    CHECK(!qf_literal(f, &big, &dim, &v, &e, err, sizeof err));
+    STR_EQ(err, "the number is out of range");
+    qf_free(f);
+}
+
+/* --- exact decimals (ADR 0015 section 3) -------------------------------------------------------- */
+
+static const char *quanta_text(QfDec d, int scale)
+{
+    static char out[160];
+    int64_t lo, hi;
+    const char *why = qf_dec_to_quanta(d, scale, &lo, &hi);
+    if (why) snprintf(out, sizeof out, "%s", why);
+    else snprintf(out, sizeof out, "%lld..%lld", (long long) lo, (long long) hi);
+    return out;
+}
+
+static const char *dec_text(int64_t v, int exp)
+{
+    static Buf out;
+    out.len = 0;
+    qf_dec_format(&out, v, exp);
+    return out.s;
+}
+
+void test_decimals(void)
+{
+    QfDec a = { 1500, 1500, -1, false, false };
+    QfDec n = qf_dec_norm(a);
+    CHECK(n.lo == 15 && n.hi == 15 && n.exp == 1);
+    QfDec z = { 0, 0, -7, false, false };
+    CHECK(qf_dec_norm(z).exp == 0);
+    QfDec half = { 100, Q_INF, -3, false, false };
+    n = qf_dec_norm(half);
+    CHECK(n.lo == 1 && n.hi == Q_INF && n.exp == -1);
+    QfDec two = { 100, 250, 0, false, false };
+    n = qf_dec_norm(two);
+    CHECK(n.lo == 10 && n.hi == 25 && n.exp == 1);
+    QfDec top = { Q_NINF, Q_INF, 5, false, false };
+    CHECK(qf_dec_norm(top).exp == 0);
+
+    /* a point value must be a whole number of quanta */
+    QfDec p15 = { 15, 15, -5, false, false };                   /* 0.15 mm, in metres */
+    STR_EQ(quanta_text(p15, -4), "the value is not a whole number of quanta of the kind");
+    STR_EQ(quanta_text(p15, -5), "15..15");
+    STR_EQ(quanta_text(p15, -8), "15000..15000");
+    /* a bound moves inward to the next quantum */
+    QfDec ge = { 15, Q_INF, -5, false, false };
+    STR_EQ(quanta_text(ge, -4), "2..9223372036854775807");
+    QfDec gt = { 2, Q_INF, -4, true, false };                   /* > 0.2 mm */
+    STR_EQ(quanta_text(gt, -4), "3..9223372036854775807");
+    QfDec gtx = { 15, Q_INF, -5, true, false };                 /* > 0.15 mm */
+    STR_EQ(quanta_text(gtx, -4), "2..9223372036854775807");
+    QfDec le = { Q_NINF, 15, -5, false, false };
+    STR_EQ(quanta_text(le, -4), "-9223372036854775808..1");
+    QfDec lt = { Q_NINF, 2, -4, false, true };                  /* < 0.2 mm */
+    STR_EQ(quanta_text(lt, -4), "-9223372036854775808..1");
+    QfDec neg = { -15, 15, -5, false, false };                  /* -0.15 mm to 0.15 mm */
+    STR_EQ(quanta_text(neg, -4), "-1..1");
+    QfDec negopen = { -2, 2, -4, true, true };
+    STR_EQ(quanta_text(negopen, -4), "-1..1");
+    QfDec none = { 11, 19, -5, true, true };                    /* between 0.11 mm and 0.19 mm */
+    STR_EQ(quanta_text(none, -4), "the range holds no whole number of quanta of the kind");
+    QfDec huge = { 1, 1, 30, false, false };
+    STR_EQ(quanta_text(huge, -4), "the value does not fit in the range of the kind");
+    QfDec tiny = { 1, 1, -40, false, false };
+    STR_EQ(quanta_text(tiny, -4), "the value is not a whole number of quanta of the kind");
+    QfDec tinyb = { 1, Q_INF, -40, false, false };              /* >= 1e-40: the next quantum is 1 */
+    STR_EQ(quanta_text(tinyb, -4), "1..9223372036854775807");
+    QfDec tinyn = { -1, Q_INF, -40, false, false };             /* >= -1e-40: 0 is allowed */
+    STR_EQ(quanta_text(tinyn, -4), "0..9223372036854775807");
+    STR_EQ(quanta_text(top, -4), "-9223372036854775808..9223372036854775807");
+    QfDec zero = { 0, 0, 0, false, false };
+    STR_EQ(quanta_text(zero, -30), "0..0");
+    STR_EQ(quanta_text(zero, 30), "0..0");
+
+    /* meets align the powers of ten */
+    QfDec r;
+    bool range;
+    QfDec x = { 5, Q_INF, -1, false, false }, y = { Q_NINF, 2, 0, false, true };     /* >=0.5 and <2 */
+    CHECK(qf_dec_meet(x, y, &r, &range) && r.lo == 5 && r.hi == 20 && r.exp == -1 && !r.lo_open && r.hi_open);
+    QfDec pt = { 2, 2, 0, false, false };
+    CHECK(!qf_dec_meet(pt, y, &r, &range) && !range);            /* 2 is not below 2 */
+    CHECK(qf_dec_meet(pt, x, &r, &range) && r.lo == 2 && r.hi == 2 && r.exp == 0);
+    QfDec far1 = { 1, 1, 30, false, false }, far2 = { 1, 1, -30, false, false };
+    CHECK(!qf_dec_meet(far1, far2, &r, &range) && range);
+    CHECK(qf_dec_meet(top, far1, &r, &range) && r.lo == 1 && r.exp == 30);
+    CHECK(qf_dec_meet(zero, x, &r, &range) == false);
+    QfDec zr = { 0, Q_INF, 0, false, false };
+    CHECK(qf_dec_meet(zr, far2, &r, &range) && r.lo == 1 && r.hi == 1 && r.exp == -30);
+
+    STR_EQ(dec_text(5000000, -3), "5000");
+    STR_EQ(dec_text(29315, -2), "293.15");
+    STR_EQ(dec_text(-15, -5), "-0.00015");
+    STR_EQ(dec_text(2, 3), "2000");
+    STR_EQ(dec_text(1989, 27), "1989e27");
+    STR_EQ(dec_text(0, -9), "0");
+    STR_EQ(dec_text(Q_INF, 0), "inf");
+}
+
+/* --- kind declarations (ADR 0015 section 1) ------------------------------------------------------ */
+
+void test_kind_declarations(void)
+{
+    bool ok;
+    Front *f = load1("%energy: { dimension: \"J\", scale: -3, conserved: true }\n"
+                     "%capacity: { dimension: \"J/K\" }\n"
+                     "%coin: { base: \"coin\", scale: -2, rounding: \"floor\" }\n"
+                     "%price: { dimension: \"coin/kg\" }\n"
+                     "%share: { dimension: \"1\" }\n"
+                     "%span: { dimension: \"s\" }\n", &ok);
+    CHECK(ok);
+    uint32_t k = qf_kind_lookup(f, qf_sym(f, "%energy"));
+    CHECK(k != QF_BOTTOM);
+    if (k != QF_BOTTOM) {
+        const KindInfo *ki = &f->kinds.v[k];
+        CHECK(ki->scale == -3 && ki->conserved && ki->rounding == Q_ROUND_HALF_EVEN && !ki->builtin);
+        CHECK(f->dims.v[ki->dimix].dim.exp[Q_BASE_MASS] == 1 && f->dims.v[ki->dimix].dim.exp[Q_BASE_TIME] == -2);
+        CHECK(f->types.v[ki->type].kind == TK_KIND && f->types.v[ki->type].name == ki->name);
+        /* a kind is a leaf below the type of its dimension, which is below number */
+        uint32_t dt = f->types.v[ki->type].parents.v[0];
+        CHECK(f->types.v[dt].kind == TK_DIMT && f->types.v[dt].parents.v[0] == f->tnumber);
+        STR_EQ(f->types.v[dt].name, "dim[m^2 kg s^-2]");
+    }
+    k = qf_kind_lookup(f, qf_sym(f, "%capacity"));
+    CHECK(k != QF_BOTTOM && f->kinds.v[k].scale == -3 && !f->kinds.v[k].conserved);       /* the default scale */
+    k = qf_kind_lookup(f, qf_sym(f, "%coin"));
+    CHECK(k != QF_BOTTOM && f->kinds.v[k].scale == -2 && f->kinds.v[k].rounding == Q_ROUND_FLOOR);
+    CHECK(f->bases.n == 2 && !strcmp(f->bases.v[0], "coin") && !strcmp(f->bases.v[1], "deg"));   /* the angle is built in */
+    if (k != QF_BOTTOM) CHECK(f->dims.v[f->kinds.v[k].dimix].dim.exp[Q_NSI] == 1);
+    k = qf_kind_lookup(f, qf_sym(f, "%price"));
+    if (k != QF_BOTTOM) CHECK(f->dims.v[f->kinds.v[k].dimix].dim.exp[Q_NSI] == 1 && f->dims.v[f->kinds.v[k].dimix].dim.exp[Q_BASE_MASS] == -1);
+    k = qf_kind_lookup(f, qf_sym(f, "%share"));
+    CHECK(k != QF_BOTTOM && f->kinds.v[k].scale == -9);                                    /* a ratio */
+    k = qf_kind_lookup(f, qf_sym(f, "%span"));
+    CHECK(k != QF_BOTTOM && f->kinds.v[k].scale == -6);                                    /* the tick */
+    /* the built-in kinds */
+    k = qf_kind_lookup(f, qf_sym(f, "%count"));
+    CHECK(k != QF_BOTTOM && f->kinds.v[k].scale == 0 && f->kinds.v[k].builtin);
+    k = qf_kind_lookup(f, qf_sym(f, "%ratio"));
+    CHECK(k != QF_BOTTOM && f->kinds.v[k].scale == -9);
+    k = qf_kind_lookup(f, qf_sym(f, "%time"));
+    CHECK(k != QF_BOTTOM && f->kinds.v[k].scale == -6);
+    /* %share and %ratio and %count have one dimension type */
+    CHECK(f->kinds.v[qf_kind_lookup(f, qf_sym(f, "%share"))].dimix == f->kinds.v[k - 1].dimix);
+    CHECK(qf_kind_lookup(f, qf_sym(f, "%none")) == QF_BOTTOM);
+    qf_free(f);
+
+    /* the tick of the world is the scale of %time */
+    f = qf_new();
+    f->tick_scale = -3;
+    const char *src = "%span: { dimension: \"s\" }\n#T: { t: %time, u: %span }\na: #T & { t: 1.5s, u: 2s }\n", *name = "a.quad";
+    CHECK(qf_load(f, &name, &src, 1));
+    const QfNode *t = at(f, inst(f, "a"), "t"), *u = at(f, inst(f, "a"), "u");
+    CHECK(t && t->lo == 1500 && t->hi == 1500);
+    CHECK(u && u->lo == 2000 && f->kinds.v[qf_kind_lookup(f, qf_sym(f, "%span"))].scale == -3);
+    qf_free(f);
+
+    /* the indices of base dimensions follow their symbols, not the order of declarations */
+    for (int order = 0; order < 2; order++) {
+        f = load1(order ? "%b: { base: \"coin\" }\n%a: { base: \"zed\" }\n" : "%a: { base: \"zed\" }\n%b: { base: \"coin\" }\n", &ok);
+        CHECK(ok && f->bases.n == 3 && !strcmp(f->bases.v[0], "coin") && !strcmp(f->bases.v[1], "deg") &&
+              !strcmp(f->bases.v[2], "zed"));
+        qf_free(f);
+    }
+
+    STR_EQ(load_error("%e: 5\n"),
+           "a.quad:1:5: error: the body of the kind %e must be a struct of literal fields: { dimension: \"J\", scale: -3 }");
+    STR_EQ(load_error("%e: { dimension: \"J\", unit: \"J\" }\n"),
+           "a.quad:1:23: error: a kind has the fields dimension, base, scale, conserved and rounding, not unit");
+    STR_EQ(load_error("%e: { scale: -3 }\n"),
+           "a.quad:1:1: error: the kind %e needs a dimension (dimension: \"J\") or a new base dimension (base: \"coin\")");
+    STR_EQ(load_error("%e: { dimension: \"J\", base: \"joule\" }\n"),
+           "a.quad:1:23: error: the kind %e has a dimension and a base: give one of them");
+    STR_EQ(load_error("%e: { dimension: \"furlong\" }\n"),
+           "a.quad:1:18: error: the dimension of the kind %e is not valid. Write the coherent units as a string, "
+           "for example \"J/K\" or \"kg m^2 s^-2\", or \"1\" for no dimension");
+    STR_EQ(load_error("%e: { dimension: J }\n"),
+           "a.quad:1:18: error: the dimension of the kind %e is not valid. Write the coherent units as a string, "
+           "for example \"J/K\" or \"kg m^2 s^-2\", or \"1\" for no dimension");
+    STR_EQ(load_error("%e: { dimension: \"J\", scale: 1.5 }\n"),
+           "a.quad:1:30: error: the scale of the kind %e must be an integer from -60 to 60");
+    STR_EQ(load_error("%e: { dimension: \"J\", scale: 3mm }\n"),
+           "a.quad:1:30: error: the scale of the kind %e must be an integer from -60 to 60");
+    STR_EQ(load_error("%e: { dimension: \"J\", scale: 61 }\n"),
+           "a.quad:1:30: error: the scale of the kind %e must be an integer from -60 to 60");
+    STR_EQ(load_error("%e: { dimension: \"J\", conserved: 1 }\n"), "a.quad:1:34: error: conserved must be true or false");
+    STR_EQ(load_error("%e: { dimension: \"J\", rounding: \"up\" }\n"),
+           "a.quad:1:33: error: rounding must be \"half-even\", \"floor\", \"ceiling\" or \"zero\"");
+    STR_EQ(load_error("%e: { dimension: \"J\" }\n%e: { dimension: \"J\" }\n"),
+           "a.quad:2:1: error: the kind %e is already declared at a.quad:1");
+    STR_EQ(load_error("%time: { dimension: \"s\" }\n"),
+           "a.quad:1:1: error: %time is a built-in kind that content cannot change: its scale is the tick of the world");
+    STR_EQ(load_error("%count: { scale: -1 }\n"), "a.quad:1:1: error: %count is a built-in kind that content cannot change");
+    STR_EQ(load_error("%ratio: { scale: -3 }\n"), "a.quad:1:1: error: %ratio is a built-in kind that content cannot change");
+    STR_EQ(load_error("%e: { base: \"deg\" }\n"), "a.quad:1:13: error: 'deg' is already a unit symbol");
+    STR_EQ(load_error("%e: { base: \"turn\" }\n"), "a.quad:1:13: error: 'turn' is already a unit symbol");
+    STR_EQ(load_error("%e: { base: \"pct\" }\n"), "a.quad:1:13: error: 'pct' is already a unit symbol");
+    STR_EQ(load_error("%e: { base: \"kg\" }\n"), "a.quad:1:13: error: 'kg' is already a unit symbol");
+    STR_EQ(load_error("%e: { base: \"mm\" }\n"), "a.quad:1:13: error: 'mm' is already a unit symbol");
+    STR_EQ(load_error("%e: { base: \"coin\" }\n%g: { base: \"coin\" }\n"),
+           "a.quad:2:13: error: the base dimension 'coin' is already declared");
+    STR_EQ(load_error("%e: { base: \"two words\" }\n"),
+           "a.quad:1:13: error: base is the unit symbol of a new base dimension, as a string: base: \"coin\"");
+    STR_EQ(load_error("%e: { dimension: \"J\" } & #T\n#T: {}\n"),
+           "a.quad:1:24: error: the body of the kind %e must be a struct of literal fields: { dimension: \"J\", scale: -3 }");
+    STR_EQ(load_error("#T: { x: %nothing }\n"),
+           "a.quad:1:10: error: unknown kind %nothing. Declare it: %nothing: { dimension: \"J\" }");
+    STR_EQ(load_error("number: 5\n"), "a.quad:1:1: error: instance name number is a built-in type");
+}
+
+/* --- built-in kinds: the base dimensions, and the angle (ADR 0015 section 1) ---------------------- */
+
+static int64_t quanta_at(Front *f, const char *instance, const char *path)
+{
+    const QfNode *n = at(f, inst(f, instance), path);
+    CHECK(n && n->lo == n->hi && f->types.v[n->type].kind == TK_KIND);
+    return n ? n->lo : 0;
+}
+
+void test_builtin_kinds(void)
+{
+    bool ok;
+    const char *T = "#T: { l: %length, m: %mass, i: %current, th: %temperature, n: %amount, lum: %luminosity, "
+                    "a: %angle, t: %time, r: %ratio, c: %count }\n";
+    char src[2048];
+    /* with no declaration, each base dimension has a kind with the default scale of ADR 0001 */
+    snprintf(src, sizeof src, "%sx: #T & { l: 19mm, m: 350g, i: 2mA, th: 293.15K, n: 0.5mol, lum: 3cd, a: 90deg, "
+             "t: 1.5s, r: 50pct, c: 12 }\ny: #T & { a: 0.5turn, r: 250ppm, l: 1.5km }\n", T);
+    Front *f = load1(src, &ok);
+    CHECK(ok);
+    if (ok) {
+        CHECK(quanta_at(f, "x", "l") == 190);                    /* 0.1 mm */
+        CHECK(quanta_at(f, "x", "m") == 350);                    /* 1 g */
+        CHECK(quanta_at(f, "x", "i") == 2);                      /* 1 mA */
+        CHECK(quanta_at(f, "x", "th") == 29315);                 /* 0.01 K */
+        CHECK(quanta_at(f, "x", "n") == 500);                    /* 1 mmol */
+        CHECK(quanta_at(f, "x", "lum") == 3000);
+        CHECK(quanta_at(f, "x", "a") == 90000);                  /* 0.001 degree */
+        CHECK(quanta_at(f, "x", "t") == 1500000);                /* 1 µs */
+        CHECK(quanta_at(f, "x", "r") == 500000000);              /* 50 percent is 0.5 */
+        CHECK(quanta_at(f, "x", "c") == 12);
+        CHECK(quanta_at(f, "y", "a") == 180000);                 /* half a turn is 180 degrees */
+        CHECK(quanta_at(f, "y", "r") == 250000);
+        CHECK(quanta_at(f, "y", "l") == 15000000);
+        static const char *const names[] = { "%length", "%mass", "%current", "%temperature", "%amount", "%luminosity", "%angle" };
+        for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+            uint32_t k = qf_kind_lookup(f, qf_sym(f, names[i]));
+            CHECK(k != QF_BOTTOM && f->kinds.v[k].builtin && !f->kinds.v[k].fixed && !f->kinds.v[k].conserved);
+        }
+        /* the angle is a base dimension: its own exponent, and no radian */
+        uint32_t ka = qf_kind_lookup(f, qf_sym(f, "%angle"));
+        const QDim *ad = &f->dims.v[f->kinds.v[ka].dimix].dim;
+        CHECK(f->bases.n == 1 && !strcmp(f->bases.v[0], "deg") && ad->exp[Q_NSI] == 1 && !strcmp(f->kinds.v[ka].base, "deg"));
+        CHECK(qf_unit_symbol(f, "deg") && qf_unit_symbol(f, "turn") && !qf_unit_symbol(f, "rad") && !qf_unit_symbol(f, "mdeg"));
+    }
+    qf_free(f);
+    snprintf(src, sizeof src, "%sx: #T & { a: 1rad }\n", T);
+    STR_EQ(load_error(src), "a.quad:2:14: error: unknown unit 'rad'");
+    snprintf(src, sizeof src, "%sx: #T & { a: 5 }\n", T);
+    STR_EQ(load_error(src), "a.quad:2:9: error: struct: conflict at a: %angle vs 5");
+    snprintf(src, sizeof src, "%sx: #T & { l: 90deg }\n", T);
+    STR_EQ(load_error(src), "a.quad:2:9: error: struct: conflict at l: %length vs dim[deg] & 90");
+    snprintf(src, sizeof src, "%sx: #T & { l: 0.01mm }\n", T);
+    STR_EQ(load_error(src), "a.quad:2:9: error: struct: conflict at l: %length vs dim[m] & 0.00001 "
+                            "(the value is not a whole number of quanta of the kind)");
+    snprintf(src, sizeof src, "%sx: #T & { r: 5J/kg*K }\n", T);
+    STR_EQ(load_error(src), "a.quad:2:14: error: in the unit 'J/kg*K', a '*' after a '/' has two readings. Give each "
+                            "divisor its own '/': J/kg/K");
+
+    /* one declaration changes the scale, conserved or the rounding of a built-in base kind */
+    snprintf(src, sizeof src, "%s%%length: { scale: -9 }\n%%mass: { dimension: \"kg\", scale: 0, conserved: true }\n"
+             "%%angle: { scale: 0, rounding: \"floor\" }\nx: #T & { l: 0.01mm, m: 2kg, a: 90deg }\n", T);
+    f = load1(src, &ok);
+    CHECK(ok);
+    if (ok) {
+        CHECK(quanta_at(f, "x", "l") == 10000);                  /* nanometres now */
+        CHECK(quanta_at(f, "x", "m") == 2);
+        CHECK(quanta_at(f, "x", "a") == 90);
+        uint32_t km = qf_kind_lookup(f, qf_sym(f, "%mass")), kl = qf_kind_lookup(f, qf_sym(f, "%length")),
+                 ka = qf_kind_lookup(f, qf_sym(f, "%angle"));
+        CHECK(f->kinds.v[km].conserved && f->kinds.v[km].scale == 0 && !f->kinds.v[km].builtin);
+        CHECK(!f->kinds.v[kl].conserved && f->kinds.v[kl].scale == -9 && f->kinds.v[kl].loc.line == 2);
+        CHECK(f->kinds.v[ka].rounding == Q_ROUND_FLOOR && !strcmp(f->kinds.v[ka].base, "deg"));
+        /* the kind is still the one kind of its name: the fields of #T have it */
+        CHECK(at(f, inst(f, "x"), "m")->type == f->kinds.v[km].type);
+    }
+    qf_free(f);
+    snprintf(src, sizeof src, "%s%%mass: { scale: 0 }\nx: #T & { m: 350g }\n", T);
+    STR_EQ(load_error(src), "a.quad:3:9: error: struct: conflict at m: %mass vs dim[kg] & 0.35 "
+                            "(the value is not a whole number of quanta of the kind)");
+    /* a second declaration is an error, whatever it says */
+    STR_EQ(load_error("%mass: { scale: 0 }\n%mass: { scale: 0 }\n"), "a.quad:2:1: error: the kind %mass is already declared at a.quad:1");
+    STR_EQ(load_error("%mass: { conserved: true }\n%mass: { conserved: false }\n"),
+           "a.quad:2:1: error: the kind %mass is already declared at a.quad:1");
+    const char *two[] = { "%length: { scale: -6 }\n", "%length: { scale: -9 }\n" };
+    f = load(two, 2, &ok);
+    CHECK(!ok && f->diags.n == 1);
+    if (f->diags.n == 1) STR_EQ(f->diags.v[0].msg, "b.quad:1:1: error: the kind %length is already declared at a.quad:1");
+    qf_free(f);
+    /* the dimension stays */
+    STR_EQ(load_error("%mass: { dimension: \"m\" }\n"),
+           "a.quad:1:21: error: the built-in kind %mass keeps its dimension: a declaration can change its scale, conserved and rounding");
+    STR_EQ(load_error("%mass: { base: \"lump\" }\n"),
+           "a.quad:1:10: error: the built-in kind %mass keeps its dimension: a declaration can change its scale, conserved and rounding");
+    STR_EQ(load_error("%angle: { dimension: \"1\" }\n"),
+           "a.quad:1:22: error: the built-in kind %angle keeps its dimension: a declaration can change its scale, conserved and rounding");
+    STR_EQ(load_error("%angle: { dimension: \"deg\", scale: -6 }\n"), "loaded");
+
+    /* a package can have its own kind with a built-in name. Another package that
+     * writes the plain name gets the built-in kind, not that package's. */
+    const char *pk[] = { "package p\n%mass: { dimension: \"kg\", scale: 0 }\n#A: { m: %mass }\na: #A & { m: 2kg }\n",
+                         "package q\n#B: { w: %mass, v: p.%mass }\nb: #B & { w: 350g, v: 3kg }\n" };
+    f = load(pk, 2, &ok);
+    CHECK(ok);
+    if (ok) {
+        CHECK(quanta_at(f, "a", "m") == 2);                      /* p's kind: kilograms */
+        CHECK(quanta_at(f, "b", "w") == 350);                    /* the built-in kind: grams */
+        CHECK(quanta_at(f, "b", "v") == 3);
+        STR_EQ(node_text(f, inst(f, "b")), "#B & { v: p.%mass & 3, w: %mass & 0.35 }");
+    }
+    qf_free(f);
+}
+
+/* --- a struct states its type (ADR 0015 section 5) ------------------------------------------------- */
+
+void test_struct_states_type(void)
+{
+    const char *T = "#Tool: { size: %length, mass: %mass }\n#Wrench: #Tool & { jaw: %length }\n"
+                    "#Box: { best: #Tool, any: _, all: [...#Tool], loose: [...] }\n";
+    char src[2048];
+#define LOADS(body, want)                                                              \
+    do {                                                                               \
+        snprintf(src, sizeof src, "%s%s\n", T, body);                                  \
+        STR_EQ(load_error(src), want);                                                 \
+    } while (0)
+    /* where the place has the type, a struct needs no more */
+    LOADS("a: #Tool & { size: 19mm }", "loaded");
+    LOADS("a: { size: 19mm } & #Tool", "loaded");                 /* the order of the conjuncts does not count */
+    LOADS("a: #Wrench & { size: 19mm }", "loaded");               /* a subtype has the fields too */
+    LOADS("a: #Tool\na: { size: 19mm }", "loaded");               /* the type from its other declaration */
+    LOADS("a: { size: 19mm }\na: #Tool", "loaded");
+    LOADS("b: #Box & { best: { size: 19mm } }", "loaded");        /* the declared type of the field */
+    LOADS("b: #Box & { all: [{ size: 19mm }, { mass: 2kg }] }", "loaded");    /* the element type of the list */
+    LOADS("a: #Tool & { size: 19mm }\nb: a & { mass: 2kg }", "loaded");       /* the type of an instance */
+    LOADS("a: #Tool & { size: 19mm }\nb: { mass: 2kg } & a", "loaded");
+    LOADS("b: #Box & { any: #Tool & { size: 19mm } }", "loaded"); /* stated */
+    LOADS("b: #Box & { any: { size: 19mm } & #Tool }", "loaded"); /* stated after the struct: the same */
+    LOADS("b: #Box & { loose: [#Tool & { size: 19mm }] }", "loaded");
+    LOADS("b: #Box & { best: #Wrench & { jaw: 250mm } }", "loaded");
+    LOADS("b: #Box & { any: {} }", "loaded");                     /* no fields: no type to get */
+    LOADS("#Crate: #Box & { best: { size: 19mm } }", "loaded");   /* in a type: the field of its supertype */
+
+    /* where the place has no type, the fields do not give one */
+    LOADS("a: { size: 19mm }",
+          "a.quad:4:4: error: this struct stands where no type is known, and a struct does not get a type from its "
+          "fields. Its fields are fields of #Tool: write #Tool & { ... }");
+    LOADS("b: #Box & { any: { size: 19mm } }",
+          "a.quad:4:18: error: this struct stands where no type is known, and a struct does not get a type from its "
+          "fields. Its fields are fields of #Tool: write #Tool & { ... }");
+    LOADS("b: #Box & { loose: [{ size: 19mm }] }",
+          "a.quad:4:21: error: this struct stands where no type is known, and a struct does not get a type from its "
+          "fields. Its fields are fields of #Tool: write #Tool & { ... }");
+    LOADS("#Vise: #Tool & { head: { size: .size } }",
+          "a.quad:4:24: error: this struct stands where no type is known, and a struct does not get a type from its "
+          "fields. Its fields are fields of #Tool: write #Tool & { ... }");
+    /* and the fields do not make the type of the place more specific */
+    LOADS("b: #Box & { best: { jaw: 250mm } }",
+          "a.quad:4:19: error: this struct has fields of #Wrench, but it stands where the type is #Tool: write #Wrench & { ... }");
+    LOADS("b: #Box & { all: [{ jaw: 250mm }] }",
+          "a.quad:4:19: error: this struct has fields of #Wrench, but it stands where the type is #Tool: write #Wrench & { ... }");
+    LOADS("a: #Tool & { jaw: 250mm }",
+          "a.quad:4:12: error: this struct has fields of #Wrench, but it stands where the type is #Tool: write #Wrench & { ... }");
+    LOADS("a: #Box & { size: 19mm }",
+          "a.quad:4:11: error: this struct has fields of #Tool, but it stands where the type is #Box: write #Tool & { ... }");
+#undef LOADS
+    /* a stated type gives the same structure as the inferred one gave before */
+    snprintf(src, sizeof src, "%sb: #Box & { best: { size: 19mm }, any: #Wrench & { jaw: 250mm } }\n", T);
+    STR_EQ(inst_text(src, "b"), "#Box & { all: [...#Tool], any: #Wrench & { jaw: %length & 0.25, mass: %mass, size: %length }, "
+                                "best: #Tool & { mass: %mass, size: %length & 0.019 }, loose: #List }");
+    /* a reference is a path that the author wrote: it can go through a field with no type */
+    snprintf(src, sizeof src, "%sb: #Box & { best: { size: .any.size } }\n", T);
+    STR_EQ(inst_text(src, "b"), "#Box & { all: [...#Tool], any: #Tool & { mass: %mass, size: $1 & %length }, "
+                                "best: #Tool & { mass: %mass, size: $1 }, loose: #List }");
+}
+
+/* --- a literal converts when it meets a kind (ADR 0015 section 3) -------------------------------- */
+
+void test_literal_conversion(void)
+{
+    const char *T = "#T: { x: %length, e: %energy, n: number, any: _, c: %count }\n";
+    char src[4096];
+#define INST(body, want)                                                               \
+    do {                                                                               \
+        snprintf(src, sizeof src, "%s%sa: %s\n", KINDS, T, body);                      \
+        STR_EQ(inst_text(src, "a"), want);                                             \
+    } while (0)
+
+    /* the value is in quanta of the kind: 0.1 mm for a length */
+    bool ok;
+    snprintf(src, sizeof src, "%s%sa: #T & { x: 19mm, e: 5kJ, c: 12 }\n", KINDS, T);
+    Front *f = load1(src, &ok);
+    CHECK(ok);
+    if (ok) {
+        const QfNode *x = at(f, inst(f, "a"), "x"), *e = at(f, inst(f, "a"), "e"), *c = at(f, inst(f, "a"), "c");
+        CHECK(x && f->types.v[x->type].kind == TK_KIND && x->lo == 190 && x->hi == 190 && x->exp == 0);
+        CHECK(e && e->lo == 5000000 && e->hi == 5000000);
+        CHECK(c && c->lo == 12 && c->hi == 12);
+        const QfNode *n = at(f, inst(f, "a"), "n");
+        CHECK(n && n->type == f->tnumber && n->lo == Q_NINF && n->hi == Q_INF);
+    }
+    qf_free(f);
+
+    INST("#T & { x: 19mm }", "#T & { any: _, c: %count, e: %energy, n: number, x: %length & 0.019 }");
+    /* the order of the conjuncts does not count */
+    INST("{ x: 19mm } & #T", "#T & { any: _, c: %count, e: %energy, n: number, x: %length & 0.019 }");
+    INST("#T & { x: 19mm & %length }", "#T & { any: _, c: %count, e: %energy, n: number, x: %length & 0.019 }");
+    INST("#T & { any: %length & 19mm }", "#T & { any: %length & 0.019, c: %count, e: %energy, n: number, x: %length }");
+    INST("#T & { any: 19mm & %length }", "#T & { any: %length & 0.019, c: %count, e: %energy, n: number, x: %length }");
+    INST("#T & { any: 1.9cm & 19mm & 0.019m }", "#T & { any: dim[m] & 0.019, c: %count, e: %energy, n: number, x: %length }");
+    /* a value with only a dimension is valid in a structure */
+    INST("#T & { n: 2.5m/s }", "#T & { any: _, c: %count, e: %energy, n: dim[m s^-1] & 2.5, x: %length }");
+    INST("#T & { n: 2.5 & >=1 }", "#T & { any: _, c: %count, e: %energy, n: 2.5, x: %length }");
+    INST("#T & { any: %energy / %time }", "#T & { any: dim[m^2 kg s^-3], c: %count, e: %energy, n: number, x: %length }");
+    INST("#T & { any: %energy / %time & 5W }", "#T & { any: dim[m^2 kg s^-3] & 5, c: %count, e: %energy, n: number, x: %length }");
+    INST("#T & { any: %energy * %length / %length & %energy & 2J }",
+         "#T & { any: %energy & 2, c: %count, e: %energy, n: number, x: %length }");
+    /* bounds */
+    INST("#T & { x: >=10mm & <=24mm }", "#T & { any: _, c: %count, e: %energy, n: number, x: %length & >=0.01 & <=0.024 }");
+    INST("#T & { x: >10mm & <24mm }", "#T & { any: _, c: %count, e: %energy, n: number, x: %length & >=0.0101 & <=0.0239 }");
+    INST("#T & { x: >=0.15mm & <0.4mm }", "#T & { any: _, c: %count, e: %energy, n: number, x: %length & >=0.0002 & <=0.0003 }");
+    INST("#T & { any: >10mm & <24mm }", "#T & { any: dim[m] & >0.01 & <0.024, c: %count, e: %energy, n: number, x: %length }");
+    INST("#T & { any: >10mm & <24mm & >=1cm & <=2cm }",
+         "#T & { any: dim[m] & >0.01 & <=0.02, c: %count, e: %energy, n: number, x: %length }");
+    INST("#T & { x: >=10mm } & { x: 12mm }", "#T & { any: _, c: %count, e: %energy, n: number, x: %length & 0.012 }");
+    INST("#T & { c: >=2 & <5 }", "#T & { any: _, c: %count & >=2 & <=4, e: %energy, n: number, x: %length }");
+    INST("#T & { x: 3e-3m, e: 1e3J }", "#T & { any: _, c: %count, e: %energy & 1000, n: number, x: %length & 0.003 }");
+
+    /* errors: each names the value and the reason */
+    INST("#T & { x: 0.15mm }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[m] & 0.00015 "
+                               "(the value is not a whole number of quanta of the kind)");
+    INST("#T & { c: 2.5 }", "a.quad:5:9: error: struct: conflict at c: %count vs 2.5 "
+                            "(the value is not a whole number of quanta of the kind)");
+    INST("#T & { x: >0.11mm & <0.19mm }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[m] & >0.00011 & <0.00019 "
+                                           "(the range holds no whole number of quanta of the kind)");
+    INST("#T & { x: 1e30m }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[m] & 1e30 "
+                              "(the value does not fit in the range of the kind)");
+    INST("#T & { x: 5kg }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[kg] & 5");
+    INST("#T & { x: 5 }", "a.quad:5:9: error: struct: conflict at x: %length vs 5");
+    INST("#T & { x: 3min }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[s] & 180");
+    INST("#T & { x: %mass }", "a.quad:5:9: error: struct: conflict at x: %length vs %mass");
+    INST("#T & { x: 12mm } & { x: 13mm }", "a.quad:5:21: error: conjunction: conflict at x: %length & 0.012 vs %length & 0.013");
+    INST("#T & { any: 12mm & 13mm }", "a.quad:5:21: error: conjunction: conflict at any: dim[m] & 0.012 vs dim[m] & 0.013");
+    INST("#T & { any: 1e30m & 1e-30m }", "a.quad:5:22: error: conjunction: conflict at any: dim[m] & 1e30 vs dim[m] & 0.000000000000000000000000000001 "
+                                         "(the number is out of range)");
+    INST("#T & { x: >=10mm & <5mm }", "a.quad:5:21: error: conjunction: conflict at x: dim[m] & >=0.01 vs dim[m] & <0.005");
+    INST("#T & { n: \"text\" }", "a.quad:5:9: error: struct: conflict at n: number vs \"text\"");
+    /* the checks that ADR 0014 gave to this stage */
+    INST("#T & { n: 0x10 }", "a.quad:5:14: error: unknown unit 'x10'");
+    INST("#T & { n: 10m/x }", "a.quad:5:14: error: unknown unit 'x' in 'm/x'. If 'x' is a name, put spaces around the "
+                              "operator, because an operator with a name directly after it continues the unit");
+    INST("#T & { any: 0.1/s }", "a.quad:5:20: error: unknown name 's'. 's' is a unit: for a value for each s, write the unit "
+                                "directly after the number with a negative exponent, for example 0.1s^-1");
+    INST("#T & { any: 2 * wrench }", "a.quad:5:20: error: the name 'wrench' cannot stand in an expression: a value of the "
+                                     "structure is a reference, for example .size");
+    INST("#T & { n: 1m | 2m }", "a.quad:5:17: error: a disjunction of numbers is not a type; use a range, or an enum of atoms");
+#undef INST
+    /* decimals in structures: copies keep the power of ten and the open bounds */
+    f = load1(with_kinds("#D: { d: >0.5m & <2.5m, any: _ }\n#U: { t: #D }\nu: #U\n"
+                         "p: #D & { any: 0.15mm }\nq: #D & { any: %length & 0.2mm }\n"
+                         "g1: #D & { any: >=1m }\ns1: #D & { any: 0.5m }\ns2: #D & { any: 2m }\ns3: #D & { any: >=0.5m }\n"
+                         "r1: #D & { any: >=0.15mm }\nr2: #D & { any: %length & >=0.2mm }\nr3: #D & { any: %length & >=0.1mm }\n"
+                         "m5: #D & { any: 5m }\nt5: #D & { any: 5s }\nn150: #D & { any: 1.50m }\ntxt: #D & { any: \"hello\" }\n"
+                         "lit: 1.50m\nrange: >=10.0mm\n"), &ok);
+    CHECK(ok);
+    if (ok) {
+        STR_EQ(node_text(f, inst(f, "u")), "#U & { t: #D & { any: _, d: dim[m] & >0.5 & <2.5 } }");
+        const QfNode *d = at(f, inst(f, "u"), "t.d");
+        CHECK(d && d->lo == 5 && d->hi == 25 && d->exp == -1 && (d->flags & NF_LO_OPEN) && (d->flags & NF_HI_OPEN));
+        /* a literal is stored with no common factor of ten: 1.50 m and 1.5 m are one value */
+        const QfNode *n150 = at(f, inst(f, "n150"), "any");
+        CHECK(n150 && n150->lo == 15 && n150->hi == 15 && n150->exp == -1);
+        const QfNode *lit = inst(f, "lit"), *range = inst(f, "range");            /* also with no unification */
+        CHECK(lit && lit->lo == 15 && lit->hi == 15 && lit->exp == -1);
+        CHECK(range && range->lo == 1 && range->hi == Q_INF && range->exp == -2);
+        /* a string that no enum lists is a text value */
+        const QfNode *txt = at(f, inst(f, "txt"), "any");
+        CHECK(txt && txt->type == f->ttext && (txt->flags & NF_VALUE) && txt->lo == txt->hi);
+        STR_EQ((const char *) (intptr_t) (txt ? txt->lo : 0), "\"hello\"");
+        QfOp *op = qf_op_new(f);
+        QfStore *out = qf_store_new();
+        bool fwd, bwd;
+#define ANY(name) at(f, inst(f, name), "any")
+        /* 0.15 mm is no value of the kind, so it does not subsume 0.2 mm of the kind */
+        qf_subsumes(op, ANY("p"), ANY("q"), &fwd, &bwd);
+        CHECK(!fwd && !bwd);
+        qf_subsumes(op, ANY("g1"), ANY("s1"), &fwd, &bwd);
+        CHECK(!fwd && !bwd);                                     /* 0.5 m is not >= 1 m */
+        qf_subsumes(op, ANY("g1"), ANY("s2"), &fwd, &bwd);
+        CHECK(fwd && !bwd);
+        qf_subsumes(op, ANY("g1"), ANY("s3"), &fwd, &bwd);
+        CHECK(!fwd && bwd);                                      /* >= 0.5 m is the more general */
+        /* a decimal range subsumes a range of a kind when every quantum in the second is in the first */
+        qf_subsumes(op, ANY("r1"), ANY("r2"), &fwd, &bwd);
+        CHECK(fwd && !bwd);
+        qf_subsumes(op, ANY("r1"), ANY("r3"), &fwd, &bwd);
+        CHECK(!fwd && !bwd);
+        /* generalization: a hull in one dimension, any number across two dimensions */
+        STR_EQ(node_text(f, qf_generalize(op, ANY("m5"), ANY("t5"), out)), "number");
+        STR_EQ(node_text(f, qf_generalize(op, ANY("m5"), ANY("s2"), out)), "dim[m] & >=2 & <=5");
+        STR_EQ(node_text(f, qf_generalize(op, ANY("q"), ANY("s2"), out)), "dim[m] & >=0.0002 & <=2");
+        STR_EQ(node_text(f, qf_generalize(op, ANY("r2"), ANY("r3"), out)), "%length & >=0.0001");
+        STR_EQ(node_text(f, qf_generalize(op, ANY("g1"), ANY("txt"), out)), "_");
+        STR_EQ(node_text(f, qf_generalize(op, ANY("txt"), ANY("txt"), out)), "\"hello\"");
+#undef ANY
+        /* an operation gives back all of its scratch */
+        CHECK(op->scratch.n == 0);
+        qf_store_free(out);
+        qf_op_free(op);
+    }
+    qf_free(f);
+
+    STR_EQ(load_error("let s = 2\n#T: { x: _ }\n"),
+           "a.quad:1:5: error: let s: 's' is a unit symbol. Give the let another name, because a number directly "
+           "before /s or *s takes it as a unit");
+    STR_EQ(load_error("let size = 2\n#T: { x: size }\n"), "loaded");
+}
+
+/* --- the fixture: a small thermal world, with packages -------------------------------------------- */
+
+static char *read_file(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    rewind(f);
+    char *s = malloc((size_t) n + 1);
+    size_t got = s ? fread(s, 1, (size_t) n, f) : 0;
+    fclose(f);
+    if (!s) return NULL;
+    s[got] = 0;
+    return s;
+}
+
+#define NFIX 4
+static const char *const fixture_files[NFIX] = { "physics.quad", "world.quad", "shop.quad", "tools.quad" };
+
+static bool fixture_sources(char *src[NFIX])
+{
+    bool all = true;
+    for (int i = 0; i < NFIX; i++) {
+        char path[256];
+        snprintf(path, sizeof path, "tests/data/resolve/%s", fixture_files[i]);
+        src[i] = read_file(path);
+        CHECK(src[i] != NULL);
+        all = all && src[i];
+    }
+    return all;
+}
+
+static Front *load_fixture(void)
+{
+    char *src[NFIX];
+    if (!fixture_sources(src)) return NULL;
+    Front *f = qf_new();
+    bool ok = qf_load(f, fixture_files, (const char *const *) src, NFIX);
+    CHECK(ok);
+    for (size_t i = 0; i < f->diags.n; i++) fprintf(stderr, "  %s\n", f->diags.v[i].msg);
+    for (int i = 0; i < NFIX; i++) free(src[i]);
+    if (!ok) { qf_free(f); return NULL; }
+    return f;
+}
+
+void test_resolve_fixture(void)
+{
+    Front *f = load_fixture();
+    if (!f) return;
+    CHECK(f->loaded && f->hash != 0);
+
+    /* the hierarchy */
+    uint32_t room = type_lookup(f, qf_sym(f, "#LumpedRoom")), thermal = type_lookup(f, qf_sym(f, "#Thermal")),
+             phen = type_lookup(f, qf_sym(f, "#Phenomenon")), port = type_lookup(f, qf_sym(f, "#ThermalPort")),
+             wall = type_lookup(f, qf_sym(f, "#Wall"));
+    CHECK(room != QF_BOTTOM && thermal != QF_BOTTOM && phen != QF_BOTTOM && port != QF_BOTTOM && wall != QF_BOTTOM);
+    CHECK(is_subtype(f, room, thermal) && is_subtype(f, room, phen) && is_subtype(f, port, thermal));
+    CHECK(!is_subtype(f, thermal, room) && !is_subtype(f, wall, thermal));
+    CHECK(meet_pure(f, room, thermal) == room && meet_pure(f, room, wall) == QF_BOTTOM);
+    CHECK(meet_pure(f, room, port) == QF_BOTTOM);
+    CHECK(meet(f, room, thermal) == room && meet(f, wall, room) == QF_BOTTOM);
+    /* a conjunction of unrelated types gets a generated type, and so does a meet of two of those */
+    uint32_t made = type_lookup(f, qf_sym(f, "shop.#Made")), phys = type_lookup(f, qf_sym(f, "shop.#Physical"));
+    CHECK(made != QF_BOTTOM && phys != QF_BOTTOM);
+    uint32_t mp = meet_pure(f, made, phys);
+    CHECK(mp != QF_BOTTOM && f->types.v[mp].kind == TK_GLB);
+    STR_EQ(f->types.v[mp].name, "glb[shop.#Made & shop.#Physical,shop.#Made & shop.#Priced & shop.#Tool]");
+    /* a packaged type is found by its plain name where only one package has it */
+    CHECK(type_lookup(f, qf_sym(f, "#Made")) == made);
+    CHECK(type_pkg(f, made) == qf_sym(f, "shop") && type_pkg(f, room) == NULL);
+    /* features: each has one introducing type, and a subtype has its supertypes' features */
+    uint32_t fenergy = feat_lookup(f, qf_sym(f, "energy")), fwest = feat_lookup(f, qf_sym(f, "west"));
+    CHECK(fenergy != QF_BOTTOM && f->feats.v[fenergy].intro == thermal && f->feats.v[fwest].intro == room);
+    CHECK(approp(f, room, fenergy) && approp(f, port, fenergy) && !approp(f, wall, fenergy) && !approp(f, port, fwest));
+    /* an enum, and a disjunction of structures */
+    uint32_t material = type_lookup(f, qf_sym(f, "shop.#Material")), steel = type_lookup(f, qf_sym(f, "\"steel\""));
+    CHECK(steel != QF_BOTTOM && is_subtype(f, steel, material) && is_subtype(f, material, f->atomroot));
+    uint32_t disj = type_lookup(f, qf_sym(f, "(#Circle | #Square)")), circle = type_lookup(f, qf_sym(f, "#Circle"));
+    CHECK(disj != QF_BOTTOM && f->types.v[disj].kind == TK_DISJ && f->types.v[disj].isdisj);
+    uint32_t alt = type_lookup(f, qf_sym(f, "(#Circle | #Square)/#Circle"));
+    CHECK(alt != QF_BOTTOM && f->types.v[alt].kind == TK_ALT && is_subtype(f, alt, disj) && is_subtype(f, alt, circle));
+    CHECK(is_value(f, f->tnumber) && is_value(f, f->ttext) && is_value(f, f->tconstraint) && !is_value(f, room));
+
+    /* an instance: several declarations, references that share nodes, and exact values */
+    const QfNode *a = inst(f, "roomA");
+    STR_EQ(node_text(f, a),
+           "#LumpedRoom & { capacity: $1 & %capacity & 1000, door: \"open\", energy: $2 & %energy & 293150, "
+           "laws: [constraint, ...constraint] & { first: .energy == (.capacity * .temperature), rest: #Null }, "
+           "temperature: $3 & %temperature & 293.15, west: #ThermalPort & { capacity: $1, energy: $2, temperature: $3 } }");
+    const QfNode *e = at(f, a, "energy");
+    CHECK(e && e->lo == 293150000 && e->hi == 293150000);                       /* millijoules */
+    CHECK(at(f, a, "west.energy") == e);                                        /* one node */
+    const QfNode *t = at(f, a, "temperature");
+    CHECK(t && t->lo == 293150000 && t->hi == 293150000);                       /* microkelvins */
+    CHECK(at(f, a, "west.west") == NULL && at(f, a, "energy.west") == NULL);
+    const QfNode *b = inst(f, "roomB");
+    const QfNode *bt = at(f, b, "temperature"), *be = at(f, b, "energy");
+    CHECK(bt && bt->lo == 273150000 && bt->hi == 373150000);
+    CHECK(be && be->lo == 0 && be->hi == Q_INF);                                /* the type's bound */
+    STR_EQ(node_text(f, at(f, b, "door")), "(\"closed\" | \"open\")");
+    /* a path into another instance gives a copy: the wall's ports do not share with the rooms */
+    const QfNode *w = inst(f, "wall");
+    const QfNode *hot = at(f, w, "hot.energy");
+    CHECK(hot && hot != e && hot->lo == 293150000);
+    STR_EQ(node_text(f, at(f, w, "cold")),
+           "#ThermalPort & { capacity: %capacity & 2000, energy: %energy & >=0, temperature: %temperature & >=273.15 & <=373.15 }");
+    STR_EQ(node_text(f, at(f, w, "power")), "dim[m^2 kg s^-3]");
+    /* packages, a let, generated types, a base dimension */
+    STR_EQ(node_text(f, inst(f, "hammer")),
+           "shop.#Made & shop.#Priced & shop.#Tool & { grip: \"hard\", mass: shop.%mass & 0.5, of: \"steel\", "
+           "per: dim[kg^-1 coin], price: shop.%coin & 12.5 }");
+    STR_EQ(node_text(f, inst(f, "anvil")),
+           "glb[shop.#Made & shop.#Physical,shop.#Made & shop.#Priced & shop.#Tool] & { mass: shop.%mass & >=5, of: \"steel\" }");
+    const QfNode *price = at(f, inst(f, "hammer"), "price");
+    CHECK(price && price->lo == 1250);                                          /* hundredths of a coin */
+    /* a recursive type, a disjunction of structures, a typed list */
+    STR_EQ(node_text(f, inst(f, "chain")),
+           "#Chain & { label: \"a\", next: #Chain & { label: \"b\", next: #Chain & { label: \"c\", next: #Chain } } }");
+    STR_EQ(node_text(f, inst(f, "round")), "#Shaped & { form: (#Circle | #Square)/#Circle & { radius: tools.%length & 2 } }");
+    const QfNode *kit = inst(f, "kit");
+    STR_EQ(node_text(f, at(f, kit, "owner")), "\"Urist\"");
+    STR_EQ(node_text(f, at(f, kit, "items.rest.first.price")), "shop.%coin & 12.5");
+    STR_EQ(node_text(f, at(f, kit, "items.rest.rest")), "#Null");
+    const QfNode *ks = at(f, kit, "items.first.size");
+    CHECK(ks && ks->lo == 190 && at(f, kit, "items.first.head.width") == ks);
+
+    /* constraint records: the expression, its path, and the path of each reference */
+    const TypeInfo *rt = &f->types.v[room];
+    CHECK(rt->ariths.n == 1);
+    if (rt->ariths.n == 1) {
+        const ArithRec *r = &rt->ariths.v[0];
+        Buf p = { 0 };
+        path_format(f, &p, r->path.v, r->path.n);
+        STR_EQ(p.s, "laws.first");
+        p.len = 0;
+        qf_print(&p, r->expr);
+        STR_EQ(p.s, ".energy == (.capacity * .temperature)");
+        CHECK(r->expr->k == X_CMP && r->tags.n == 3);
+        if (r->tags.n == 3) {
+            STR_EQ(r->tags.v[0].name, ".energy");
+            CHECK(r->tags.v[0].path.n == 1 && r->tags.v[0].path.v[0] == fenergy);
+            STR_EQ(r->tags.v[2].name, ".temperature");
+        }
+        qf_buf_free(&p);
+        /* the node of the comparison refers to the same expression */
+        const QfNode *law = at(f, a, "laws.first");
+        CHECK(law && law->type == f->tconstraint && (const X *) (intptr_t) law->lo == r->expr && law->lo == law->hi);
+    }
+    const TypeInfo *wt = &f->types.v[wall];
+    CHECK(wt->ariths.n == 1 && wt->ariths.v[0].tags.n == 4);
+    if (wt->ariths.n == 1 && wt->ariths.v[0].tags.n == 4) {
+        Buf p = { 0 };
+        path_format(f, &p, wt->ariths.v[0].tags.v[2].path.v, wt->ariths.v[0].tags.v[2].path.n);
+        STR_EQ(p.s, "hot.temperature");
+        qf_buf_free(&p);
+    }
+    /* every record of a structure: of its instance, then of the type of each node */
+    QfRecUses uses = { 0 };
+    qf_records(f, a, &f->insts.v[qf_instance(f, "roomA")].ariths, &uses);
+    CHECK(uses.n == 1 && uses.v[0].rec == &rt->ariths.v[0] && uses.v[0].prefix.n == 0);
+    qf_records_free(&uses);
+    qf_free(f);
+
+    /* a record in a field: the record is at the path of the type's node */
+    bool ok;
+    f = load1(with_kinds("#Leg: { len: %length, twice: .len * 2, laws: [...constraint] }\n"
+                         "#Table: { leg: #Leg, spare: #Leg }\n"
+                         "t: #Table & { leg: { len: 1m, laws: [ .leg.len > 0m ] } }\n"
+                         "u: #Table & { spare: t.leg }\n"
+                         "v: #Table & { leg: t.leg }\n"
+                         "w: t & { spare: { len: 2m } }\n"
+                         "#Holder: { item: #Table }\n"
+                         "h: #Holder & { item: t }\n"
+                         "s: #Table & { spare: .leg }\n"), &ok);
+    CHECK(ok);
+    if (ok) {
+        uint32_t leg = type_lookup(f, qf_sym(f, "#Leg")), fleg = feat_lookup(f, qf_sym(f, "leg")),
+                 fspare = feat_lookup(f, qf_sym(f, "spare"));
+        CHECK(f->types.v[leg].ariths.n == 1 && f->types.v[leg].ariths.v[0].expr->k == X_ARITH);
+        STR_EQ(node_text(f, inst(f, "t")),
+               "#Table & { leg: #Leg & { laws: [constraint, ...constraint] & { first: .leg.len > 0m, rest: #Null }, "
+               "len: %length & 1, twice: _ }, spare: #Leg & { laws: [...constraint], len: %length, twice: _ } }");
+        /* the instance's own record: the comparison in t.leg.laws, with the reference at leg.len */
+        const InstInfo *ti = &f->insts.v[qf_instance(f, "t")];
+        CHECK(ti->ariths.n == 1);
+        if (ti->ariths.n == 1) {
+            Buf p = { 0 };
+            path_format(f, &p, ti->ariths.v[0].path.v, ti->ariths.v[0].path.n);
+            STR_EQ(p.s, "leg.laws.first");
+            p.len = 0;
+            CHECK(ti->ariths.v[0].tags.n == 1);
+            if (ti->ariths.v[0].tags.n == 1) path_format(f, &p, ti->ariths.v[0].tags.v[0].path.v, ti->ariths.v[0].tags.v[0].path.n);
+            STR_EQ(p.s, "leg.len");
+            qf_buf_free(&p);
+        }
+        /* the records of the structure: the instance's, and #Leg's at leg and at spare */
+        QfRecUses us = { 0 };
+        qf_records(f, ti->node, &ti->ariths, &us);
+        CHECK(us.n == 3);
+        if (us.n == 3) {
+            CHECK(us.v[0].rec == &ti->ariths.v[0] && us.v[0].prefix.n == 0);
+            CHECK(us.v[1].rec == &f->types.v[leg].ariths.v[0] && us.v[1].prefix.n == 1 && us.v[1].prefix.v[0] == fleg);
+            CHECK(us.v[2].rec == &f->types.v[leg].ariths.v[0] && us.v[2].prefix.n == 1 && us.v[2].prefix.v[0] == fspare);
+        }
+        qf_records_free(&us);
+        /* a whole instance by name brings its records, moved to where the copy stands */
+        const InstInfo *wi = &f->insts.v[qf_instance(f, "w")];
+        CHECK(wi->ariths.n == 1);
+        if (wi->ariths.n == 1) {
+            Buf p = { 0 };
+            path_format(f, &p, wi->ariths.v[0].path.v, wi->ariths.v[0].path.n);
+            STR_EQ(p.s, "leg.laws.first");
+            qf_buf_free(&p);
+            CHECK(wi->ariths.v[0].expr == ti->ariths.v[0].expr);
+        }
+        STR_EQ(node_text(f, at(f, inst(f, "w"), "spare.len")), "%length & 2");
+        /* at a field, the paths of the record and of its references get the path of the field */
+        const InstInfo *hi = &f->insts.v[qf_instance(f, "h")];
+        CHECK(hi->ariths.n == 1 && hi->ariths.v[0].tags.n == 1);
+        if (hi->ariths.n == 1 && hi->ariths.v[0].tags.n == 1) {
+            Buf p = { 0 };
+            path_format(f, &p, hi->ariths.v[0].path.v, hi->ariths.v[0].path.n);
+            STR_EQ(p.s, "item.leg.laws.first");
+            p.len = 0;
+            path_format(f, &p, hi->ariths.v[0].tags.v[0].path.v, hi->ariths.v[0].tags.v[0].path.n);
+            STR_EQ(p.s, "item.leg.len");
+            qf_buf_free(&p);
+        }
+        /* one node at two paths gives the records of its type once, at its first path */
+        const InstInfo *si = &f->insts.v[qf_instance(f, "s")];
+        CHECK(at(f, si->node, "leg") == at(f, si->node, "spare"));
+        QfRecUses shared = { 0 };
+        qf_records(f, si->node, &si->ariths, &shared);
+        CHECK(shared.n == 1 && shared.v[0].prefix.n == 1 && shared.v[0].prefix.v[0] == fleg);
+        qf_records_free(&shared);
+        /* inheritance: a subtype has the records of its supertypes, once */
+    }
+    qf_free(f);
+    f = load1(with_kinds("#A: { x: %length, y: .x * 2 }\n#B: #A & { z: .x + .y }\n#C: #A & { w: _ }\n#D: #B & #C\n"), &ok);
+    CHECK(ok);
+    if (ok) {
+        CHECK(f->types.v[type_lookup(f, qf_sym(f, "#A"))].ariths.n == 1);
+        CHECK(f->types.v[type_lookup(f, qf_sym(f, "#B"))].ariths.n == 2);
+        CHECK(f->types.v[type_lookup(f, qf_sym(f, "#C"))].ariths.n == 1);
+        CHECK(f->types.v[type_lookup(f, qf_sym(f, "#D"))].ariths.n == 2);
+    }
+    qf_free(f);
+}
+
+/* --- errors of a load ------------------------------------------------------------------------------ */
+
+void test_resolve_errors(void)
+{
+    /* what a later stage brings: each error names its issue */
+    STR_EQ(load_error("#T: { x: *1 | 2 }\n"), "a.quad:1:10: error: a default (*) is not in this stage (quad-ijx.10)");
+    STR_EQ(load_error("#T: { xs: [for x in [1] { x }] }\n"),
+           "a.quad:1:12: error: a comprehension or a function is not in this stage (quad-ijx.9)");
+    STR_EQ(load_error("#T: { for x in [1] { a: x } }\n"),
+           "a.quad:1:7: error: a comprehension or a function is not in this stage (quad-ijx.9)");
+    STR_EQ(load_error("#T: { x: len([1]) }\n"),
+           "a.quad:1:10: error: a comprehension or a function is not in this stage (quad-ijx.9)");
+    STR_EQ(load_error("#T: { (\"a\"): 1 }\n"), "a.quad:1:7: error: a computed label is not in this stage (quad-ijx.9)");
+    STR_EQ(load_error("#T: { x: =~\"^a\" }\n"),
+           "a.quad:1:10: error: a regular-expression constraint is not in this stage (quad-ijx.11)");
+    STR_EQ(load_error("#T: { x: \"a \\(1)\" }\n"), "a.quad:1:10: error: string interpolation is not in this stage (quad-ijx.11)");
+    STR_EQ(load_error("#A: { a: _ }\n#B: { b: _ }\nx: #C & { c: #A | #B }\n#C: { c: _ }\n"),
+           "a.quad:3:17: error: a disjunction of structures stands in a type's body. In an instance it needs variants, "
+           "which are not in this stage (quad-ijx.10)");
+
+    /* the hierarchy */
+    STR_EQ(load_error("#A: { x: _ }\n#B: { x: _ }\n"),
+           "a.quad:1:7: error: feature 'x' is introduced by both #A (a.quad:1) and #B (a.quad:2); declare it once "
+           "on a new common supertype (say #HasX), and inherit it");
+    STR_EQ(load_error("#A: #B\n#B: #A\n"), "a.quad:1:1: error: the type hierarchy has a cycle through #A");
+    STR_EQ(load_error("#A: #Nope & { x: _ }\n"), "a.quad:1:5: error: #Nope is not a type that #A can inherit from");
+    STR_EQ(load_error("a: { x: 1 }\n"), "a.quad:1:6: error: unknown feature 'x': no type declares a field with this name");
+    STR_EQ(load_error("#A: { x: _ }\na: #A & { x: nope }\n"), "a.quad:2:14: error: unknown name nope");
+    STR_EQ(load_error("#A: { x: _ }\n#B: { y: _ }\na: #A & { y: 1 }\n"),
+           "a.quad:3:9: error: this struct has fields of #B, but it stands where the type is #A: write #B & { ... }");
+    STR_EQ(load_error("#A: { x: _ }\na: #A & { x: a.x }\n"), "a.quad:2:1: error: instance a refers to itself");
+    STR_EQ(load_error("#A: { x: \"p\" | \"q\" }\na: #A & { x: \"r\" }\n"),
+           "a.quad:2:9: error: struct: conflict at x: \"r\" vs \"p\" | \"q\"");
+    STR_EQ(load_error("#A: { x: text }\na: #A & { x: \"r\" }\na: { x: \"s\" }\n"),
+           "a.quad:3:1: error: a: conflict at x: \"r\" vs \"s\", with its other declarations");
+    STR_EQ(load_error("#A: { x: #B, w: _ }\n#B: { y: #C, z: _ }\n#C: { v: _ }\na: #A & { w: .x.y.z }\n"),
+           "a.quad:4:14: error: the reference .x.y.z: x.y is #C, which has no field z");
+    /* a field with no type is open: the reference gives it the fields of its path */
+    STR_EQ(load_error("#A: { x: #B, w: _ }\n#B: { y: _, z: _ }\n#C: { v: _ }\na: #A & { w: .x.y.v.z }\n"), "loaded");
+    STR_EQ(load_error("#A: { x: _, y: _ }\na: #A & { x: .y + $nowhere }\n"),
+           "a.quad:2:17: error: a: $nowhere in an expression is not bound to a field");
+    STR_EQ(load_error("let room = 1\n#A: { x: _ }\nroom: #A\n"),
+           "a.quad:1:5: error: let room: an instance has this name, and a let may not hide it");
+    /* packages */
+    STR_EQ(load_error("package p\nx: q.#T\n"), "a.quad:2:4: error: unknown name q.#T");
+
+    /* every error of a content, sorted by location; a content with an error has no result */
+    bool ok;
+    const char *srcs[] = { "#A: { x: _ }\nb: #A & { x: nope }\n", "a: #A & { x: also_nope }\n" };
+    Front *f = load(srcs, 2, &ok);
+    CHECK(!ok && f->nerrors == 2 && f->diags.n == 2 && f->loaded);
+    if (f->diags.n == 2) {
+        STR_EQ(f->diags.v[0].msg, "a.quad:2:14: error: unknown name nope");
+        STR_EQ(f->diags.v[1].msg, "b.quad:1:14: error: unknown name also_nope");
+    }
+    qf_free(f);
+    const char *unsorted[] = { "#A: { x: \"p\" | \"q\", y: _ }\ni: #A & { y: nope }\n", "#B: #A & { x: \"r\" }\n" };
+    f = load(unsorted, 2, &ok);
+    CHECK(!ok && f->diags.n == 2);
+    if (f->diags.n == 2) {
+        STR_EQ(f->diags.v[0].msg, "a.quad:2:14: error: unknown name nope");
+        STR_EQ(f->diags.v[1].msg, "b.quad:1:12: error: #B inheriting from #A: conflict at x: \"r\" vs \"p\" | \"q\", with #A at a.quad:1");
+    }
+    const char *more = "x: 1\n", *name = "z.quad";
+    CHECK(!qf_load(f, &name, &more, 1));                         /* a front end loads once */
+    qf_free(f);
+    /* a syntax error in one file stops the load */
+    const char *bad[] = { "#A: { x: _ }\n", "a: #A & { x: ? }\n" };
+    f = load(bad, 2, &ok);
+    CHECK(!ok && f->diags.n == 1 && f->types.n == 0);
+    if (f->diags.n) STR_EQ(f->diags.v[0].msg, "b.quad:1:14: error: unexpected character '?'");
+    qf_free(f);
+}
+
+/* --- unification, subsumption, generalization and copies, through handles -------------------------- */
+
+void test_structure_operations(void)
+{
+    bool ok;
+    Front *f = load1(with_kinds(
+        "#Tool: { size: %length, mass: %mass, grip: \"soft\" | \"hard\", label: text }\n"
+        "#Wrench: #Tool & { jaw: %length, head: #Tool & { size: .size } }\n"
+        "#Hammer: #Tool & { face: %length }\n"
+        "small: #Tool & { size: <=20mm }\n"
+        "w19: #Wrench & { size: 19mm, mass: 350g }\n"
+        "w24: #Wrench & { size: 24mm, mass: 500g, grip: \"hard\" }\n"
+        "soft: #Tool & { grip: \"soft\", label: \"comfort\" }\n"
+        "club: #Hammer & { face: 40mm }\n"), &ok);
+    CHECK(ok);
+    if (!ok) { qf_free(f); return; }
+    QfOp *op = qf_op_new(f);
+    QfStore *out = qf_store_new();
+    QfFailure fail;
+    const QfNode *small = inst(f, "small"), *w19 = inst(f, "w19"), *w24 = inst(f, "w24"), *soft = inst(f, "soft"),
+                 *club = inst(f, "club");
+
+    /* the result has the more specific type and the narrower values */
+    const QfNode *r = qf_unify(op, small, w19, out, &fail);
+    CHECK(r != NULL);
+    const char *both = "#Wrench & { grip: (\"hard\" | \"soft\"), head: #Tool & { grip: (\"hard\" | \"soft\"), label: text, "
+                       "mass: %mass, size: $1 & %length & 0.019 }, jaw: %length, label: text, mass: %mass & 0.35, size: $1 }";
+    STR_EQ(node_text(f, r), both);
+    /* the operands do not change */
+    STR_EQ(node_text(f, small), "#Tool & { grip: (\"hard\" | \"soft\"), label: text, mass: %mass, size: %length & <=0.02 }");
+    const QfNode *r2 = qf_unify(op, w19, small, out, &fail);
+    STR_EQ(node_text(f, r2), both);
+    /* an unchanged operand is shared with the result, not copied */
+    const QfNode *r3 = qf_unify(op, w19, w19, out, &fail);
+    CHECK(r3 == w19);
+    const QfNode *r4 = qf_unify(op, r, soft, out, &fail);
+    CHECK(r4 != NULL);
+    STR_EQ(node_text(f, at(f, r4, "grip")), "\"soft\"");
+    STR_EQ(node_text(f, at(f, r4, "label")), "\"comfort\"");
+    CHECK(at(f, r4, "size") == at(f, r4, "head.size"));
+
+    /* a failure says where, and what met */
+    CHECK(qf_unify(op, small, w24, out, &fail) == NULL);
+    STR_EQ(fail.path, "size");
+    STR_EQ(fail.left, "%length & 0.024");
+    STR_EQ(fail.right, "%length & <=0.02");
+    STR_EQ(fail.why, "");
+    CHECK(qf_unify(op, w19, club, out, &fail) == NULL);
+    STR_EQ(fail.path, "(root)");
+    STR_EQ(fail.left, "#Wrench");
+    STR_EQ(fail.right, "#Hammer");
+    CHECK(qf_unify(op, w24, soft, out, &fail) == NULL);
+    STR_EQ(fail.path, "grip");
+    /* a failure leaves nothing behind: the next operation is not affected */
+    CHECK(qf_unify(op, small, w19, out, NULL) != NULL);
+
+    /* subsumption: the general one is forward */
+    bool fwd, bwd;
+    qf_subsumes(op, small, r, &fwd, &bwd);
+    CHECK(fwd && !bwd);
+    qf_subsumes(op, r, small, &fwd, &bwd);
+    CHECK(!fwd && bwd);
+    qf_subsumes(op, w19, w19, &fwd, &bwd);
+    CHECK(fwd && bwd);
+    qf_subsumes(op, w19, w24, &fwd, &bwd);
+    CHECK(!fwd && !bwd);
+    qf_subsumes(op, small, w24, &fwd, &bwd);
+    CHECK(!fwd && !bwd);                                         /* 24 mm is not <= 20 mm */
+    qf_subsumes(op, soft, r4, &fwd, &bwd);
+    CHECK(fwd && !bwd);
+    /* sharing counts: a structure with two equal lengths does not subsume... it does, but not the reverse */
+    const QfNode *tool = qf_type_node(f, type_lookup(f, qf_sym(f, "#Tool"))),
+                 *wrench = qf_type_node(f, type_lookup(f, qf_sym(f, "#Wrench")));
+    qf_subsumes(op, tool, wrench, &fwd, &bwd);
+    CHECK(fwd && !bwd);
+
+    /* generalization: the most specific structure that subsumes both */
+    const QfNode *g = qf_generalize(op, w19, w24, out);
+    /* both operands share size with head.size, so the result shares them too */
+    STR_EQ(node_text(f, g), "#Wrench & { grip: (\"hard\" | \"soft\"), head: #Tool & { grip: (\"hard\" | \"soft\"), label: text, "
+                            "mass: %mass, size: $1 & %length & >=0.019 & <=0.024 }, jaw: %length, label: text, "
+                            "mass: %mass & >=0.35 & <=0.5, size: $1 }");
+    qf_subsumes(op, g, w19, &fwd, &bwd);
+    CHECK(fwd);
+    qf_subsumes(op, g, w24, &fwd, &bwd);
+    CHECK(fwd);
+    const QfNode *g2 = qf_generalize(op, w19, club, out);
+    STR_EQ(node_text(f, g2), "#Tool & { grip: (\"hard\" | \"soft\"), label: text, mass: %mass, size: %length }");
+
+    /* a copy shares nothing with its source, and it is equal to it */
+    QfStore *other = qf_store_new(), *tmp = qf_store_new();
+    const QfNode *src = qf_unify(op, r, soft, tmp, &fail);
+    const QfNode *cp = qf_copy(op, src, other);
+    CHECK(cp != src && cp->store == other && at(f, cp, "size") != at(f, src, "size"));
+    CHECK(at(f, cp, "size") == at(f, cp, "head.size"));
+    qf_subsumes(op, cp, src, &fwd, &bwd);
+    CHECK(fwd && bwd);
+    char *before = strdup(node_text(f, src));
+    qf_store_free(tmp);                                          /* the copy does not need the store of its source */
+    STR_EQ(node_text(f, cp), before);
+    free(before);
+
+    /* a structure from handles: no text is parsed */
+    uint32_t ttool = type_lookup(f, qf_sym(f, "#Tool")), tlen = type_lookup(f, qf_sym(f, "%length")),
+             tmass = type_lookup(f, qf_sym(f, "%mass"));
+    uint32_t fsize = feat_lookup(f, qf_sym(f, "size")), fmass = feat_lookup(f, qf_sym(f, "mass")),
+             flabel = feat_lookup(f, qf_sym(f, "label")), fhead = feat_lookup(f, qf_sym(f, "head"));
+    QInterval q19 = { 190, 190 }, heavy = { 1000, Q_INF };
+    QfNode *size = qf_build_quantity(op, out, tlen, q19);
+    uint32_t feats[3] = { fsize, fmass, flabel };
+    QfNode *vals[3] = { size, qf_build_quantity(op, out, tmass, heavy), qf_build_text(op, out, "from \"cells\"") };
+    QfNode *built = qf_build_struct(op, out, ttool, feats, vals, 3);
+    CHECK(size && vals[1] && vals[2] && built);
+    STR_EQ(node_text(f, built), "#Tool & { label: \"from \\\"cells\\\"\", mass: %mass & >=1, size: %length & 0.019 }");
+    /* unified with its type, it has the constraint of the type */
+    const QfNode *full = qf_unify(op, built, tool, out, &fail);
+    STR_EQ(node_text(f, full), "#Tool & { grip: (\"hard\" | \"soft\"), label: \"from \\\"cells\\\"\", mass: %mass & >=1, size: %length & 0.019 }");
+    CHECK(qf_unify(op, built, w19, out, &fail) == NULL);          /* 350 g is not >= 1 kg */
+    STR_EQ(fail.path, "mass");
+    /* a shared node: the same value at two features */
+    uint32_t f2[2] = { fsize, fhead };
+    uint32_t fh[1] = { fsize };
+    QfNode *hv[1] = { size };
+    QfNode *head = qf_build_struct(op, out, type_lookup(f, qf_sym(f, "#Wrench")), fh, hv, 1);
+    QfNode *v2[2] = { size, head };
+    QfNode *shared = qf_build_struct(op, out, type_lookup(f, qf_sym(f, "#Wrench")), f2, v2, 2);
+    STR_EQ(node_text(f, shared), "#Wrench & { head: #Wrench & { size: $1 & %length & 0.019 }, size: $1 }");
+    CHECK(qf_unify(op, shared, w19, out, &fail) != NULL);
+    CHECK(qf_unify(op, shared, w24, out, &fail) == NULL);
+    uint32_t dup[2] = { fsize, fsize };
+    CHECK(qf_build_struct(op, out, ttool, dup, v2, 2) == NULL);
+    CHECK(qf_build_struct(op, out, tlen, feats, vals, 3) == NULL);
+    CHECK(qf_build_quantity(op, out, ttool, q19) == NULL);
+    QInterval emptyq = { 5, 4 };
+    CHECK(qf_build_quantity(op, out, tlen, emptyq) == NULL);
+
+    /* the quick check: types at a few paths. It never rejects a unification that succeeds. */
+    uint32_t pgrip[1] = { feat_lookup(f, qf_sym(f, "grip")) }, psize[2] = { fhead, fsize };
+    const uint32_t *paths[3] = { pgrip, psize, NULL };
+    size_t lens[3] = { 1, 2, 0 };
+    QfQuickCheck *qc = qf_qc_new(f, paths, lens, 3);
+    CHECK(qf_qc_size(qc) == 3);                                   /* the root and two paths */
+    uint32_t fg[1] = { pgrip[0] };
+    QfNode *gv[1] = { qf_build_text(op, out, "soft") };
+    QfNode *textgrip = qf_build_struct(op, out, ttool, fg, gv, 1);
+    CHECK(textgrip && qf_unify(op, textgrip, soft, out, NULL) != NULL);     /* the atom's name as text */
+    CHECK(qf_unify(op, textgrip, w24, out, NULL) == NULL);                  /* "soft" is not "hard" */
+    CHECK(op->scratch.n == 0);                                              /* the scratch nodes are given back */
+    const QfNode *all[] = { small, w19, w24, soft, club, r, r4, g, built, shared, textgrip };
+    uint32_t va[3], vb[3];
+    int rejected = 0;
+    for (size_t i = 0; i < sizeof all / sizeof *all; i++)
+        for (size_t j = 0; j < sizeof all / sizeof *all; j++) {
+            qf_qc_vector(qc, all[i], va);
+            qf_qc_vector(qc, all[j], vb);
+            bool compat = qf_qc_compatible(qc, va, vb), unifies = qf_unify(op, all[i], all[j], out, NULL) != NULL;
+            CHECK(compat || !unifies);
+            rejected += !compat;
+        }
+    CHECK(rejected > 0);
+    qf_qc_vector(qc, w24, va);
+    qf_qc_vector(qc, soft, vb);
+    CHECK(!qf_qc_compatible(qc, va, vb));                         /* "hard" and "soft" */
+    qf_qc_vector(qc, w19, va);
+    qf_qc_vector(qc, club, vb);
+    CHECK(!qf_qc_compatible(qc, va, vb));                         /* the roots */
+    qf_qc_free(qc);
+
+    qf_store_free(other);
+    qf_store_free(out);
+    qf_op_free(op);
+    qf_free(f);
+}
+
+/* --- two contexts work on one content at the same time (ADR 0015 section 7) ------------------------ */
+
+typedef struct { Front *f; const QfNode **nodes; size_t n; uint64_t sum; int rounds; } Worker;
+
+static uint64_t text_hash(const char *s) { return qf_fnv1a(0xcbf29ce484222325ULL, s, strlen(s)); }
+
+/* Unifies and generalizes every pair, and sums the hashes of the results. */
+static void *work(void *arg)
+{
+    Worker *w = arg;
+    QfOp *op = qf_op_new(w->f);
+    uint64_t sum = 0;
+    for (int round = 0; round < w->rounds; round++) {
+        QfStore *out = qf_store_new();
+        for (size_t i = 0; i < w->n; i++)
+            for (size_t j = 0; j < w->n; j++) {
+                Buf b = { 0 };
+                qf_buf_puts(&b, "");
+                const QfNode *r = qf_unify(op, w->nodes[i], w->nodes[j], out, NULL);
+                if (r) qf_node_print(w->f, &b, r);
+                qf_buf_putc(&b, '|');
+                qf_node_print(w->f, &b, qf_generalize(op, w->nodes[i], w->nodes[j], out));
+                bool fwd, bwd;
+                qf_subsumes(op, w->nodes[i], w->nodes[j], &fwd, &bwd);
+                qf_buf_printf(&b, "|%d%d", fwd, bwd);
+                sum += text_hash(b.s) * (uint64_t) (i * w->n + j + 1);
+                qf_buf_free(&b);
+            }
+        qf_store_free(out);
+    }
+    qf_op_free(op);
+    w->sum = sum;
+    return NULL;
+}
+
+void test_two_contexts(void)
+{
+    Front *f = load_fixture();
+    if (!f) return;
+    const QfNode *nodes[32];
+    size_t n = 0;
+    for (size_t i = 0; i < f->insts.n && n < 16; i++) nodes[n++] = f->insts.v[i].node;
+    for (uint32_t t = 0; t < f->types.n && n < 32; t++)
+        if (f->types.v[t].kind == TK_DEF && f->types.v[t].expansion) nodes[n++] = f->types.v[t].expansion;
+    CHECK(n > 20);
+    Worker alone = { f, nodes, n, 0, 3 };
+    work(&alone);
+    CHECK(alone.sum != 0);
+    /* two contexts in turn */
+    QfOp *a = qf_op_new(f), *b = qf_op_new(f);
+    QfStore *sa = qf_store_new(), *sb = qf_store_new();
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = 0; j < n; j++) {
+            const QfNode *ra = qf_unify(a, nodes[i], nodes[j], sa, NULL), *rb = qf_unify(b, nodes[j], nodes[i], sb, NULL);
+            CHECK((ra == NULL) == (rb == NULL));
+            if (ra && rb) {
+                char *ta = strdup(node_text(f, ra));
+                bool fwd, bwd;
+                qf_subsumes(a, ra, rb, &fwd, &bwd);
+                CHECK(fwd && bwd);                               /* a & b and b & a are equal */
+                /* a result of one context is an operand in the other */
+                const QfNode *again = qf_unify(b, ra, nodes[i], sb, NULL);
+                CHECK(again != NULL);
+                if (again) STR_EQ(node_text(f, again), ta);
+                free(ta);
+            }
+        }
+    qf_store_free(sa);
+    qf_store_free(sb);
+    qf_op_free(a);
+    qf_op_free(b);
+    /* four threads, each with its own context, on the one content */
+    enum { NT = 4 };
+    pthread_t th[NT];
+    Worker ws[NT];
+    for (int i = 0; i < NT; i++) {
+        ws[i] = (Worker) { f, nodes, n, 0, 3 };
+        CHECK(pthread_create(&th[i], NULL, work, &ws[i]) == 0);
+    }
+    for (int i = 0; i < NT; i++) {
+        pthread_join(th[i], NULL);
+        CHECK(ws[i].sum == alone.sum);
+    }
+    qf_free(f);
+}
+
+/* --- properties ------------------------------------------------------------------------------------- */
+
+/* Unification is commutative and idempotent, its result is below both
+ * operands, and a generalization is above both. */
+void test_prop_unification(void)
+{
+    Front *f = load_fixture();
+    if (!f) return;
+    const QfNode *nodes[64];
+    size_t n = 0;
+    for (size_t i = 0; i < f->insts.n && n < 32; i++) nodes[n++] = f->insts.v[i].node;
+    for (uint32_t t = 0; t < f->types.n && n < 64; t++)
+        if ((f->types.v[t].kind == TK_DEF || f->types.v[t].kind == TK_GLB) && f->types.v[t].expansion)
+            nodes[n++] = f->types.v[t].expansion;
+    QfOp *op = qf_op_new(f);
+    QfStore *out = qf_store_new();
+    uint64_t rng = 15;
+    int unified = 0;
+    for (int k = 0; k < 600; k++) {
+        const QfNode *a = nodes[t_range(&rng, 0, (int64_t) n - 1)], *b = nodes[t_range(&rng, 0, (int64_t) n - 1)];
+        const QfNode *ab = qf_unify(op, a, b, out, NULL), *ba = qf_unify(op, b, a, out, NULL);
+        CHECK((ab == NULL) == (ba == NULL));
+        bool fwd, bwd;
+        if (ab && ba) {
+            unified++;
+            qf_subsumes(op, ab, ba, &fwd, &bwd);
+            CHECK(fwd && bwd);
+            qf_subsumes(op, a, ab, &fwd, &bwd);
+            CHECK(fwd);
+            qf_subsumes(op, b, ab, &fwd, &bwd);
+            CHECK(fwd);
+            const QfNode *again = qf_unify(op, ab, a, out, NULL);
+            CHECK(again != NULL);
+            if (again) {
+                qf_subsumes(op, ab, again, &fwd, &bwd);
+                CHECK(fwd && bwd);
+            }
+        }
+        const QfNode *g = qf_generalize(op, a, b, out);
+        qf_subsumes(op, g, a, &fwd, &bwd);
+        CHECK(fwd);
+        qf_subsumes(op, g, b, &fwd, &bwd);
+        CHECK(fwd);
+        const QfNode *aa = qf_unify(op, a, a, out, NULL);
+        CHECK(aa == a);
+    }
+    CHECK(unified > 30);
+    qf_store_free(out);
+    qf_op_free(op);
+    qf_free(f);
+}
+
+/* The declarations of a source in another order, as new source text. */
+static char *shuffled_source(const char *name, const char *src, uint64_t *rng)
+{
+    Front *f = qf_new();
+    DeclVec d = { 0 };
+    bool ok = qf_parse(f, name, src, &d);
+    CHECK(ok);
+    Buf b = { 0 };
+    qf_buf_puts(&b, "");
+    if (ok && d.n) {
+        if (d.v[0].pkg) qf_buf_printf(&b, "package %s\n", d.v[0].pkg);
+        for (size_t i = d.n - 1; i > 0; i--) {
+            size_t j = (size_t) t_range(rng, 0, (int64_t) i);
+            Decl tmp = d.v[i]; d.v[i] = d.v[j]; d.v[j] = tmp;
+        }
+        for (size_t i = 0; i < d.n; i++) {
+            Decl one = d.v[i];
+            one.pkg = NULL;                      /* the package line is written once, first */
+            qf_print_decls(&b, &one, 1);
+        }
+    }
+    VEC_FREE(d);
+    qf_free(f);
+    return b.s;
+}
+
+/* The result of a load does not depend on the order of the files or on the
+ * order of the declarations in a file (ADR 0015 section 9). */
+void test_prop_load_order(void)
+{
+    char *src[NFIX];
+    if (!fixture_sources(src)) return;
+    Front *base = qf_new();
+    CHECK(qf_load(base, fixture_files, (const char *const *) src, NFIX));
+    Buf want = { 0 };
+    qf_dump(base, &want);
+    uint64_t hash = base->hash;
+    CHECK(hash == qf_fnv1a(0xcbf29ce484222325ULL, want.s, want.len));
+    size_t ntypes = base->types.n, nfeats = base->feats.n;
+    qf_free(base);
+
+    uint64_t rng = 2026;
+    for (int round = 0; round < 40; round++) {
+        const char *names[NFIX];
+        char *text[NFIX];
+        int order[NFIX];
+        for (int i = 0; i < NFIX; i++) order[i] = i;
+        for (int i = NFIX - 1; i > 0; i--) {
+            int j = (int) t_range(&rng, 0, i), tmp = order[i];
+            order[i] = order[j];
+            order[j] = tmp;
+        }
+        for (int i = 0; i < NFIX; i++) {
+            names[i] = fixture_files[order[i]];
+            text[i] = shuffled_source(names[i], src[order[i]], &rng);
+        }
+        Front *f = qf_new();
+        bool ok = qf_load(f, names, (const char *const *) text, NFIX);
+        CHECK(ok);
+        if (ok) {
+            Buf got = { 0 };
+            qf_dump(f, &got);
+            CHECK(f->hash == hash && f->types.n == ntypes && f->feats.n == nfeats);
+            CHECK(!strcmp(got.s, want.s));
+            if (strcmp(got.s, want.s) && t_failures < 3) {
+                const char *g = got.s, *w = want.s;
+                while (*g && *g == *w) { g++; w++; }
+                fprintf(stderr, "  round %d: the dumps differ at\n  got    %.200s\n  wanted %.200s\n", round, g, w);
+            }
+            qf_buf_free(&got);
+        } else {
+            for (size_t i = 0; i < f->diags.n && i < 3; i++) fprintf(stderr, "  %s\n", f->diags.v[i].msg);
+        }
+        qf_free(f);
+        for (int i = 0; i < NFIX; i++) free(text[i]);
+    }
+    qf_buf_free(&want);
+
+    /* a content with an error fails in every order, with the same messages apart from the places */
+    const char *bad[3] = { "#A: { x: \"p\" | \"q\", y: _ }\n", "a: #A & { x: \"r\" }\nb: #A & { y: nope }\n", "c: #A & { x: \"p\" }\n" };
+    for (int round = 0; round < 6; round++) {
+        static const int perms[6][3] = { { 0, 1, 2 }, { 0, 2, 1 }, { 1, 0, 2 }, { 1, 2, 0 }, { 2, 0, 1 }, { 2, 1, 0 } };
+        const char *names[3] = { "x.quad", "y.quad", "z.quad" }, *text[3];
+        for (int i = 0; i < 3; i++) text[i] = bad[perms[round][i]];
+        Front *f = qf_new();
+        CHECK(!qf_load(f, names, text, 3));
+        CHECK(f->nerrors == 2 && f->diags.n == 2);
+        int conflict = 0, unknown = 0;
+        for (size_t i = 0; i < f->diags.n; i++) {
+            conflict += strstr(f->diags.v[i].msg, "struct: conflict at x: \"p\" | \"q\" vs \"r\"") != NULL;
+            unknown += strstr(f->diags.v[i].msg, "unknown name nope") != NULL;
+        }
+        CHECK(conflict == 1 && unknown == 1);
+        qf_free(f);
+    }
+    for (int i = 0; i < NFIX; i++) free(src[i]);
+}

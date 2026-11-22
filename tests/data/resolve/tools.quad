@@ -1,0 +1,12 @@
+package tools
+
+%length: { dimension: "m" }
+
+// A struct states its type: the head is a #Head, and its width is the size.
+#Head: { width: %length }
+#Wrench: shop.#Tool & { size: %length, head: #Head & { width: .size } }
+#Kit: { items: [...shop.#Physical], owner: text }
+
+w19: #Wrench & { size: 19mm, mass: 350g, grip: "soft" }
+kit: #Kit & { items: [w19, shop.hammer], owner: "Urist" }
+kit: { items: [#Wrench & { size: 19mm }, _] }
