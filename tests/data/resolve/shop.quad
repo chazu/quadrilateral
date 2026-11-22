@@ -1,0 +1,15 @@
+package shop
+
+%coin: { base: "coin", scale: -2 }
+%mass: { dimension: "kg" }
+
+let heavy = 5kg
+
+#Physical: { mass: %mass }
+#Priced:   { price: %coin, per: %coin / %mass }
+#Tool:     #Physical & { grip: "soft" | "hard" }
+#Material: "steel" | "wood" | "brass"
+#Made:     { of: #Material }
+
+hammer: #Tool & #Priced & #Made & { mass: 0.5kg, price: 12.5coin, of: "steel", grip: "hard" }
+anvil:  #Physical & #Made & { mass: >=heavy, of: "steel" }

@@ -11,10 +11,11 @@
  * Borrowed from Triangle's parse.c (bruggadung f425574), under ADR 0003.
  * Changes from Triangle: a number keeps its unit as text, the unit can be
  * compound (1000J/K), and a number can have an exponent (1e-5); an attribute can have any name; the parser does not
- * check function names or regular expressions; ref(n) and @embed are gone. */
+ * check function names or regular expressions; ref(n) and @embed are gone;
+ * a kind has the prefix % (ADR 0015). */
 
 typedef enum {
-    T_EOF, T_IDENT, T_DEF, T_STRING, T_NUMBER, T_TAG, T_ATTR,
+    T_EOF, T_IDENT, T_DEF, T_KIND, T_STRING, T_NUMBER, T_TAG, T_ATTR,
     T_COLON, T_COMMA, T_LBRACE, T_RBRACE, T_LBRACK, T_RBRACK, T_LPAREN, T_RPAREN,
     T_AND, T_OR, T_STAR, T_GE, T_LE, T_GT, T_LT, T_ELLIPSIS, T_PLUS, T_MINUS, T_SLASH,
     T_MATCH, T_NMATCH, T_REF, T_ASSIGN,
@@ -147,7 +148,7 @@ static void perr(Parser *p, Loc loc, const char *text)
 
 static bool operand_end(TokKind k)
 {
-    return k == T_NUMBER || k == T_IDENT || k == T_DEF || k == T_TAG || k == T_STRING || k == T_RPAREN ||
+    return k == T_NUMBER || k == T_IDENT || k == T_DEF || k == T_KIND || k == T_TAG || k == T_STRING || k == T_RPAREN ||
            k == T_RBRACE || k == T_RBRACK || k == T_REF;
 }
 
@@ -274,10 +275,10 @@ static bool lex_at(Parser *p, const char *src, int line, int col)
             t.k = ch == '#' ? T_DEF : T_IDENT;
             ADV();
             while (isalnum((unsigned char) *s) || *s == '_') ADV();
-            /* a qualified name, one package deep: pkg.#Type, pkg.blueprint */
-            if (ch != '#' && *s == '.' && s[1] == '#') {
+            /* a qualified name, one package deep: pkg.#Type, pkg.%kind, pkg.blueprint */
+            if (ch != '#' && *s == '.' && (s[1] == '#' || s[1] == '%')) {
                 ADV();
-                t.k = T_DEF;
+                t.k = *s == '#' ? T_DEF : T_KIND;
                 ADV();
                 if (!name_start(*s)) {
                     perr(p, t.loc, "expected a name after the package");
@@ -285,8 +286,14 @@ static bool lex_at(Parser *p, const char *src, int line, int col)
                 }
                 while (isalnum((unsigned char) *s) || *s == '_') ADV();
             }
-            /* then a path into it: wrench_19.size, tools.wrench_250.head.size, steps[0] */
-            for (size_t n = path_segments(s); n; n--) ADV();
+            /* then a path into it: wrench_19.size, tools.wrench_250.head.size, steps[0].
+             * A kind has no fields, so no path follows it. */
+            if (t.k != T_KIND) for (size_t n = path_segments(s); n; n--) ADV();
+        } else if (ch == '%' && name_start(s[1])) {
+            /* a kind (ADR 0015): %energy */
+            t.k = T_KIND;
+            ADV();
+            while (isalnum((unsigned char) *s) || *s == '_') ADV();
         } else if (ch == '.' && name_start(s[1])) {
             /* a reference: a path from the root of the declaration it is in */
             t.k = T_REF;
@@ -1406,7 +1413,7 @@ static X *parse_primary(Parser *p)
         x->u.name = tok_sym(p, t);
         return x;
     }
-    case T_DEF: {
+    case T_DEF: case T_KIND: {
         next(p);
         X *x = xnew(p, X_NAME, t->loc);
         x->u.name = tok_sym(p, t);
@@ -1628,13 +1635,14 @@ bool qf_parse(Front *c, const char *file_name, const char *src, DeclVec *out)
         }
         /* another package's type, pkg.#Type, may be added to; anything else
          * qualified is declared in its own package's files */
-        if ((lab->k == T_IDENT || lab->k == T_DEF) && qualified(lab) && !package_type(lab)) {
+        if ((lab->k == T_IDENT || lab->k == T_DEF || lab->k == T_KIND) && qualified(lab) && !package_type(lab)) {
             perr(&p, lab->loc, "a declaration's name is its own: declare it in its package's files, unqualified");
             break;
         }
         Decl d = { 0 };
         d.pkg = pkg;
         if (lab->k == T_DEF) d.kind = L_DEF;
+        else if (lab->k == T_KIND) d.kind = L_KIND;
         else if (lab->k == T_STRING && lab->ninterp) { perr(&p, lab->loc, "a declaration's label can't be interpolated"); break; }
         else if (lab->k == T_STRING) d.kind = L_ATOM;
         else if (lab->k == T_IDENT) d.kind = L_INST;

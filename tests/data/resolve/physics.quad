@@ -1,0 +1,35 @@
+// The kinds and the types of a small thermal world (ADR 0011 section 2).
+%energy:      { dimension: "J", scale: -3, conserved: true }
+%temperature: { dimension: "K", scale: -6 }
+%capacity:    { dimension: "J/K", scale: -3 }
+%conductance: { dimension: "W/K", scale: -3 }
+
+#Port: {}
+
+// A type introduces each feature once. The port and the room share these
+// three fields, so one supertype declares them.
+#Thermal: {
+    temperature: %temperature
+    capacity:    %capacity
+    energy:      %energy
+}
+
+#ThermalPort: #Port & #Thermal
+
+#Phenomenon: { laws: [...constraint] }
+
+// A room with one temperature.
+#LumpedRoom: #Phenomenon & #Thermal & {
+    energy: >=0J
+    laws: [ .energy == .capacity * .temperature ]
+    west: #ThermalPort & { temperature: .temperature, capacity: .capacity, energy: .energy }
+    door: "open" | "closed"
+}
+
+#Wall: #Phenomenon & {
+    hot:  #ThermalPort
+    cold: #ThermalPort
+    conductance: %conductance
+    power: %energy / %time
+    laws: [ .power == .conductance * (.hot.temperature - .cold.temperature) ]
+}

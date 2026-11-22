@@ -12,7 +12,7 @@ ADR 0011 section 1 decided that Quadrilateral source is a CUE-like language borr
 
 The grammar is the grammar of Triangle's `docs/REFERENCE.md` at `f425574`:
 
-- Declarations of types (`#Name`), atoms (`"name"`), and instances, with an optional `package` line.
+- Declarations of types (`#Name`), atoms (`"name"`), kinds (`%name`, ADR 0015), and instances, with an optional `package` line. The character `%` has no other use.
 - Structs, lists, unification (`&`), disjunction (`|`), defaults (`*`), bounds, tags (`$t`), and references (`.a.b`).
 - `let` and hidden fields (`_name`), comprehensions (`for`, `if`), and computed labels.
 - Arithmetic, comparisons, and logic.

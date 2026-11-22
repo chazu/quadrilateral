@@ -1,0 +1,14 @@
+roomA: #LumpedRoom & { energy: 293150J, capacity: 1000J/K, door: "open" }
+roomA: { temperature: 293.15K }
+roomB: #LumpedRoom & { capacity: 2000J/K, temperature: >=273.15K & <=373.15K }
+wall: #Wall & { conductance: 20W/K, hot: roomA.west, cold: roomB.west }
+
+// A recursive type: its constraint names the type.
+#Chain: { next: #Chain, label: text }
+chain: #Chain & { label: "a", next: { label: "b", next: { label: "c" } } }
+
+// A disjunction of structures in a type.
+#Circle: { radius: tools.%length }
+#Square: { side: tools.%length }
+#Shaped: { form: #Circle | #Square }
+round: #Shaped & { form: #Circle & { radius: 2m } }

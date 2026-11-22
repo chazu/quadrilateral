@@ -297,6 +297,55 @@ void test_parse_numbers(void)
     TEXT("[for x in xs if x > 3 for y in ys { x }]", "[for x in xs if (x > 3) for y in ys { x }]");
 }
 
+/* --- kinds (ADR 0015) ------------------------------------------------------------------------ */
+
+void test_parse_kinds(void)
+{
+    Front *f = qf_new();
+    DeclVec d = { 0 };
+    const char *src =
+        "// The stock of a room.\n"
+        "%energy: { dimension: \"J\", scale: -3, conserved: true }\n"
+        "%coin: { base: \"coin\" }\n"
+        "#Room: { energy: %energy, capacity: %capacity & 1000J/K, rate: %energy / %time, pay: money.%coin * 2 }\n";
+    CHECK(qf_parse(f, "t.quad", src, &d));
+    CHECK(d.n == 3);
+    if (d.n == 3) {
+        CHECK(d.v[0].kind == L_KIND && !strcmp(d.v[0].label, "%energy") && d.v[0].value->k == X_STRUCT);
+        CHECK(d.v[0].doc && !strcmp(d.v[0].doc, "The stock of a room."));
+        CHECK(d.v[1].kind == L_KIND && !strcmp(d.v[1].label, "%coin"));
+        CHECK(d.v[2].kind == L_DEF);
+        const XField *e = find_field(d.v[2].value, "energy");
+        CHECK(e && e->value->k == X_NAME && !strcmp(e->value->u.name, "%energy"));
+        const XField *r = find_field(d.v[2].value, "rate");
+        CHECK(r && r->value->k == X_ARITH && r->value->u.ar.op == '/' && r->value->u.ar.a->k == X_NAME &&
+              !strcmp(r->value->u.ar.b->u.name, "%time"));
+        const XField *p = find_field(d.v[2].value, "pay");
+        CHECK(p && p->value->k == X_ARITH && !strcmp(p->value->u.ar.a->u.name, "money.%coin"));
+        Buf b = { 0 };
+        qf_print_decls(&b, d.v, d.n);
+        CHECK(!strcmp(b.s,
+            "// The stock of a room.\n"
+            "%energy: { dimension: \"J\", scale: -3, conserved: true }\n"
+            "%coin: { base: \"coin\" }\n"
+            "#Room: { energy: %energy, capacity: %capacity & 1000J/K, rate: %energy / %time, pay: money.%coin * 2 }\n"));
+        qf_buf_free(&b);
+    }
+    VEC_FREE(d);
+    qf_free(f);
+
+    TEXT("%energy & >=0J", "%energy & >=0J");
+    TEXT("%a -1", "%a - 1");
+    TEXT("[%a, *%b | %c]", "[%a, *%b | %c]");
+    /* % has no other use: no modulo operator, no percent literal, no path into a kind */
+    TEXT("5 % 2", "t.quad:1:3: error: unexpected character '%'");
+    TEXT("50%", "t.quad:1:3: error: unexpected character '%'");
+    TEXT("%energy.scale", "t.quad:1:8: error: unexpected input after expression");
+    TEXT("%1", "t.quad:1:1: error: unexpected character '%'");
+    FILE_ERROR("money.%coin: { base: \"coin\" }\n",
+               "t.quad:1:1: error: a declaration's name is its own: declare it in its package's files, unqualified");
+}
+
 /* --- expressions and their text form -------------------------------------------------------- */
 
 void test_parse_expressions(void)
@@ -597,7 +646,7 @@ void test_parse_adr_sketch(void)
 
 static void random_expr(uint64_t *rng, Buf *b, int depth)
 {
-    static const char *const leaves[] = { "a", "#T", "\"s\"", "12", "3.5kg", "20W/K", "5.67e-8W/m^2", "2e30kg", "$t", ".p.q", "_", "true",
+    static const char *const leaves[] = { "a", "#T", "\"s\"", "12", "3.5kg", "20W/K", "5.67e-8W/m^2", "2e30kg", "%energy", "pkg.%coin", "$t", ".p.q", "_", "true",
                                           ">=1mm", "<x", "=~\"r\"", "pkg.#U", "b.c[1]" };
     static const char *const ops[] = { " & ", " | ", " + ", " - ", " * ", " / ", " == ", " < ", " && ", " || " };
     int pick = depth <= 0 ? 0 : (int) t_range(rng, 0, 9);
