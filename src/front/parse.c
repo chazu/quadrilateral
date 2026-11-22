@@ -9,8 +9,8 @@
  * ADR 0014).
  *
  * Borrowed from Triangle's parse.c (bruggadung f425574), under ADR 0003.
- * Changes from Triangle: a number keeps its unit as text, and the unit can
- * be compound (1000J/K); an attribute can have any name; the parser does not
+ * Changes from Triangle: a number keeps its unit as text, the unit can be
+ * compound (1000J/K), and a number can have an exponent (1e-5); an attribute can have any name; the parser does not
  * check function names or regular expressions; ref(n) and @embed are gone. */
 
 typedef enum {
@@ -67,10 +67,80 @@ struct Parser {
     VEC(CompVar *) vars;                                 /* comprehension variables in scope, innermost last */
 };
 
-static void perr(Parser *p, Loc loc, const char *msg)
+/* The length of the exponent at s (e-8, E+3, e27), or 0. */
+static size_t exp_len(const char *s)
 {
-    if (!p->error) qf_diag(p->c, true, loc, "%s", msg);
+    if (*s != 'e' && *s != 'E') return 0;
+    size_t n = s[1] == '+' || s[1] == '-' ? 2 : 1;
+    if (!isdigit((unsigned char) s[n])) return 0;
+    while (isdigit((unsigned char) s[n])) n++;
+    return n;
+}
+
+/* The length of the unit at s, or 0 (ADR 0014). A unit is terms joined by
+ * '*' or '/'. A term is a symbol, then an optional exponent (^2, ^-1). A '*'
+ * or a '/' continues the unit only when a letter follows it at once, so
+ * 10mm*2 and 10m / x are arithmetic. *bad: a '^' has no digits. */
+static size_t unit_len(const char *s, bool *bad)
+{
+    const char *s0 = s;
+    *bad = false;
+    for (bool more = isalpha((unsigned char) *s); more;) {
+        while (isalnum((unsigned char) *s) || *s == '_') s++;
+        if (*s == '^') {
+            s++;
+            if (*s == '-') s++;
+            if (!isdigit((unsigned char) *s)) { *bad = true; break; }
+            while (isdigit((unsigned char) *s)) s++;
+        }
+        more = (*s == '*' || *s == '/') && isalpha((unsigned char) s[1]);
+        if (more) s++;
+    }
+    return (size_t) (s - s0);
+}
+
+/* Where the unit of a number token starts: after the digits and the exponent. */
+static const char *unit_start(const Tok *t)
+{
+    const char *s = t->s, *end = t->s + t->len;
+    if (*s == '-') s++;
+    while (s < end && (isdigit((unsigned char) *s) || *s == '.')) s++;
+    return s < end ? s + exp_len(s) : s;
+}
+
+static bool comp_at(Parser *p, size_t i);
+
+/* An author who knows SI notation writes 20 W/K. The name then reads as a
+ * label, and the error is at the name or at the token after it. If a name
+ * follows a number that has no unit, on the same line, the hint shows the
+ * attached form. */
+static void spaced_unit_hint(Parser *p, Loc loc, Buf *msg)
+{
+    size_t i = 0;
+    while (i < p->toks.n && (p->toks.v[i].loc.line != loc.line || p->toks.v[i].loc.col != loc.col)) i++;
+    if (i == p->toks.n) return;
+    for (size_t j = i; j >= 1 && j + 1 >= i; j--) {
+        const Tok *name = &p->toks.v[j], *num = name - 1;
+        if (name->k != T_IDENT || num->k != T_NUMBER || name->loc.line != num->loc.line) continue;
+        if (unit_start(num) != num->s + num->len || comp_at(p, j)) continue;
+        bool bad;
+        int n = (int) unit_len(name->s, &bad);
+        if (!n) continue;
+        qf_buf_printf(msg, ". If '%.*s' is a unit, write it directly after the number: %.*s%.*s",
+                      n, name->s, (int) num->len, num->s, n, name->s);
+        return;
+    }
+}
+
+static void perr(Parser *p, Loc loc, const char *text)
+{
+    if (p->error) return;
     p->error = true;
+    Buf msg = { 0 };
+    qf_buf_puts(&msg, text);
+    spaced_unit_hint(p, loc, &msg);
+    qf_diag(p->c, true, loc, "%s", msg.s);
+    qf_buf_free(&msg);
 }
 
 /* --- lexer --------------------------------------------------------------------- */
@@ -241,23 +311,26 @@ static bool lex_at(Parser *p, const char *src, int line, int col)
                 if (*s == '.' && s[1] == '.') break;
                 ADV();
             }
-            /* A unit follows the digits with no space (ADR 0014): 250mm,
-             * 1000J/K, 5kg*m^2/s^2. A term is a symbol, then an exponent
-             * (^2, ^-1). A '*' or a '/' continues the unit only when a
-             * letter follows, so 10mm*2 and 10m / x are arithmetic. */
-            for (bool more = isalpha((unsigned char) *s); more;) {
-                while (isalnum((unsigned char) *s) || *s == '_') ADV();
-                if (*s == '^') {
-                    ADV();
-                    if (*s == '-') ADV();
-                    if (!isdigit((unsigned char) *s)) {
-                        perr(p, t.loc, "expected digits after '^' in a unit");
-                        return false;
-                    }
-                    while (isdigit((unsigned char) *s)) ADV();
-                }
-                more = (*s == '*' || *s == '/') && isalpha((unsigned char) s[1]);
-                if (more) ADV();
+            for (size_t n = exp_len(s); n; n--) ADV();   /* 5.67e-8 */
+            /* A unit follows the number with no space (ADR 0014): 250mm,
+             * 1000J/K, 5kg*m^2/s^2. */
+            bool bad;
+            const char *unit = s;
+            size_t ulen = unit_len(s, &bad);
+            if (bad) {
+                perr(p, t.loc, "expected digits after '^' in a unit");
+                return false;
+            }
+            for (size_t n = ulen; n; n--) ADV();
+            /* In 10m/sqrt(4), 10m/v.size and 10m/xs[0], the operator joined
+             * a name to the unit. No valid source has this form. */
+            if ((memchr(unit, '/', ulen) || memchr(unit, '*', ulen)) &&
+                (*s == '(' || *s == '[' || (*s == '.' && name_start(s[1])))) {
+                char msg[256];
+                snprintf(msg, sizeof msg, "'%c' directly after the unit '%.*s'. To multiply or divide by a name, "
+                         "put spaces around the operator", *s, (int) (ulen < 80 ? ulen : 80), unit);
+                perr(p, t.loc, msg);
+                return false;
             }
         } else if (ch == '"' || (ch == '#' && raw_start(s))) {
             /* "..." with escapes, or #"..."# raw, as in CUE: with n #s, only
@@ -379,8 +452,9 @@ static bool lex_at(Parser *p, const char *src, int line, int col)
                 if (s[0] == '.' && s[1] == '.') { ADV(); ADV(); t.k = T_ELLIPSIS; break; }
                 /* fallthrough */
             default: {
-                char msg[64];
-                snprintf(msg, sizeof msg, "unexpected character '%c'", ch);
+                char msg[160];
+                snprintf(msg, sizeof msg, "unexpected character '%c'%s", ch, ch != '^' ? "" :
+                         ". A '^' is valid only in a unit, and a unit follows its number with no space: 5kg*m^2");
                 perr(p, t.loc, msg);
                 return false;
             }
@@ -1189,8 +1263,8 @@ fail:
     return NULL;
 }
 
-/* A number's digits and its unit: mant × 10^-frac. The parser keeps the
- * unit as text. The kind of the field converts the value later (ADR 0014). */
+/* A number's digits, its exponent and its unit: mant × 10^-frac. The parser
+ * keeps the unit as text. The kind of the field converts the value later (ADR 0014). */
 static bool number(Parser *p, Tok *t, XNum *out)
 {
     const char *s = t->s, *end = t->s + t->len, *err = NULL;
@@ -1210,6 +1284,20 @@ static bool number(Parser *p, Tok *t, XNum *out)
         if (point) frac++;
     }
     if (!err && point && !frac) err = "malformed number";
+    /* An exponent moves the decimal point, exactly: 1.5e-3 is 15 × 10^-4,
+     * and 1e5 is 1 × 10^5 (frac is -5). A later stage rejects a value that
+     * the kind of the field cannot hold. */
+    size_t elen = s < end ? exp_len(s) : 0;
+    if (!err && elen) {
+        const char *e = s + 1, *eend = s + elen;
+        bool eneg = *e == '-';
+        int exp = 0;
+        if (*e == '+' || *e == '-') e++;
+        for (; e < eend; e++) if (exp <= 9999) exp = exp * 10 + (*e - '0');
+        if (exp > 9999) err = "number out of range";
+        frac += eneg ? exp : -exp;
+        s = eend;
+    }
     if (err) {
         char msg[160];
         snprintf(msg, sizeof msg, "%s: %.*s", err, (int) t->len, t->s);

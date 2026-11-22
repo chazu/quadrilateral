@@ -23,14 +23,19 @@ static bool ref_conjunct(const X *x) { return x->k == X_STRUCT && x->u.st.refs; 
 
 static void print_num(Buf *b, const XNum *n)
 {
-    char digits[32];
     uint64_t mag = n->mant < 0 ? (uint64_t) -n->mant : (uint64_t) n->mant;
-    int len = snprintf(digits, sizeof digits, "%0*" PRIu64, n->frac + 1, mag);
     if (n->mant < 0) qf_buf_putc(b, '-');
-    qf_buf_putn(b, digits, (size_t) (len - n->frac));
-    if (n->frac) {
-        qf_buf_putc(b, '.');
-        qf_buf_puts(b, digits + len - n->frac);
+    if (n->frac < 0) {
+        qf_buf_printf(b, "%" PRIu64 "e%d", mag, -n->frac);   /* 1989e27 */
+    } else {
+        /* the digits, with zeros in front so that one digit is left of the point */
+        qf_buf_printf(b, "%0*" PRIu64, n->frac + 1, mag);
+        if (n->frac) {
+            size_t point = b->len - (size_t) n->frac;
+            qf_buf_putc(b, b->s[b->len - 1]);
+            memmove(b->s + point + 1, b->s + point, (size_t) n->frac - 1);
+            b->s[point] = '.';
+        }
     }
     if (n->unit) qf_buf_puts(b, n->unit);
 }

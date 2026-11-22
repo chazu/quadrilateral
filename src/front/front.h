@@ -59,8 +59,9 @@ typedef enum { X_TOP, X_NAME, X_ATOM, X_NUM, X_BOUND, X_TAG, X_STRUCT, X_LIST,
 typedef struct X X;
 typedef VEC(X *) XPtrVec;
 
-/* A number literal: mant × 10^-frac, in `unit`. The unit is the text after
- * the digits, for example "mm" or "J/K", or NULL. The parser does not know
+/* A number literal: mant × 10^-frac, in `unit`. An exponent changes frac:
+ * 1.5e-3 has frac 4, and 1e5 has frac -5. The unit is the text after the
+ * number, for example "mm" or "J/K", or NULL. The parser does not know
  * units. The kind of the field converts the literal later, and exactly
  * (ADR 0001, ADR 0014). */
 typedef struct { int64_t mant; int frac; Sym unit; } XNum;

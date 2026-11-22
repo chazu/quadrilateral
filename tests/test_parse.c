@@ -196,6 +196,39 @@ void test_parse_numbers(void)
     n = num_of("9223372036854775807");
     CHECK(n.mant == INT64_MAX);
 
+    /* an exponent moves the decimal point, exactly; frac is negative for a large number */
+    n = num_of("1e5");
+    CHECK(n.mant == 1 && n.frac == -5 && n.unit == NULL);
+    n = num_of("1e-5");
+    CHECK(n.mant == 1 && n.frac == 5 && n.unit == NULL);
+    n = num_of("5.67e-8W/m^2/K^4");
+    CHECK(n.mant == 567 && n.frac == 10 && !strcmp(n.unit, "W/m^2/K^4"));
+    n = num_of("1.989E30kg");
+    CHECK(n.mant == 1989 && n.frac == -27 && !strcmp(n.unit, "kg"));
+    n = num_of("-1.5e+2m");
+    CHECK(n.mant == -15 && n.frac == -1 && !strcmp(n.unit, "m"));
+    n = num_of("2.50e2");
+    CHECK(n.mant == 250 && n.frac == 0 && n.unit == NULL);
+    n = num_of("1e9999");
+    CHECK(n.mant == 1 && n.frac == -9999);
+    /* an e with no digits after it is a unit */
+    n = num_of("3eV");
+    CHECK(n.mant == 3 && n.frac == 0 && !strcmp(n.unit, "eV"));
+    n = num_of("2e");
+    CHECK(n.mant == 2 && n.frac == 0 && !strcmp(n.unit, "e"));
+    n = num_of("1e5e");
+    CHECK(n.mant == 1 && n.frac == -5 && !strcmp(n.unit, "e"));
+    TEXT("1e - 5", "1e - 5");
+    TEXT("5.67e-8W/m^2/K^4", "0.0000000567W/m^2/K^4");
+    TEXT("1.989E30kg", "1989e27kg");
+    TEXT("-2e3 * 1e-3", "-2e3 * 0.001");
+    TEXT(">=1e-3m & <1e3m", ">=0.001m & <1e3m");
+    TEXT("0e2", "0e2");
+    TEXT("-1.5e+2m", "-15e1m");
+    TEXT("1.e5", "t.quad:1:1: error: malformed number: 1.e5");
+    TEXT("1e10000", "t.quad:1:1: error: number out of range: 1e10000");
+    TEXT("1e99999999999999999999", "t.quad:1:1: error: number out of range: 1e99999999999999999999");
+
     /* compound units: the unit is attached, with *, / and ^ */
     n = num_of("1000J/K");
     CHECK(n.mant == 1000 && !strcmp(n.unit, "J/K"));
@@ -227,6 +260,41 @@ void test_parse_numbers(void)
     TEXT("5m^-", "t.quad:1:1: error: expected digits after '^' in a unit");
     TEXT("9223372036854775808", "t.quad:1:1: error: number out of range: 9223372036854775808");
     TEXT(">=x.", "t.quad:1:4: error: unexpected character '.'");
+
+    /* a reference starts with '.', so it never joins a unit */
+    TEXT("10m/.duration", "10m / .duration");
+    TEXT("10m*.w", "10m * .w");
+
+    /* an operator joined a name to the unit: no valid source has these forms */
+    TEXT("10m/sqrt(4)", "t.quad:1:1: error: '(' directly after the unit 'm/sqrt'. To multiply or divide by a name, "
+                        "put spaces around the operator");
+    TEXT("2 + 10m/v.size", "t.quad:1:5: error: '.' directly after the unit 'm/v'. To multiply or divide by a name, "
+                           "put spaces around the operator");
+    TEXT("10kg*xs[0]", "t.quad:1:1: error: '[' directly after the unit 'kg*xs'. To multiply or divide by a name, "
+                       "put spaces around the operator");
+    TEXT("10m / sqrt(4)", "10m / sqrt(4)");
+    TEXT("10m(", "t.quad:1:4: error: unexpected input after expression");   /* a simple unit: no hint */
+
+    /* the SI form, with a space: the error shows the attached form */
+    TEXT("10 m", "t.quad:1:4: error: unexpected input after expression. "
+                 "If 'm' is a unit, write it directly after the number: 10m");
+    FILE_ERROR("a: { x: 20 W/K, y: 2 }\n", "t.quad:1:13: error: expected ':' after field label. "
+                                           "If 'W/K' is a unit, write it directly after the number: 20W/K");
+    FILE_ERROR("a: 1e3 kg\nb: 2\n", "t.quad:2:1: error: expected ':' after declaration label. "
+                                    "If 'kg' is a unit, write it directly after the number: 1e3kg");
+    FILE_ERROR("a: [10 m, 2]\n", "t.quad:1:8: error: expected ',' or ']'. "
+                                 "If 'm' is a unit, write it directly after the number: 10m");
+    FILE_ERROR("a: 5 kg*m^2\n", "t.quad:1:10: error: unexpected character '^'. "
+                                "A '^' is valid only in a unit, and a unit follows its number with no space: 5kg*m^2");
+    /* no hint: the number has a unit, the name is on the next line, the name
+     * starts a clause of a comprehension, or the name cannot be a unit */
+    FILE_ERROR("a: { x: 10mm m }\n", "t.quad:1:16: error: expected ':' after field label");
+    FILE_ERROR("a: { x: 1m2 m }\n", "t.quad:1:15: error: expected ':' after field label");
+    FILE_ERROR("a: {\n    b: 1\n    c 2\n}\n", "t.quad:3:7: error: expected ':' after field label");
+    FILE_ERROR("a: [for x in xs if x > 3 for y of ys { x }]\n", "t.quad:1:32: error: expected 'in' after for's variables");
+    FILE_ERROR("a: [for x in xs if x > 3 for y.z in ys { x }]\n", "t.quad:1:30: error: expected a variable's name");
+    FILE_ERROR("a: { x: 10 _m }\n", "t.quad:1:15: error: expected ':' after field label");
+    TEXT("[for x in xs if x > 3 for y in ys { x }]", "[for x in xs if (x > 3) for y in ys { x }]");
 }
 
 /* --- expressions and their text form -------------------------------------------------------- */
@@ -529,7 +597,7 @@ void test_parse_adr_sketch(void)
 
 static void random_expr(uint64_t *rng, Buf *b, int depth)
 {
-    static const char *const leaves[] = { "a", "#T", "\"s\"", "12", "3.5kg", "20W/K", "$t", ".p.q", "_", "true",
+    static const char *const leaves[] = { "a", "#T", "\"s\"", "12", "3.5kg", "20W/K", "5.67e-8W/m^2", "2e30kg", "$t", ".p.q", "_", "true",
                                           ">=1mm", "<x", "=~\"r\"", "pkg.#U", "b.c[1]" };
     static const char *const ops[] = { " & ", " | ", " + ", " - ", " * ", " / ", " == ", " < ", " && ", " || " };
     int pick = depth <= 0 ? 0 : (int) t_range(rng, 0, 9);
