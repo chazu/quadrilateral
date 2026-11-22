@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Cells can hold a finite set of atoms, and element and reification propagators connect sets to quantities
