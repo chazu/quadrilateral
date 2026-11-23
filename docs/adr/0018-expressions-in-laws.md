@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A law can have inner expressions, numbers and inequalities, and an inner value is a derived cell
@@ -24,7 +24,10 @@ ADR 0016 section 4 lowered a law of one shape: `a == b` or `a == b op c`, with r
 ### 3. The kind of a derived cell
 
 - A sum or a difference keeps the kind of its operands (ADR 0001 section 1). `.hot.temperature - .cold.temperature` is a `%temperature`.
-- A product or a quotient has an **anonymous kind**: a dimension and a scale, with no name. Its scale is the exact scale of the operation.
+- A product or a quotient has an **anonymous kind**: a dimension and a scale, with no name.
+- The scale of an inner product is the sum of the scales of its operands, which is exact. But it is at most 12 decimals. Without that limit, a long product gets a scale so fine that no value fits: `sigma * area * T * T * T * T` gave "power >= 0 W".
+- The scale of an inner quotient is the difference of the scales, which can be coarse: `.energy / .capacity` in whole kelvin. So it has at least 6 decimals more than the default scale of its dimension, and at most 12 decimals.
+- Where a limit applies, the propagator rounds outward by less than one step of that scale. The result stays sound.
 - A number has an anonymous kind with the scale that makes it exact. `273.15K` is 27315 with the scale -2, and `100K` is 1 with the scale 2. So a number is exact in every law.
 - An anonymous kind converts to every kind of its dimension, as ADR 0001 says for an intermediate value. The world has `qw_anonymous_kind` for it.
 
@@ -51,12 +54,13 @@ Two comparisons with the same text are the same value. So one law that a type an
 - **A derived cell in the state hash.** The world would need no new kind of cell. But two contents with the same state and two spellings of a law would have two hashes. A snapshot would also store values that propagation gives. We rejected it.
 - **A derived cell with no path, in the network only.** The world keeps one record for each cell of the network, with a path and an owner. A hidden cell needs a second kind of record. A hidden cell also cannot be shown. We rejected it.
 - **A number converts to the kind of the other operand.** `273.15K` next to a temperature in whole kelvin would not be exact. With its own scale, a number is always exact, and the propagator converts outward. We rejected the conversion.
-- **A default scale for each derived cell**, as for a field with no kind. The scale of a product is then independent of its operands. But a product of two fine scales would round, and the result of a law would depend on a default. We kept the exact scale.
+- **The exact scale for each derived cell.** The first version did that. A product of six factors then had 31 decimals, and an int64 holds no useful value at that scale. The law of radiated power gave "power >= 0 W" with no message. An inner quotient of an energy and a capacity was in whole kelvin. We rejected it and added the limits.
+- **The default scale of the dimension for each derived cell**, as for a field with no kind. A small value, such as the product of a physical constant and an area, then rounds to nothing. We rejected it.
 
 ## Consequences
 
 - The wall law of the stage 2 fixture elaborates, and the world narrows the power to 200 W.
-- The exact scale of a product is the sum of the scales of its operands. A long product can have a very fine scale, and its bounds can then widen to the whole range. The result stays sound. The author gives the value a field with a kind to choose the scale.
+- An inner value holds at most about 9 million units at 12 decimals, and it cannot hold a value below 10^-12. A law can have a very large or a very small inner value, such as the product of the Planck constant and a frequency. That value needs a field with a kind. A fixed scale cannot serve every magnitude. A scale that follows the value is the full answer, and it is `quad-qx3`.
 - The IR has anonymous kinds with names such as `dim[K]@-6`, and cells with the mark "derived".
 - A message of the world names an anonymous kind as "anonymous K, scale -6".
 - ADR 0015 section 3 and ADR 0016 sections 2 and 4 change with this ADR.

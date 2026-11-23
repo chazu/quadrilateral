@@ -649,6 +649,36 @@ void test_elab_expressions(void)
     }
     qi_free(ir);
 
+    /* The scale of an inner value has limits (ADR 0018 section 3). A long
+     * product keeps its range: the radiated power is sigma × area × T^4, and
+     * the exact scale of T^4 would hold no value. An inner quotient keeps
+     * its digits: the exact scale of energy / capacity is whole kelvin. */
+    for (int fine = 0; fine < 2; fine++) {
+        snprintf(src, sizeof src,
+                 "%%area: { dimension: \"m^2\" }\n%%power: { dimension: \"W\" }\n%%heat: { dimension: \"J\" }\n"
+                 "%%warmth: { dimension: \"K\", scale: %d }\n"
+                 "#Plate: #Phenomenon & {\n"
+                 "    area: %%area, t: %%warmth, power: %%power, heat: %%heat, cap: %%capacity, celsius: %%warmth\n"
+                 "    glow: .power == 5.67e-8W/m^2/K^4 * .area * .t * .t * .t * .t\n"
+                 "    c: .celsius == .heat / .cap - 273.15K\n"
+                 "}\n"
+                 "p: #Plate & { area: 2m^2, t: 300K, heat: 3031500J, cap: 10000J/K }\n",
+                 fine ? -6 : -2);
+        ir = compile(src, NULL);
+        w = ir ? build(ir, 1) : NULL;
+        if (w) {
+            OK(qw_run(w, 0));
+            CHECK_I64(qw_get(w, "p.power").lo, 918540);          /* 918.54 W, in mW */
+            CHECK_I64(qw_get(w, "p.power").hi, 918540);
+            CHECK_I64(qw_get(w, "p.celsius").lo, fine ? 30000000 : 3000);     /* 30, in the scale of the kind */
+            CHECK_I64(qw_get(w, "p.celsius").hi, fine ? 30000000 : 3000);
+            for (uint32_t i = 0; i < ir->nkinds; i++)
+                if (ir->kinds[i].anonymous) CHECK(ir->kinds[i].scale >= -12);
+        }
+        qw_free(w);
+        qi_free(ir);
+    }
+
     /* one law that two declarations state is one law, with one set of derived cells */
     ir = compile("#D: #Phenomenon & { a: %temperature, b: %temperature, up: .b == (.a + 1K) * 2 }\n"
                  "d: #D & { a: 2K }\nd: #D & { up: .b == (.a + 1K) * 2 }\n",
