@@ -329,6 +329,7 @@ void qf_free(Front *f)
         VEC_FREE(ti->field_feats);
     }
     VEC_FREE(f->types);
+    for (size_t i = 0; i < f->feats.n; i++) VEC_FREE(f->feats.v[i].intros);
     VEC_FREE(f->feats);
     for (size_t i = 0; i < f->insts.n; i++) {
         InstInfo *in = &f->insts.v[i];

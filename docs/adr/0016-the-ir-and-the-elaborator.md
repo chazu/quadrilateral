@@ -22,7 +22,7 @@ The design document gives the endpoint. Each phenomenon owns its state, exposes 
 ### 2. Cells
 
 - A number of a kind in a phenomenon is an interval cell. Its path is the name of the phenomenon and the path of the field: `roomA.energy`. Its base is the value of the structure, in quanta of the kind.
-- A field of atoms is a set cell (ADR 0012). Its enumeration is every atom that the field can have by the declaration of the type that introduces it, in the order of the names. So the same field has the same enumeration in every phenomenon. `bool` is the boolean kind of the world.
+- A field of atoms is a set cell (ADR 0012). Its enumeration is every atom that the field can have by its declaration, in the order of the names. The declaration is that of the most general supertype that gives the field an enumeration (ADR 0017 section 5). So the field has the same enumeration in every phenomenon of that type. `bool` is the boolean kind of the world.
 - A path has the labels of the fields, without their packages. Two packages can give one phenomenon two fields with one label. Then two cells would have one path, and that is an error.
 - A cell of a conserved kind is a stock. Its first value must be a point, because only transfers change a stock.
 - A number with no kind is an error (ADR 0015 section 3). The message shows the form `power: %energy`.
@@ -94,7 +94,7 @@ The design document gives the endpoint. Each phenomenon owns its state, exposes 
 
 ## Consequences
 
-- A type introduces each feature once (ADR 0015 section 5). So two wall types cannot each declare `hot` and `cold`, and two unrelated types cannot each have a law named `storage`. They need one common type. The test content has `#Wall`, and `#ConductiveWall: #Wall & { evaluator: "native.conduction" }`. The project owner decided on 2026-11-22 to reverse this rule. `quad-ijx.13` does that, with a change to ADR 0015.
+- The first version of this ADR met the rule that a type introduces each feature once (ADR 0015 section 5). Two wall types could not each declare `hot` and `cold`, and two types could not each have a law named `storage`. ADR 0017 reversed the rule. The test content still has `#Wall`, and `#ConductiveWall: #Wall & { evaluator: "native.conduction" }`, as a choice.
 - A type that sets `evaluator` fixes the kernel for its subtypes, because two different texts do not unify. Defaults (`quad-ijx.10`) remove this limit, and stage 4 moves evaluators to models (design section 12.3).
 - The sketch of ADR 0011 section 2 changes: a law is a named field, and the prelude is in the package `quad`.
 - The content hash of stage 2 changes, because the text form of a load now has reference records.

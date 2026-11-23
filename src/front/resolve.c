@@ -410,17 +410,69 @@ static uint32_t chain_type(Build *b, X *x, uint32_t t)
     return m != QF_BOTTOM ? m : t;
 }
 
-/* Reports a written struct whose fields give it a type that its place does
- * not have. t: the type that introduces its fields. e: the expected type. */
-static bool struct_has_type(Build *b, X *x, uint32_t t, uint32_t e)
+/* The type of a written struct, or QF_BOTTOM with a diagnostic. A struct
+ * does not get a type from its fields (ADR 0015 section 5): the place where
+ * it stands must have a type with every field of the struct.
+ *
+ * base: the meet of the types that alone introduce a field of the struct.
+ * e: the expected type. feats: the features of its fields. A field name
+ * that several unrelated types have (ADR 0017) says nothing about the type. */
+static uint32_t struct_type(Build *b, X *x, uint32_t base, uint32_t e, const uint32_t *feats, int n)
 {
-    Front *f = b->c->f;
-    if (x->u.st.refs || t == f->top) return true;            /* the parser made it for a reference; no fields */
-    if (e != f->top && (is_value(f, e) || is_subtype(f, e, t))) return true;
-    const char *tn = f->types.v[t].name;
-    char msg[700], fix[300];
-    if (!strncmp(tn, "glb[", 4)) snprintf(fix, sizeof fix, "state its type before it, with '&'");
-    else snprintf(fix, sizeof fix, "write %s & { ... }", tn);
+    QfOp *c = b->c;
+    Front *f = c->f;
+    if (x->u.st.refs || !n) return base;         /* the parser made it for a reference; or no fields */
+    if (e != f->top && is_value(f, e)) return base;
+    int odd = 0;                                 /* the first field that the place does not have */
+    if (e != f->top) {
+        odd = -1;
+        for (int i = 0; i < n && odd < 0; i++)
+            if (!approp(f, e, feats[i])) odd = i;
+        if (odd < 0) return base;
+        if (f->types.v[e].isdisj) {
+            /* the fields choose among the alternatives: the most general type below e with every field */
+            U32Vec cands = { 0 };
+            for (uint32_t u = 0; u < f->types.n; u++) {
+                if (u == e || !is_subtype(f, u, e)) continue;
+                bool all = true;
+                for (int i = 0; i < n && all; i++) all = approp(f, u, feats[i]);
+                if (all) VEC_PUSH(cands, u);
+            }
+            uint32_t pick = QF_BOTTOM;
+            size_t top = 0;
+            for (size_t i = 0; i < cands.n; i++) {
+                bool maximal = true;
+                for (size_t j = 0; j < cands.n && maximal; j++)
+                    maximal = i == j || !is_subtype(f, cands.v[i], cands.v[j]);
+                if (maximal) { pick = cands.v[i]; top++; }
+            }
+            VEC_FREE(cands);
+            if (top == 1) return pick;
+            if (top > 1) {
+                char msg[600];
+                snprintf(msg, sizeof msg, "the fields of this struct are fields of more than one alternative of %s: "
+                         "state its type before it, with '&'", f->types.v[e].name);
+                build_error(b, x->loc, "%s", msg);
+                return QF_BOTTOM;
+            }
+        }
+    }
+    const U32Vec *in = &f->feats.v[feats[odd]].intros;
+    const char *tn = f->types.v[base].name;
+    char msg[900], fix[400];
+    if (in->n > 1) {
+        /* several types have this field: the author names one of them */
+        Buf who = { 0 };
+        for (size_t k = 0; k < in->n && k < 4; k++) qf_buf_printf(&who, "%s%s", k ? ", " : "", f->types.v[in->v[k]].name);
+        snprintf(fix, sizeof fix, "state its type before it, with '&'. The types with these fields: %s%s", who.s,
+                 in->n > 4 ? ", ..." : "");
+        qf_buf_free(&who);
+        tn = "more than one type";
+    } else {
+        if (base == f->top) tn = f->types.v[in->v[0]].name;
+        if (!strncmp(tn, "glb[", 4)) snprintf(fix, sizeof fix, "state its type before it, with '&'");
+        else snprintf(fix, sizeof fix, "write %s & { ... }", tn);
+    }
     if (e == f->top)
         snprintf(msg, sizeof msg, "this struct stands where no type is known, and a struct does not get a type from "
                  "its fields. Its fields are fields of %s: %s", tn, fix);
@@ -428,7 +480,7 @@ static bool struct_has_type(Build *b, X *x, uint32_t t, uint32_t e)
         snprintf(msg, sizeof msg, "this struct has fields of %s, but it stands where the type is %s: %s", tn,
                  f->types.v[e].name, fix);
     build_error(b, x->loc, "%s", msg);
-    return false;
+    return QF_BOTTOM;
 }
 
 static QfNode *build_struct_into(Build *b, QfNode *r, X *x)
@@ -648,17 +700,21 @@ static QfNode *build_raw(Build *b, X *x)
     }
     case X_STRUCT: {
         uint32_t t = f->top;
+        uint32_t *fts = qf_alloc_raw(c->scratch.arena, sizeof(uint32_t) * (size_t) (x->u.st.n ? x->u.st.n : 1));
         for (int i = 0; i < x->u.st.n; i++) {
             uint32_t ft = field_feat(b, x, &x->u.st.fields[i], b->ctx1 ? b->ctx1 - 1 : QF_BOTTOM);
             if (ft == QF_BOTTOM) return NULL;
-            uint32_t m = op_meet(c, t, f->feats.v[ft].intro);
+            fts[i] = ft;
+            if (f->feats.v[ft].intros.n != 1) continue;      /* a name of several types gives no type */
+            uint32_t m = op_meet(c, t, f->feats.v[ft].intros.v[0]);
             if (m == QF_BOTTOM) {
                 build_error(b, x->u.st.fields[i].loc, "no type has all of these features (at '%s')", x->u.st.fields[i].label);
                 return NULL;
             }
             t = m;
         }
-        if (!struct_has_type(b, x, t, b->ctx1 ? b->ctx1 - 1 : f->top)) return NULL;
+        t = struct_type(b, x, t, b->ctx1 ? b->ctx1 - 1 : f->top, fts, x->u.st.n);
+        if (t == QF_BOTTOM) return NULL;
         QfNode *r = node_new(c, &c->scratch, t);
         build_struct_into(b, r, x);
         if (!b->ok) return NULL;
@@ -1510,8 +1566,12 @@ void qf_dump(const Front *f, Buf *b)
         dump_records(f, b, &ti->ariths);
         dump_refs(f, b, &ti->refs);
     }
-    for (uint32_t ft = 0; ft < f->feats.n; ft++)
-        qf_buf_printf(b, "feature %s of %s\n", f->feats.v[ft].full, f->types.v[f->feats.v[ft].intro].name);
+    for (uint32_t ft = 0; ft < f->feats.n; ft++) {
+        qf_buf_printf(b, "feature %s of ", f->feats.v[ft].full);
+        for (size_t k = 0; k < f->feats.v[ft].intros.n; k++)
+            qf_buf_printf(b, "%s%s", k ? ", " : "", f->types.v[f->feats.v[ft].intros.v[k]].name);
+        qf_buf_putc(b, '\n');
+    }
     /* instances in name order */
     const InstInfo **is = qf_xmalloc(sizeof *is * (f->insts.n ? f->insts.n : 1));
     for (size_t i = 0; i < f->insts.n; i++) is[i] = &f->insts.v[i];

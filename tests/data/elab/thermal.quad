@@ -4,8 +4,8 @@
 %capacity:    { dimension: "J/K", scale: -3 }
 %conductance: { dimension: "W/K", scale: -3 }
 
-// A type introduces each feature once. The port and the room share these
-// three fields, so one supertype declares them.
+// The port and the room have the same three fields, with the same kinds, so
+// one supertype declares them.
 #Thermal: {
     temperature: %temperature
     capacity:    %capacity

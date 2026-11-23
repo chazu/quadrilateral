@@ -268,15 +268,20 @@ typedef struct {
     U32Vec field_feats;
 } TypeInfo;
 
-/* A feature is its introducing type's package's: two packages may each
- * introduce one of a label. Features are numbered by label, then package
- * (the root first), so packages don't reorder them. */
+/* A feature is a field name of a package: two packages may each have one of
+ * a label. Features are numbered by label, then package (the root first), so
+ * packages don't reorder them.
+ *
+ * Unrelated types can each have a field with the same name (ADR 0017). So a
+ * feature has a list of the types that introduce it: each type that declares
+ * the field and has no supertype that declares it. A type has the feature if
+ * it is below one of them. */
 typedef struct {
     Sym      name;       /* as it prints: the label, unless that is ambiguous */
     Sym      label;      /* as written: larder */
     Sym      pkg;        /* its package, or NULL (the root) */
     Sym      full;       /* pkg.label, or the label */
-    uint32_t intro;
+    U32Vec   intros;     /* the types that introduce it, ascending */
 } FeatInfo;
 
 /* --- nodes, stores and operations (fs.c) ---------------------------------------------------- */
@@ -526,6 +531,7 @@ uint32_t meet(Front *c, uint32_t a, uint32_t b);        /* during load: it fills
 uint32_t meet_pure(const Front *c, uint32_t a, uint32_t b);   /* no cache: for an operation's own cache */
 void     meet_cache_clear(Front *c);
 bool     approp(const Front *c, uint32_t t, uint32_t f);
+bool     introduces(const Front *c, uint32_t t, uint32_t f);     /* t is one of the types that introduce f */
 bool     is_value(const Front *c, uint32_t t);          /* a number, a text or a constraint: a node with a value */
 bool     is_leaf(const Front *c, uint32_t t);           /* no subtypes, no features */
 Sym      anon_name(Front *c, X *orx);

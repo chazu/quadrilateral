@@ -17,7 +17,8 @@
  * Then the kinds, the enumerations and the dependency graph, in orders that
  * do not depend on the order of the source. */
 
-typedef struct { const QfNode *node; Sym text; uint32_t n; int port; bool set; uint32_t feat; } Leaf;
+/* One path to a value. owner: the type of the structure that holds the field. */
+typedef struct { const QfNode *node; Sym text; uint32_t n; int port; bool set; uint32_t feat, owner; } Leaf;
 typedef struct { U32Vec path; uint32_t target; U32Vec sub; uint32_t port; } Conn;
 
 typedef struct {
@@ -122,6 +123,7 @@ typedef struct {
     U32Vec          path;
     VEC(const QfNode *) stack;
     int             port;        /* the port that the walk is inside, or -1 */
+    uint32_t        owner;       /* the type of the structure that the walk is in */
 } Walk;
 
 static uint32_t add_port(Elab *e, uint32_t phen, const uint32_t *path, size_t n, uint32_t type, QiPortState state)
@@ -205,7 +207,7 @@ static void leaf(Walk *w, const QfNode *n, bool set)
 {
     Elab *e = w->e;
     Leaf l = { n, path_sym(e, w->in->name, w->path.v, w->path.n), (uint32_t) w->path.n, w->port, set,
-               w->path.v[w->path.n - 1] };
+               w->path.v[w->path.n - 1], w->owner };
     VEC_PUSH(w->leaves, l);
 }
 
@@ -247,11 +249,14 @@ static void walk(Walk *w, const QfNode *n)
         for (size_t i = 0; i < w->stack.n; i++) cyclic |= w->stack.v[i] == n;
         if (!cyclic) {
             VEC_PUSH(w->stack, n);
+            uint32_t outer = w->owner;
+            w->owner = n->type;
             for (uint32_t i = 0; i < n->narcs; i++) {
                 VEC_PUSH(w->path, n->arcs[i].feat);
                 walk(w, n->arcs[i].val);
                 w->path.n--;
             }
+            w->owner = outer;
             w->stack.n--;
         }
     }
@@ -272,16 +277,24 @@ static const char *atom_name(Elab *e, Sym type_name)
     return s;
 }
 
-/* The enumeration of a set cell: every atom that the field can have by the
- * declaration of the type that introduces it. QI_NONE with a diagnostic. */
+/* The enumeration of a set cell: every atom that the field can have by its
+ * declaration. Unrelated types can each have a field with one name (ADR 0017), so the
+ * declaration is that of the most general supertype of the owner that gives
+ * the field an enumeration. QI_NONE with a diagnostic. */
 static uint32_t enum_of(Walk *w, const Leaf *l)
 {
     Elab *e = w->e;
     Front *f = e->f;
-    uint32_t u = l->node->type;
-    const QfNode *x = f->types.v[f->feats.v[l->feat].intro].expansion;
-    const QfNode *decl = x && !(x->flags & NF_VALUE) ? node_arc(x, l->feat) : NULL;
-    if (decl && decl->type != f->atomroot && is_subtype(f, l->node->type, decl->type)) u = decl->type;
+    uint32_t u = QF_BOTTOM;
+    for (uint32_t t = 0; t < f->types.n; t++) {
+        if (!is_subtype(f, l->owner, t)) continue;
+        const QfNode *x = f->types.v[t].expansion;
+        const QfNode *decl = x && !(x->flags & NF_VALUE) ? node_arc(x, l->feat) : NULL;
+        if (!decl || decl->type == f->atomroot || !is_subtype(f, decl->type, f->atomroot)) continue;
+        if (!is_subtype(f, l->node->type, decl->type)) continue;
+        if (u == QF_BOTTOM || is_subtype(f, u, decl->type)) u = decl->type;
+    }
+    if (u == QF_BOTTOM) u = l->node->type;
     for (size_t i = 0; i < e->usedenums.n; i++)
         if (e->usedenums.v[i] == u) return (uint32_t) i;
     VEC(const char *) atoms = { 0 };

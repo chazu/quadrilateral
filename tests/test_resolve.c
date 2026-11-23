@@ -794,7 +794,8 @@ void test_resolve_fixture(void)
     CHECK(type_pkg(f, made) == qf_sym(f, "shop") && type_pkg(f, room) == NULL);
     /* features: each has one introducing type, and a subtype has its supertypes' features */
     uint32_t fenergy = feat_lookup(f, qf_sym(f, "energy")), fwest = feat_lookup(f, qf_sym(f, "west"));
-    CHECK(fenergy != QF_BOTTOM && f->feats.v[fenergy].intro == thermal && f->feats.v[fwest].intro == room);
+    CHECK(fenergy != QF_BOTTOM && f->feats.v[fenergy].intros.n == 1 && introduces(f, thermal, fenergy));
+    CHECK(f->feats.v[fwest].intros.n == 1 && introduces(f, room, fwest) && !introduces(f, room, fenergy));
     CHECK(approp(f, room, fenergy) && approp(f, port, fenergy) && !approp(f, wall, fenergy) && !approp(f, port, fwest));
     /* an enum, and a disjunction of structures */
     uint32_t material = type_lookup(f, qf_sym(f, "shop.#Material")), steel = type_lookup(f, qf_sym(f, "\"steel\""));
@@ -992,9 +993,7 @@ void test_resolve_errors(void)
            "which are not in this stage (quad-ijx.10)");
 
     /* the hierarchy */
-    STR_EQ(load_error("#A: { x: _ }\n#B: { x: _ }\n"),
-           "a.quad:1:7: error: feature 'x' is introduced by both #A (a.quad:1) and #B (a.quad:2); declare it once "
-           "on a new common supertype (say #HasX), and inherit it");
+    STR_EQ(load_error("#A: { x: _ }\n#B: { x: _ }\n"), "loaded");            /* two types, one field name (ADR 0017) */
     STR_EQ(load_error("#A: #B\n#B: #A\n"), "a.quad:1:1: error: the type hierarchy has a cycle through #A");
     STR_EQ(load_error("#A: #Nope & { x: _ }\n"), "a.quad:1:5: error: #Nope is not a type that #A can inherit from");
     STR_EQ(load_error("a: { x: 1 }\n"), "a.quad:1:6: error: unknown feature 'x': no type declares a field with this name");
@@ -1531,6 +1530,234 @@ void test_reference_records(void)
         CHECK(strstr(dump.s, "\n  reference at leg: t.legs.rest.first\n  reference at spare: t.leg\n") != NULL);
         CHECK(strstr(dump.s, "\n  reference at spare: oak\n") != NULL);
         qf_buf_free(&dump);
+    }
+    qf_free(f);
+}
+
+/* The number of generated types in a content: a meet type, or a conjunction type. */
+static size_t generated_types(const Front *f)
+{
+    size_t n = 0;
+    for (uint32_t t = 0; t < f->types.n; t++) n += f->types.v[t].kind == TK_GLB;
+    return n;
+}
+
+/* Unrelated types can each have a field with the same name (ADR 0017). The
+ * name is one feature, and each of the types introduces it. */
+void test_shared_fields(void)
+{
+    bool ok;
+    const char *src = with_kinds("#A: { x: %length, own: text }\n"
+                                 "#B: { x: text }\n"
+                                 "#H: { item: _ }\n"
+                                 "a: #A & { x: 2m }\n"
+                                 "b: #B & { x: \"two\" }\n");
+    Front *f = load1(src, &ok);
+    CHECK(ok);
+    if (ok) {
+        STR_EQ(node_text(f, inst(f, "a")), "#A & { own: text, x: %length & 2 }");
+        STR_EQ(node_text(f, inst(f, "b")), "#B & { x: \"two\" }");
+        uint32_t a = type_lookup(f, qf_sym(f, "#A")), b = type_lookup(f, qf_sym(f, "#B")), h = type_lookup(f, qf_sym(f, "#H")),
+                 fx = feat_lookup(f, qf_sym(f, "x")), fown = feat_lookup(f, qf_sym(f, "own"));
+        CHECK(fx != QF_BOTTOM && fown != QF_BOTTOM);
+        if (fx != QF_BOTTOM && fown != QF_BOTTOM) {
+            /* one feature for the name, and both types introduce it */
+            CHECK(f->feats.v[fx].intros.n == 2 && introduces(f, a, fx) && introduces(f, b, fx) && !introduces(f, h, fx));
+            CHECK(f->feats.v[fown].intros.n == 1 && introduces(f, a, fown));
+            CHECK(approp(f, a, fx) && approp(f, b, fx) && !approp(f, h, fx) && !approp(f, b, fown));
+            /* the hierarchy has no new type: the two types stay unrelated, below the top */
+            CHECK(meet_pure(f, a, b) == QF_BOTTOM && generated_types(f) == 0);
+            CHECK(f->types.v[a].parents.n == 1 && f->types.v[a].parents.v[0] == f->top);
+        }
+        Buf dump = { 0 };
+        qf_dump(f, &dump);
+        CHECK(strstr(dump.s, "\nfeature x of #A, #B\n") != NULL && strstr(dump.s, "\nfeature own of #A\n") != NULL);
+        qf_buf_free(&dump);
+    }
+    qf_free(f);
+
+    /* each type keeps its own declaration of the field */
+    STR_EQ(load_error(with_kinds("#A: { x: %length }\n#B: { x: text }\na: #A & { x: \"no\" }\n")),
+           "a.quad:6:7: error: conjunction: conflict at x: %length vs \"no\"");
+    /* a structure still cannot have a field that its type does not declare */
+    STR_EQ(load_error("#A: { x: _ }\n#B: { x: _, y: _ }\na: #A & { y: 1 }\n"),
+           "a.quad:3:9: error: this struct has fields of #B, but it stands where the type is #A: write #B & { ... }");
+    /* a struct that stands where no type is known: the message names the types */
+    STR_EQ(load_error(with_kinds("#A: { x: %length }\n#B: { x: text }\n#H: { item: _ }\nh: #H & { item: { x: 2m } }\n")),
+           "a.quad:7:17: error: this struct stands where no type is known, and a struct does not get a type from its "
+           "fields. Its fields are fields of more than one type: state its type before it, with '&'. The types with "
+           "these fields: #A, #B");
+    STR_EQ(inst_text(with_kinds("#A: { x: %length }\n#B: { x: text }\n#H: { item: _ }\nh: #H & { item: #A & { x: 2m } }\n"), "h"),
+           "#H & { item: #A & { x: %length & 2 } }");
+    STR_EQ(inst_text(with_kinds("#A: { x: %length }\n#B: { x: text }\n#H: { item: #B }\nh: #H & { item: { x: \"ok\" } }\n"), "h"),
+           "#H & { item: #B & { x: \"ok\" } }");
+
+    /* a type below both: the two declarations unify, or the conflict is an error at that type */
+    STR_EQ(inst_text(with_kinds("#A: { x: %length & >=1m }\n#B: { x: %length & <=5m }\n#C: #A & #B\nc: #C & { x: 2m }\n"), "c"),
+           "#C & { x: %length & 2 }");
+    STR_EQ(load_error(with_kinds("#A: { x: %length & >=1m }\n#B: { x: %length & <=5m }\n#C: #A & #B\nc: #C & { x: 6m }\n")),
+           "a.quad:7:7: error: conjunction: conflict at x: %length & >=1 & <=5 vs dim[m] & 6");
+    STR_EQ(load_error(with_kinds("#A: { x: %length }\n#B: { x: text }\n#C: #A & #B\n")),
+           "a.quad:6:1: error: #C inheriting from #B: conflict at x: %length vs text, with #B at a.quad:5");
+
+    /* many shared names give no generated type */
+    f = load1(with_kinds("#Port: { side: text }\n"
+                         "#Wall: { hot: #Port, cold: #Port, mass: %mass }\n"
+                         "#Glass: { hot: #Port, cold: #Port, tint: text }\n"
+                         "#Door: { hot: #Port, mass: %mass }\n"
+                         "#Solid: { mass: %mass }\n"
+                         "#Slab: #Solid & { hot: #Port }\n"),
+              &ok);
+    CHECK(ok);
+    if (ok) {
+        uint32_t wall = type_lookup(f, qf_sym(f, "#Wall")), door = type_lookup(f, qf_sym(f, "#Door")),
+                 glass = type_lookup(f, qf_sym(f, "#Glass")), solid = type_lookup(f, qf_sym(f, "#Solid")),
+                 slab = type_lookup(f, qf_sym(f, "#Slab")), hot = feat_lookup(f, qf_sym(f, "hot")),
+                 cold = feat_lookup(f, qf_sym(f, "cold")), mass = feat_lookup(f, qf_sym(f, "mass"));
+        CHECK(generated_types(f) == 0);
+        CHECK(f->feats.v[hot].intros.n == 4 && introduces(f, slab, hot) && !introduces(f, solid, hot));
+        CHECK(f->feats.v[cold].intros.n == 2 && introduces(f, wall, cold) && introduces(f, glass, cold));
+        /* the slab has its mass from #Solid: it does not introduce the name */
+        CHECK(f->feats.v[mass].intros.n == 3 && introduces(f, solid, mass) && !introduces(f, slab, mass));
+        CHECK(approp(f, slab, mass) && approp(f, door, mass) && !approp(f, glass, mass) && !approp(f, door, cold));
+        for (size_t i = 1; i < f->feats.v[hot].intros.n; i++)      /* in the order of the types */
+            CHECK(f->feats.v[hot].intros.v[i - 1] < f->feats.v[hot].intros.v[i]);
+    }
+    qf_free(f);
+
+    /* a supertype that declares the field introduces it, alone */
+    f = load1(with_kinds("#T: { x: _ }\n#A: #T & { x: text }\n#B: #T & { x: %length }\na: #A & { x: \"q\" }\n"), &ok);
+    CHECK(ok);
+    if (ok) {
+        uint32_t fx = feat_lookup(f, qf_sym(f, "x"));
+        CHECK(f->feats.v[fx].intros.n == 1 && introduces(f, type_lookup(f, qf_sym(f, "#T")), fx));
+    }
+    qf_free(f);
+
+    /* a package has its own field names */
+    const char *pk[2] = { "package p\n%size: { dimension: \"m\" }\n#A: { x: %size }\n#B: { x: text }\na: #A & { x: 1m }\n",
+                          "#C: { x: text }\nc: #C & { x: \"root\" }\n" };
+    f = load(pk, 2, &ok);
+    CHECK(ok);
+    if (ok) {
+        uint32_t px = feat_lookup(f, qf_sym(f, "p.x")), rx = feat_lookup(f, qf_sym(f, "x"));
+        CHECK(px != QF_BOTTOM && rx != QF_BOTTOM && px != rx);
+        if (px != QF_BOTTOM && rx != QF_BOTTOM) {
+            CHECK(f->feats.v[px].intros.n == 2 && introduces(f, type_lookup(f, qf_sym(f, "p.#A")), px) &&
+                  introduces(f, type_lookup(f, qf_sym(f, "p.#B")), px));
+            CHECK(f->feats.v[rx].intros.n == 1 && introduces(f, type_lookup(f, qf_sym(f, "#C")), rx));
+        }
+        STR_EQ(node_text(f, inst(f, "c")), "#C & { x: \"root\" }");
+    }
+    qf_free(f);
+
+    /* An alternative that is a structure declares its own fields. It is not
+     * below a named type that declares the same field. A struct that stands
+     * where the type is a disjunction chooses an alternative by its fields. */
+    const char *alts = "#A: { x: %length }\n"
+                       "#S: { form: { x: text, r: %length } | { side: %length } }\n"
+                       "s: #S & { form: { side: 1m } }\n"
+                       "t: #S & { form: { x: \"a\", r: 2m } }\n"
+                       "u: #S & { form: { x: \"a\" } }\n"
+                       "a: #A & { x: 3m }\n";
+    STR_EQ(inst_text(with_kinds(alts), "s"),
+           "#S & { form: ({ side: %length } | { x: text, r: %length })/{ side: %length } & { side: %length & 1 } }");
+    STR_EQ(inst_text(with_kinds(alts), "t"),
+           "#S & { form: ({ side: %length } | { x: text, r: %length })/{ x: text, r: %length } & { r: %length & 2, x: \"a\" } }");
+    STR_EQ(inst_text(with_kinds(alts), "u"),
+           "#S & { form: ({ side: %length } | { x: text, r: %length })/{ x: text, r: %length } & { r: %length, x: \"a\" } }");
+    STR_EQ(inst_text(with_kinds(alts), "a"), "#A & { x: %length & 3 }");
+    STR_EQ(load_error(with_kinds("#S: { form: { x: text, r: %length } | { side: %length } }\ns: #S & { form: { side: 1m, r: 2m } }\n")),
+           "a.quad:5:29: error: no type has all of these features (at 'r')");
+
+    /* a field that the alternatives of one disjunction share, and no named type has, is the disjunction's */
+    const char *alts2 = "#S: { form: { x: text, r: %length } | { x: text, side: %length } }\n"
+                        "u: #S & { form: { x: \"a\" } }\n"
+                        "v: #S & { form: { x: \"a\", side: 1m } }\n";
+    STR_EQ(inst_text(with_kinds(alts2), "u"),
+           "#S & { form: ({ x: text, r: %length } | { x: text, side: %length }) & { x: \"a\" } }");
+    STR_EQ(inst_text(with_kinds(alts2), "v"),
+           "#S & { form: ({ x: text, r: %length } | { x: text, side: %length })/{ x: text, side: %length } & "
+           "{ side: %length & 1, x: \"a\" } }");
+
+    /* a struct with fields of two alternatives, and of no one alternative alone */
+    STR_EQ(load_error(with_kinds("#N: { x: text }\n"
+                                 "#S: { form: { x: text, r: %length } | { x: text, side: %length } }\n"
+                                 "u: #S & { form: { x: \"a\" } }\n")),
+           "a.quad:6:17: error: the fields of this struct are fields of more than one alternative of "
+           "({ x: text, r: %length } | { x: text, side: %length }): state its type before it, with '&'");
+    STR_EQ(inst_text(with_kinds("#N: { x: text }\n"
+                                "#S: { form: { x: text, r: %length } | { x: text, side: %length } }\n"
+                                "u: #S & { form: { x: \"a\", side: 2m } }\nn: #N & { x: \"b\" }\n"), "u"),
+           "#S & { form: ({ x: text, r: %length } | { x: text, side: %length })/{ x: text, side: %length } & "
+           "{ side: %length & 2, x: \"a\" } }");
+    STR_EQ(load_error(with_kinds("#N: { x: text }\n#S: { form: { x: text, r: %length } | { side: %length } }\n"
+                                 "#H: { item: _ }\nh: #H & { item: { x: \"a\" } }\n")),
+           "a.quad:7:17: error: this struct stands where no type is known, and a struct does not get a type from its "
+           "fields. Its fields are fields of more than one type: state its type before it, with '&'. The types with "
+           "these fields: #N, ({ side: %length } | { x: text, r: %length })/{ x: text, r: %length }");
+
+    /* Many types with many common names: the hierarchy gets no new type, so
+     * the load stays fast. A generated supertype for each name made this
+     * content take minutes (ADR 0017, considered options). */
+    {
+        Buf big = { 0 };
+        for (int t = 0; t < 80; t++) {
+            qf_buf_printf(&big, "#T%d: { own%d: text", t, t);
+            for (int l = 0; l < 40; l++)
+                if ((t * 7 + l * 13 + t * l) % 5 != 0) qf_buf_printf(&big, ", f%d: text", l);
+            qf_buf_puts(&big, " }\n");
+        }
+        qf_buf_puts(&big, "t3: #T3 & { f1: \"a\", own3: \"b\" }\n");
+        f = load1(big.s, &ok);
+        CHECK(ok);
+        if (ok) {
+            CHECK(generated_types(f) == 0);
+            uint32_t f1 = feat_lookup(f, qf_sym(f, "f1"));
+            CHECK(f1 != QF_BOTTOM && f->feats.v[f1].intros.n > 50);
+        }
+        qf_free(f);
+        qf_buf_free(&big);
+    }
+
+    /* the result does not depend on the order of the declarations */
+    const char *mix = "%length: { dimension: \"m\" }\n"
+                      "#Port: { side: text }\n"
+                      "#Wall: { hot: #Port, cold: #Port, thick: %length, wide: %length, rule: .thick == .wide }\n"
+                      "#Glass: { hot: #Port, cold: #Port, tint: text, wide: %length }\n"
+                      "#Door: { hot: #Port, wide: %length, rule: .wide == .tall, tall: %length }\n"
+                      "#Frame: #Door & #Glass\n"
+                      "w: #Wall & { thick: 2m, wide: 2m }\n"
+                      "d: #Door & { wide: 1m }\n"
+                      "fr: #Frame & { tint: \"clear\" }\n";
+    f = load1(mix, &ok);
+    CHECK(ok);
+    for (size_t i = 0; i < f->diags.n; i++) fprintf(stderr, "  %s\n", f->diags.v[i].msg);
+    if (ok) {
+        /* hot and wide: all three types. cold: the wall and the glass. rule: the wall and the door. */
+        CHECK(f->feats.v[feat_lookup(f, qf_sym(f, "wide"))].intros.n == 3 && f->feats.v[feat_lookup(f, qf_sym(f, "rule"))].intros.n == 2);
+        CHECK(generated_types(f) == 0);              /* #Frame names its two supertypes, so it needs no meet type */
+        STR_EQ(node_text(f, inst(f, "fr")),
+               "#Frame & { cold: #Port & { side: text }, hot: #Port & { side: text }, rule: .wide == .tall, tall: %length, "
+               "tint: \"clear\", wide: %length }");
+        Buf want = { 0 };
+        qf_dump(f, &want);
+        uint64_t rng = 13;
+        for (int round = 0; round < 20; round++) {
+            char *text = shuffled_source("a.quad", mix, &rng);
+            bool ok2;
+            Front *g = load1(text, &ok2);
+            CHECK(ok2);
+            if (ok2) {
+                Buf got = { 0 };
+                qf_dump(g, &got);
+                CHECK(!strcmp(got.s, want.s) && g->hash == f->hash);
+                qf_buf_free(&got);
+            }
+            qf_free(g);
+            free(text);
+        }
+        qf_buf_free(&want);
     }
     qf_free(f);
 }
