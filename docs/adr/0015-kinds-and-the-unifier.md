@@ -50,7 +50,7 @@ Stage 2 of the front end (ADR 0011 section 3) builds the type hierarchy and unif
 - A point value that is not a whole number of quanta makes the unification fail, and the failure names the value and the quantum (ADR 0001 section 4). Example: `0.15mm` for a kind with a quantum of 0.1 mm.
 - A bound that is not a whole number of quanta moves inward to the next quantum. This removes no value of the kind: for a quantum of 0.1 mm, `>=0.15mm` and `>=0.2mm` allow the same values.
 - A value that does not fit in the finite range of the kind makes the unification fail (ADR 0001 section 5).
-- A node can end the load with only a dimension type. That is valid for a structure. The elaborator of stage 3 needs a kind for each cell and reports a value that has none.
+- A node can end the load with only a dimension type. That is valid for a structure. The first version of this ADR said that the elaborator reports a value with no kind. Since ADR 0018, such a value is a cell with the default scale of its dimension.
 
 ### 4. Units
 

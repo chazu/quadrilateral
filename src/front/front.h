@@ -430,6 +430,7 @@ typedef struct Front {
     VEC(char *) buildlog;        /* generated types, for the developer */
     VEC(DisjInfo) disjs;
     U64Map disjidx;              /* X * of a disjunction → index + 1 */
+    U64Map cmpidx;               /* Sym of the text of a comparison → the X * that stands for that text */
 
     uint32_t top, atomroot, tnumber, ttext, tconstraint, tlist, tcons, tnull, tbool;
     uint32_t ffirst, frest;

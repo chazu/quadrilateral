@@ -25,7 +25,7 @@ The design document gives the endpoint. Each phenomenon owns its state, exposes 
 - A field of atoms is a set cell (ADR 0012). Its enumeration is every atom that the field can have by its declaration, in the order of the names. The declaration is that of the most general supertype that gives the field an enumeration (ADR 0017 section 5). So the field has the same enumeration in every phenomenon of that type. `bool` is the boolean kind of the world.
 - A path has the labels of the fields, without their packages. Two packages can give one phenomenon two fields with one label. Then two cells would have one path, and that is an error.
 - A cell of a conserved kind is a stock. Its first value must be a point, because only transfers change a stock.
-- A number with no kind is an error (ADR 0015 section 3). The message shows the form `power: %energy`.
+- A number with a dimension and no kind is a cell with the default scale of its dimension (ADR 0018 section 4). In the first version of this ADR it was an error. A number with no dimension is still an error.
 - A text and a constraint are not state. They give no cell.
 - One value can stand at several paths, because a reference shares one node (ADR 0011 section 1). The value is one cell. The cell has the shortest path outside a port, and each other path is an **alias**.
 
@@ -51,7 +51,7 @@ The design document gives the endpoint. Each phenomenon owns its state, exposes 
 - This stage lowers a law of the form `a == b` or `a == b op c`. Here `a`, `b` and `c` are references, and `op` is `+`, `-`, `*` or `/`. The law gives one propagator: equality, sum, difference, product or quotient. For an expression at a field, the field is the result.
 - A reference can go through a connected port. Then the propagator names a cell of the other phenomenon. It can only narrow that cell, so ownership holds: a narrowing is a deduction, not a write.
 - The elaborator checks the kinds of a law with the rules of ADR 0001, so the error has the place of the law in source.
-- A nested expression, a literal operand, and an inequality are errors that name `quad-ijx.12`. They need an intermediate cell with an anonymous kind, a constant cell, and an inequality propagator. Until then, the author gives an intermediate value a field with a kind.
+- A nested expression, a number, and an inequality were errors in this stage. ADR 0018 added them: an inner value is a derived cell.
 - A record that stands under a connection is a law of the other phenomenon. The elaborator makes it once, for its owner.
 
 ### 5. Kernels
@@ -98,7 +98,7 @@ The design document gives the endpoint. Each phenomenon owns its state, exposes 
 - A type that sets `evaluator` fixes the kernel for its subtypes, because two different texts do not unify. Defaults (`quad-ijx.10`) remove this limit, and stage 4 moves evaluators to models (design section 12.3).
 - The sketch of ADR 0011 section 2 changes: a law is a named field, and the prelude is in the package `quad`.
 - The content hash of stage 2 changes, because the text form of a load now has reference records.
-- The stage 2 fixture declares `#Phenomenon` and `#Port` in the root, with a `laws` list. The prelude adds to a type that the root declares, so the fixture loads as before. Its wall law has a nested expression, so the fixture does not elaborate until `quad-ijx.12`.
+- The stage 2 fixture declares `#Phenomenon` and `#Port` in the root, with a `laws` list. The prelude adds to a type that the root declares, so the fixture loads as before. Its wall law has a nested expression, which elaborates since ADR 0018.
 - A kernel that needs a parameter, such as `native.diffusion` for n cells, has no name in source yet. Stage 4 needs it for the phase 5 experiment.
 - A phenomenon in a package works when one package has its name. Two phenomena with the same plain name in two packages are an error, because the world has one name space.
 - An atom in a set cell needs a name of letters, digits and `_`. An atom such as `"two words"` is an error where it becomes a cell.

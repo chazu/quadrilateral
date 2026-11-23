@@ -23,7 +23,7 @@ const char *qn_status_str(QnStatus s)
 
 /* --- storage ----------------------------------------------------------------- */
 
-typedef enum { P_SUM, P_PRODUCT, P_EQUAL, P_CUSTOM, P_SETEQ, P_ELEMENT, P_REIFY } PKind;
+typedef enum { P_SUM, P_PRODUCT, P_EQUAL, P_CUSTOM, P_SETEQ, P_ELEMENT, P_REIFY, P_LE } PKind;
 
 typedef struct {
     PKind  kind;
@@ -36,6 +36,7 @@ typedef struct {
     size_t first, n;      /* custom: cells in net->ccells[first .. first + n);
                              element: net->tables[first .. first + n) */
     QInterval range;      /* reify */
+    bool   strict;        /* less-or-equal: a < b */
 } Prop;
 
 typedef struct { uint32_t *ids; size_t n, cap; } List;
@@ -371,6 +372,24 @@ QnStatus qn_equal(QNet *net, QnCell a, QnCell b, QStatus *why)
     return add_prop(net, &p, p.c, 2);
 }
 
+/* Less-or-equal plans: k[0] converts b to a's scale, k[1] converts a to b's. */
+QnStatus qn_less_equal(QNet *net, QnCell a, QnCell b, bool strict, QStatus *why)
+{
+    if (!valid_cell(net, a) || !valid_cell(net, b)) return QN_ECELL;
+    QType t;
+    QStatus q;
+    if ((q = qtype_sum(&net->cells[a].type, &net->cells[b].type, &t))) return type_error(q, why);
+    Prop p;
+    memset(&p, 0, sizeof p);
+    p.kind = P_LE;
+    p.c[0] = a;
+    p.c[1] = b;
+    p.k[0] = plan(scale_of(net, b) - scale_of(net, a));
+    p.k[1] = plan(scale_of(net, a) - scale_of(net, b));
+    p.strict = strict;
+    return add_prop(net, &p, p.c, 2);
+}
+
 QnStatus qn_custom(QNet *net, const QnCell *cells, size_t n, QnFn fn, void *ctx)
 {
     for (size_t i = 0; i < n; i++)
@@ -417,6 +436,19 @@ static void run_equal(QNet *net, const Prop *p)
     QInterval a = net->cells[p->c[0]].cur, b = net->cells[p->c[1]].cur;
     qn_tell(net, p->c[0], qi_conv(b, &p->k[0]));
     qn_tell(net, p->c[1], qi_conv(a, &p->k[1]));
+}
+
+/* a <= b: a is at most the upper bound of b, and b is at least the lower
+ * bound of a. A conversion rounds outward, so no value is lost. For a < b
+ * the bound moves by one quantum of the cell that it narrows. */
+static void run_le(QNet *net, const Prop *p)
+{
+    QInterval a = net->cells[p->c[0]].cur, b = net->cells[p->c[1]].cur;
+    int64_t upper = qi_conv(b, &p->k[0]).hi, lower = qi_conv(a, &p->k[1]).lo;
+    if (p->strict && upper != Q_INF && upper > Q_FMIN) upper--;
+    if (p->strict && lower != Q_NINF && lower < Q_FMAX) lower++;
+    if (upper != Q_INF) qn_tell(net, p->c[0], (QInterval) { Q_NINF, upper });
+    if (lower != Q_NINF) qn_tell(net, p->c[1], (QInterval) { lower, Q_INF });
 }
 
 static void run_seteq(QNet *net, const Prop *p)
@@ -483,6 +515,7 @@ static void run(QNet *net, const Prop *p)
     case P_SETEQ:   run_seteq(net, p); break;
     case P_ELEMENT: run_element(net, p); break;
     case P_REIFY:   run_reify(net, p); break;
+    case P_LE:      run_le(net, p); break;
     }
 }
 

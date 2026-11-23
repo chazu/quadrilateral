@@ -38,7 +38,8 @@ char *qi_text(const QIr *ir)
     for (uint32_t i = 0; i < ir->nbases; i++) qf_buf_printf(&b, "base %s\n", ir->bases[i]);
     for (uint32_t i = 0; i < ir->nkinds; i++) {
         const QiKind *k = &ir->kinds[i];
-        qf_buf_printf(&b, "kind %s: %s, scale %d%s", k->name, k->dimension, k->scale, k->conserved ? ", conserved" : "");
+        qf_buf_printf(&b, "kind %s: %s, scale %d%s%s", k->name, k->dimension, k->scale, k->conserved ? ", conserved" : "",
+                      k->anonymous ? ", anonymous" : "");
         if (k->rounding) qf_buf_printf(&b, ", %s", rounding[k->rounding & 3]);
         qf_buf_putc(&b, '\n');
     }
@@ -52,7 +53,7 @@ char *qi_text(const QIr *ir)
         for (uint32_t i = 0; i < ir->ncells; i++) {
             const QiCell *c = &ir->cells[i];
             if (c->phen != p) continue;
-            qf_buf_printf(&b, "  %s %s: %s = ", c->stock ? "stock" : "cell", c->path,
+            qf_buf_printf(&b, "  %s %s: %s = ", c->stock ? "stock" : c->derived ? "derived" : "cell", c->path,
                           c->domain == QI_SET ? ir->enums[c->kind].name : ir->kinds[c->kind].name);
             put_value(&b, ir, c);
             qf_buf_putc(&b, '\n');
@@ -70,9 +71,9 @@ char *qi_text(const QIr *ir)
         for (uint32_t i = 0; i < ir->nprops; i++) {
             const QiProp *pr = &ir->props[i];
             if (pr->phen != p) continue;
-            qf_buf_printf(&b, "  propagator P%u, in an epoch: %s = %s", i, cell_path(ir, pr->cell[0]),
-                          cell_path(ir, pr->cell[1]));
-            if (pr->op != QI_EQUAL) qf_buf_printf(&b, " %s %s", ops[pr->op], cell_path(ir, pr->cell[2]));
+            qf_buf_printf(&b, "  propagator P%u, in an epoch: %s %s %s", i, cell_path(ir, pr->cell[0]),
+                          pr->op == QI_LESS_EQUAL ? "<=" : pr->op == QI_LESS ? "<" : "=", cell_path(ir, pr->cell[1]));
+            if (pr->op >= QI_SUM && pr->op <= QI_QUOTIENT) qf_buf_printf(&b, " %s %s", ops[pr->op], cell_path(ir, pr->cell[2]));
             qf_buf_printf(&b, "\n    law %s: %s\n", pr->name, pr->law);
         }
         for (uint32_t i = 0; i < ir->nkernels; i++) {

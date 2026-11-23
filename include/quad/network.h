@@ -58,6 +58,10 @@ QnStatus qn_difference(QNet *net, QnCell z, QnCell x, QnCell y, QStatus *why);  
 QnStatus qn_product(QNet *net, QnCell z, QnCell x, QnCell y, QStatus *why);     /* z = x * y */
 QnStatus qn_equal(QNet *net, QnCell a, QnCell b, QStatus *why);                 /* a = b */
 
+/* a <= b, or a < b if `strict`. It lowers the upper bound of a and raises
+ * the lower bound of b. In quanta, a < b removes one quantum. */
+QnStatus qn_less_equal(QNet *net, QnCell a, QnCell b, bool strict, QStatus *why);
+
 /* z = x / y, as x = z * y. Where y can be 0, this is weaker than division:
  * it also allows y = 0 with x = 0 and any z. */
 QnStatus qn_quotient(QNet *net, QnCell z, QnCell x, QnCell y, QStatus *why);

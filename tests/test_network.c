@@ -454,3 +454,61 @@ void test_net_groups(void)
     CHECK(group_inner == QN_EPROPAGATING);
     qn_free(net);
 }
+
+/* a <= b and a < b (ADR 0018): the upper bound of a and the lower bound of b */
+void test_net_less_equal(void)
+{
+    QNet *net = qn_new();
+    QDim len = dim4(1, 0, 0, 0);
+    QnCell a = cell(net, 1, len, -3, iv(2000, 9000)), b = cell(net, 1, len, -3, iv(1000, 5000));
+    CHECK(qn_less_equal(net, a, b, false, NULL) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK_IV(qn_get(net, a), 2000, 5000);
+    CHECK_IV(qn_get(net, b), 2000, 5000);
+
+    /* strict: one quantum of the cell that the propagator narrows */
+    QnCell c = cell(net, 1, len, -3, iv(2000, 9000)), d = cell(net, 1, len, -3, iv(1000, 5000));
+    CHECK(qn_less_equal(net, c, d, true, NULL) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK_IV(qn_get(net, c), 2000, 4999);
+    CHECK_IV(qn_get(net, d), 2001, 5000);
+
+    /* two scales: metres and millimetres. A bound converts outward, so no value is lost. */
+    QnCell m = cell(net, 1, len, 0, qi_top()), mm = cell(net, 1, len, -3, iv(1500, 2500));
+    CHECK(qn_less_equal(net, m, mm, false, NULL) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK_IV(qn_get(net, m), Q_NINF, 3);                 /* at most 2.5 m: 3 m in whole metres, outward */
+    QnCell lo = cell(net, 1, len, 0, iv(2, 2));
+    CHECK(qn_less_equal(net, lo, mm, true, NULL) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK_IV(qn_get(net, mm), 2001, 2500);               /* more than 2 m */
+
+    /* an infinite bound says nothing */
+    QnCell x = cell(net, 1, len, -3, qi_top()), y = cell(net, 1, len, -3, qi_top());
+    CHECK(qn_less_equal(net, x, y, true, NULL) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK_IV(qn_get(net, x), Q_NINF, Q_INF);
+    CHECK_IV(qn_get(net, y), Q_NINF, Q_INF);
+
+    /* kinds and dimensions must fit, as for an equality */
+    QStatus why = Q_OK;
+    QnCell t = cell(net, 2, dim4(0, 0, 0, 1), -3, qi_top()), other = cell(net, 3, len, -3, qi_top());
+    CHECK(qn_less_equal(net, a, t, false, &why) == QN_ETYPE && why == Q_EDIM);
+    CHECK(qn_less_equal(net, a, other, false, &why) == QN_ETYPE && why == Q_EKIND);
+    CHECK(qn_less_equal(net, a, 9999, false, NULL) == QN_ECELL);
+
+    /* a contradiction: 6 <= 5 */
+    QnCell six = cell(net, 1, len, -3, iv(6000, 6000)), five = cell(net, 1, len, -3, iv(5000, 5000));
+    CHECK(qn_less_equal(net, six, five, false, NULL) == QN_OK);
+    CHECK(qn_propagate(net) == QN_CONTRADICTION);
+    qn_free(net);
+
+    /* 5 < 5 is a contradiction, and 5 <= 5 is not */
+    net = qn_new();
+    QnCell p = cell(net, 1, len, -3, iv(5000, 5000)), q = cell(net, 1, len, -3, iv(5000, 5000));
+    CHECK(qn_less_equal(net, p, q, false, NULL) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK(qn_less_equal(net, p, q, true, NULL) == QN_OK);
+    CHECK(qn_propagate(net) == QN_CONTRADICTION);
+    qn_free(net);
+}

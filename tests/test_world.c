@@ -681,3 +681,56 @@ void test_world_alias(void)
     qw_free(w);
     qw_free(plain.w);
 }
+
+/* A derived cell is not state, and an anonymous kind has no name (ADR 0018). */
+void test_world_derived(void)
+{
+    Rooms plain = make_rooms(1, 303.15, 293.15, 10000, 10000, 10, 10000000);
+    Rooms r = make_rooms(1, 303.15, 293.15, 10000, 10000, 10, 10000000);
+    QwKind dt, dt2, power, coarse;
+    OK(qw_anonymous_kind(r.w, "K", -6, &dt));
+    OK(qw_anonymous_kind(r.w, "K", -6, &dt2));
+    OK(qw_anonymous_kind(r.w, "W", -3, &power));
+    OK(qw_anonymous_kind(r.w, "K", -3, &coarse));
+    CHECK(dt == dt2 && dt != power && dt != coarse);     /* one kind for one dimension and scale */
+    CHECK(qw_anonymous_kind(r.w, "furlong", 0, &dt2) == QW_ETYPE);
+    CHECK(qw_anonymous_kind(r.w, "K", 300, &dt2) == QW_ETYPE);
+    QType t;
+    OK(qw_kind_type(r.w, dt, &t));
+    CHECK(t.kind == 0 && t.scale == -6);
+
+    /* the wall's law by hand: power = conductance × (T hot − T cold) */
+    QnCell diff, p, hot, cold, g;
+    OK(qw_derived_cell(r.w, "wall.law.1", dt, qi_top(), &diff));
+    OK(qw_derived_cell(r.w, "wall.law.2", power, qi_top(), &p));
+    OK(qw_find(r.w, "roomA.temperature", &hot));
+    OK(qw_find(r.w, "roomB.temperature", &cold));
+    OK(qw_find(r.w, "wall.conductance", &g));
+    CHECK(qn_difference(qw_net(r.w), diff, hot, cold, NULL) == QN_OK);    /* an anonymous kind fits each kind of its dimension */
+    CHECK(qn_product(qw_net(r.w), p, g, diff, NULL) == QN_OK);
+    OK(qw_attach(r.w, r.wall, qk_conduction()));
+    OK(qw_attach(plain.w, plain.wall, qk_conduction()));
+
+    /* a derived cell is not state: the hash is the hash of the world without it */
+    CHECK(qw_hash(r.w) == qw_hash(plain.w));
+    OK(qw_run(r.w, 0));
+    CHECK_I64(qw_get(r.w, "wall.law.1").lo, 10000000);            /* 10 K */
+    CHECK_I64(qw_get(r.w, "wall.law.2").lo, 100000);              /* 100 W */
+    OK(qw_run(r.w, 1000000000));
+    OK(qw_run(plain.w, 1000000000));
+    CHECK(qw_hash(r.w) == qw_hash(plain.w));
+    CHECK(qw_get(r.w, "wall.law.2").lo < 20000 && qw_get(r.w, "wall.law.2").lo > 10000);   /* the rooms came closer */
+
+    CHECK(qw_input(r.w, "wall.law.1", qi_point(5)) == QW_EOWNER);
+    CHECK(strstr(qw_error(r.w), "derived") != NULL);
+    CHECK(qw_derived_cell(r.w, "wall.law.1", dt, qi_top(), NULL) == QW_EDUP);
+    CHECK(qw_derived_cell(r.w, "wall.stock", r.energy, qi_point(0), NULL) == QW_ESTOCK);
+    CHECK(qw_derived_cell(r.w, "nowhere.x", dt, qi_top(), NULL) == QW_ENAME);
+    /* a constant: a derived cell with a point */
+    QnCell k;
+    OK(qw_derived_cell(r.w, "wall.law.3", coarse, qi_point(273150), &k));
+    CHECK_I64(qw_get(r.w, "wall.law.3").hi, 273150);
+    CHECK(qw_hash(r.w) == qw_hash(plain.w));
+    qw_free(r.w);
+    qw_free(plain.w);
+}

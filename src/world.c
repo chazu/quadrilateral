@@ -18,6 +18,7 @@ typedef struct {
     int       model;
     QInterval init;        /* the declared base; an instance's cell returns to it at an end */
     bool      host_only;   /* "<key>.alive": only the host writes it */
+    bool      derived;     /* a law gives its value: not state */
 } CellInfo;
 typedef struct { char *path; QnCell cell; } Alias;               /* qw_alias */
 typedef struct { char *port, *target; } Port;                   /* qw_connect */
@@ -547,6 +548,29 @@ QwStatus qw_kind(QWorld *w, const char *name, const char *dim, int scale, bool c
     return QW_OK;
 }
 
+QwStatus qw_anonymous_kind(QWorld *w, const char *dim, int scale, QwKind *out)
+{
+    QDim d;
+    if (parse_dim(w, dim, &d) != Q_OK) return fail(w, QW_ETYPE, "anonymous kind: cannot read dimension '%s'", dim);
+    if (scale < INT8_MIN || scale > INT8_MAX) return fail(w, QW_ETYPE, "anonymous kind of '%s': scale out of range", dim);
+    for (size_t i = 0; i < w->nkinds; i++) {
+        const Kind *k = &w->kinds[i];
+        if (!k->natoms && k->type.kind == 0 && k->type.scale == scale && qdim_eq(&k->type.dim, &d)) {
+            *out = (QwKind) i;
+            return QW_OK;
+        }
+    }
+    if (!grow((void **) &w->kinds, &w->capkinds, w->nkinds + 1, sizeof *w->kinds)) return QW_ENOMEM;
+    Kind *k = &w->kinds[w->nkinds];
+    memset(k, 0, sizeof *k);
+    char name[160];
+    snprintf(name, sizeof name, "anonymous %s, scale %d", dim[0] ? dim : "1", scale);
+    if (!(k->name = dupstr(name))) return QW_ENOMEM;
+    k->type = qtype_make(0, d, (int8_t) scale);
+    *out = (QwKind) w->nkinds++;
+    return QW_OK;
+}
+
 QwStatus qw_enum_kind(QWorld *w, const char *name, const char *const *atoms, unsigned n, QwKind *out)
 {
     if (!valid_name(name)) return fail(w, QW_ENAME, "invalid kind name '%s'", name);
@@ -746,6 +770,7 @@ static QwStatus add_cell(QWorld *w, const char *path, QwKind kind, bool is_set, 
     ci->model = model;
     ci->init = qn_base(w->net, c);
     ci->host_only = host_only;
+    ci->derived = false;
     p->cells[p->ncells++] = c;
     w->delta[c] = w->wval[c] = 0;
     w->written[c] = false;
@@ -758,6 +783,18 @@ static QwStatus add_cell(QWorld *w, const char *path, QwKind kind, bool is_set, 
 QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out)
 {
     return add_cell(w, path, kind, false, base, 0, false, out);
+}
+
+QwStatus qw_derived_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out)
+{
+    if (kind < w->nkinds && w->kinds[kind].conserved)
+        return fail(w, QW_ESTOCK, "derived cell '%s': a stock is state, so it cannot be derived", path);
+    QnCell c;
+    QwStatus s = add_cell(w, path, kind, false, base, 0, false, &c);
+    if (s) return s;
+    w->cells[c].derived = true;
+    if (out) *out = c;
+    return QW_OK;
 }
 
 QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out)
@@ -1926,6 +1963,7 @@ QwStatus qw_input(QWorld *w, const char *path, QInterval v)
     if (w->kinds[w->cells[c].kind].conserved)
         return fail(w, QW_ESTOCK, "'%s' is a stock; a stock changes only by transfers", path);
     if (set_cell(w, c)) return fail(w, QW_ETYPE, "'%s' is a set cell; use qw_input_set", path);
+    if (w->cells[c].derived) return fail(w, QW_EOWNER, "'%s' is derived: a law gives its value", path);
     if (!qi_valid(v)) return fail(w, QW_ETYPE, "invalid interval for '%s'", path);
     if (!log_reserve(w, 1)) return fail(w, QW_ENOMEM, "no memory for the change log");
     size_t logged = w->nlog;
@@ -2010,6 +2048,7 @@ uint64_t qw_hash(const QWorld *w)
     for (size_t i = 0; i < w->nphens; i++)
         sum += fnv(fnv(seed, w->phens[i].ident), (uint64_t) (int64_t) w->phens[i].active);
     for (size_t c = 0; c < w->ncells; c++) {
+        if (w->cells[c].derived) continue;       /* not state */
         QInterval b = qn_base(w->net, (QnCell) c);
         sum += fnv(fnv(fnv(seed, w->cells[c].hash), (uint64_t) b.lo), (uint64_t) b.hi);
     }
