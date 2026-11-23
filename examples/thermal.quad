@@ -1,0 +1,36 @@
+// Types for heat in buildings: a room with one temperature, and a wall that
+// conducts heat between two rooms. The examples two-rooms.quad and house.quad
+// use this file.
+
+%energy:      { dimension: "J", conserved: true }
+%temperature: { scale: -6 }
+%capacity:    { dimension: "J/K" }
+%conductance: { dimension: "W/K" }
+
+// What a thermal port shows of a room.
+#Thermal: {
+    temperature: %temperature
+    capacity:    %capacity
+    energy:      %energy
+}
+
+#ThermalPort: #Port & #Thermal
+
+// A room with one temperature. The law relates its energy and its
+// temperature. The port `west` is a view of the room's own state.
+#Room: #Phenomenon & #Thermal & {
+    storage: .energy == .capacity * .temperature
+    west: #ThermalPort & { temperature: .temperature, capacity: .capacity, energy: .energy }
+}
+
+// A wall with no thermal mass. A native kernel moves the heat.
+#Wall: #Phenomenon & {
+    hot:  #ThermalPort
+    cold: #ThermalPort
+    conductance: %conductance
+    tolerance:   %ratio
+    evaluator:   "native.conduction"
+    // the power through the wall, for the reader: the kernel does not need it
+    power: %energy / %time
+    flow:  .power == .conductance * (.hot.temperature - .cold.temperature)
+}

@@ -1,0 +1,10 @@
+// Two rooms and a wall (design section 9.2). The warm room loses heat to the
+// cold room through the wall. The energy that one room loses, the other
+// room gains: energy is a conserved kind, and only a transfer changes it.
+//
+//   quad run examples/thermal.quad examples/two-rooms.quad --until 30min --every 10min \
+//        --show living.temperature,cellar.temperature,wall.power
+
+living: #Room & { energy: 3031500J, capacity: 10000J/K }    // 303.15 K
+cellar: #Room & { energy: 2931500J, capacity: 10000J/K }    // 293.15 K
+wall:   #Wall & { hot: living.west, cold: cellar.west, conductance: 10W/K, tolerance: 1pct }

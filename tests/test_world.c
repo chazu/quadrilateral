@@ -41,6 +41,16 @@ void test_parse_dim(void)
     QDim pa = dimof("Pa", &st), npm = dimof("N/m^2", &st);
     CHECK(qdim_eq(&pa, &npm));
 
+    /* electricity: each unit is the same dimension as its definition */
+    const char *same[][2] = { { "V", "W/A" }, { "ohm", "V/A" }, { "C", "A s" }, { "F", "C/V" },
+                              { "H", "Wb/A" }, { "S", "A/V" }, { "T", "Wb/m^2" }, { "Wb", "V s" } };
+    for (size_t i = 0; i < sizeof same / sizeof same[0]; i++) {
+        QDim x = dimof(same[i][0], &st);
+        CHECK(st == Q_OK);
+        QDim y = dimof(same[i][1], &st);
+        CHECK(st == Q_OK && qdim_eq(&x, &y) && !qdim_is_none(&x));
+    }
+
     dimof("furlong", &st);
     CHECK(st == Q_EDIM);
     const char *bad[] = { "kg^", "kg^x", "/s", "m/", "m/s/s", "2m", "m^-" };

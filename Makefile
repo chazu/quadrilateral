@@ -11,7 +11,7 @@ HDR   := $(wildcard include/quad/*.h) $(wildcard src/front/*.h) $(wildcard tests
 
 .PHONY: all test asan clean
 
-all: $(BUILD)/libquad.a $(BUILD)/test
+all: $(BUILD)/libquad.a $(BUILD)/test $(BUILD)/quad
 
 $(BUILD)/obj/%.o: src/%.c $(HDR)
 	@mkdir -p $(dir $@)
@@ -26,6 +26,10 @@ $(BUILD)/libquad.a: $(OBJ)
 
 $(BUILD)/test: $(TOBJ) $(BUILD)/libquad.a
 	$(CC) $(CFLAGS) $(TOBJ) $(BUILD)/libquad.a -o $@
+
+# The command-line tool: quad check, quad ir, quad run.
+$(BUILD)/quad: tools/quad.c $(BUILD)/libquad.a $(HDR)
+	$(CC) $(CFLAGS) tools/quad.c $(BUILD)/libquad.a -o $@
 
 test: $(BUILD)/test
 	./$(BUILD)/test

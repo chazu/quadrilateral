@@ -1,0 +1,25 @@
+// Ohm's law, in every direction. A law is a relation, not an assignment:
+// give any two of voltage, current and resistance, and the world finds the
+// third. A range gives a range.
+
+%voltage:    { dimension: "V" }
+%resistance: { dimension: "ohm" }
+%power:      { dimension: "W" }
+
+#Resistor: #Phenomenon & {
+    voltage:    %voltage
+    current:    %current
+    resistance: %resistance
+    power:      %power
+    ohm:  .voltage == .current * .resistance
+    heat: .power == .voltage * .current
+}
+
+// The voltage and the resistance are known: the current follows.
+lamp: #Resistor & { voltage: 12V, resistance: 100ohm }
+
+// The current and the resistance are known: the voltage follows.
+heater: #Resistor & { current: 2A, resistance: 25ohm }
+
+// A part with a tolerance of 5 percent, and a current between two limits.
+sensor: #Resistor & { current: >=10mA & <=20mA, resistance: >=95ohm & <=105ohm }

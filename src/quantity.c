@@ -488,6 +488,15 @@ static const UnitSym unit_syms[] = {
     { "W",    2,  1, -3, 0, 0, 0, 0 },
     { "Pa",  -1,  1, -2, 0, 0, 0, 0 },
     { "Hz",   0,  0, -1, 0, 0, 0, 0 },
+    /* electricity: coulomb, volt, ohm, farad, henry, siemens, tesla, weber */
+    { "C",    0,  0,  1, 1, 0, 0, 0 },
+    { "V",    2,  1, -3, -1, 0, 0, 0 },
+    { "ohm",  2,  1, -3, -2, 0, 0, 0 },
+    { "F",   -2, -1,  4, 2, 0, 0, 0 },
+    { "H",    2,  1, -2, -2, 0, 0, 0 },
+    { "S",   -2, -1,  3, 2, 0, 0, 0 },
+    { "T",    0,  1, -2, -1, 0, 0, 0 },
+    { "Wb",   2,  1, -2, -1, 0, 0, 0 },
 };
 
 static bool is_name_char(char c)

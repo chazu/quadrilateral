@@ -54,7 +54,7 @@ Stage 2 of the front end (ADR 0011 section 3) builds the type hierarchy and unif
 
 ### 4. Units
 
-- One table gives each unit symbol its dimension and its exact factor. The table has the symbols of `q_parse_dim` (m, kg, s, A, K, mol, cd, N, J, W, Pa, Hz), the gram, the SI prefixes from pico to tera, and min, h, d, and L. It has `deg` and `turn` for the angle. The symbols of declared base dimensions are added to it.
+- One table gives each unit symbol its dimension and its exact factor. The table has the symbols of `q_parse_dim` (m, kg, s, A, K, mol, cd, N, J, W, Pa, Hz, and for electricity C, V, ohm, F, H, S, T, Wb), the gram, the SI prefixes from pico to tera, and min, h, d, and L. It has `deg` and `turn` for the angle. The symbols of declared base dimensions are added to it.
 - Two symbols have no dimension: `pct` is 10^-2 and `ppm` is 10^-6. So `50pct` is 0.5.
 - A kind that is not a base dimension has no unit symbol of its own, such as `gp` for a count of gold pieces. That waits for a need.
 - A symbol is first looked up as a whole (`min`, `mol`, `cd`), and then as a prefix with a symbol (`mm`, `kJ`).

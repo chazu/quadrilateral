@@ -23,6 +23,8 @@ const char *qn_status_str(QnStatus s)
 
 /* --- storage ----------------------------------------------------------------- */
 
+#define NO_PROP UINT32_MAX
+
 typedef enum { P_SUM, P_PRODUCT, P_EQUAL, P_CUSTOM, P_SETEQ, P_ELEMENT, P_REIFY, P_LE } PKind;
 
 typedef struct {
@@ -70,6 +72,8 @@ struct QNet {
 
     uint64_t epoch, runs, budget;
     bool     propagating, contradicted;
+    uint32_t running;       /* the propagator that runs now, or NO_PROP */
+    uint32_t culprit;       /* the propagator that ran when the contradiction came, or NO_PROP */
     QnCell   conflict;
 };
 
@@ -95,6 +99,7 @@ QNet *qn_new(void)
     }
     net->groups[0] = true;
     net->ngroups = 1;
+    net->running = net->culprit = NO_PROP;
     return net;
 }
 
@@ -197,6 +202,7 @@ static void contradict(QNet *net, QnCell c)
 {
     net->contradicted = true;
     net->conflict = c;
+    net->culprit = net->running;
     clear_queue(net);
 }
 
@@ -258,6 +264,13 @@ QnStatus qn_tell(QNet *net, QnCell c, QInterval v)
     cell->cur = m;
     wake(net, cell);
     return QN_OK;
+}
+
+bool qn_contradicted_by(const QNet *net, uint32_t *propagator)
+{
+    if (!net->contradicted || net->culprit == NO_PROP) return false;
+    if (propagator) *propagator = net->culprit;
+    return true;
 }
 
 bool qn_contradicted(const QNet *net, QnCell *where)
@@ -581,8 +594,11 @@ QnStatus qn_propagate(QNet *net)
             s = QN_BUDGET;
             break;
         }
-        Prop p = net->props[dequeue(net)];   /* a copy: a custom run can add propagators */
+        uint32_t id = dequeue(net);
+        Prop p = net->props[id];             /* a copy: a custom run can add propagators */
+        net->running = id;
         run(net, &p);
+        net->running = NO_PROP;
         used++;
         net->runs++;
         if (net->contradicted) {

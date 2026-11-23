@@ -1,0 +1,15 @@
+// A plan that cannot work: 90 crates of 12.5 kg and a pallet of 25 kg are
+// 1150 kg, and the truck carries 1000 kg. The world reports the law that
+// cannot hold, with the values that it has.
+
+#Truck: #Phenomenon & {
+    crates:     %count & >=1
+    crate_mass: %mass
+    pallet:     %mass
+    load:       %mass
+    capacity:   %mass
+    total: .load == .crates * .crate_mass + .pallet
+    limit: .load <= .capacity
+}
+
+plan: #Truck & { crates: 90, crate_mass: 12.5kg, pallet: 25kg, capacity: 1000kg }

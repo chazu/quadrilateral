@@ -497,10 +497,20 @@ void test_net_less_equal(void)
     CHECK(qn_less_equal(net, a, other, false, &why) == QN_ETYPE && why == Q_EKIND);
     CHECK(qn_less_equal(net, a, 9999, false, NULL) == QN_ECELL);
 
-    /* a contradiction: 6 <= 5 */
+    /* a contradiction: 6 <= 5. The network says which propagator found it. */
+    uint32_t culprit = 99;
+    CHECK(!qn_contradicted_by(net, &culprit) && culprit == 99);
     QnCell six = cell(net, 1, len, -3, iv(6000, 6000)), five = cell(net, 1, len, -3, iv(5000, 5000));
-    CHECK(qn_less_equal(net, six, five, false, NULL) == QN_OK);
+    CHECK(qn_less_equal(net, six, five, false, NULL) == QN_OK);          /* the sixth propagator: number 5 */
     CHECK(qn_propagate(net) == QN_CONTRADICTION);
+    CHECK(qn_contradicted_by(net, &culprit) && culprit == 5);
+    qn_free(net);
+
+    /* a tell from outside is not a propagator */
+    net = qn_new();
+    QnCell lone = cell(net, 1, len, -3, iv(1, 2));
+    CHECK(qn_tell(net, lone, iv(5, 6)) == QN_CONTRADICTION);
+    CHECK(qn_contradicted(net, NULL) && !qn_contradicted_by(net, &culprit));
     qn_free(net);
 
     /* 5 < 5 is a contradiction, and 5 <= 5 is not */
