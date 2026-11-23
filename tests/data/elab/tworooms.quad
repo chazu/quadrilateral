@@ -1,0 +1,6 @@
+// Two rooms at 303.15 K and 293.15 K, and a wall of 10 W/K between them: the
+// world of phase 4 (design section 9.2). The time constant is 500 s, and the
+// tolerance gives steps of 5 s.
+roomA: #LumpedRoom & { energy: 3031500J, capacity: 10000J/K }
+roomB: #LumpedRoom & { energy: 2931500J, capacity: 10000J/K }
+wall:  #ConductiveWall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 0.01 }

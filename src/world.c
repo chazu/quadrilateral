@@ -19,6 +19,7 @@ typedef struct {
     QInterval init;        /* the declared base; an instance's cell returns to it at an end */
     bool      host_only;   /* "<key>.alive": only the host writes it */
 } CellInfo;
+typedef struct { char *path; QnCell cell; } Alias;               /* qw_alias */
 typedef struct { char *port, *target; } Port;                   /* qw_connect */
 typedef struct { char *port; int model; char *target; } PortMap;   /* qw_port */
 typedef struct { uint32_t slot; QnCell cell; QInterval range; bool explicit_; } Assume;
@@ -91,6 +92,8 @@ struct QWorld {
     size_t     nkinds, capkinds;
     CellInfo  *cells;
     size_t     ncells, capcells;
+    Alias     *aliases;
+    size_t     naliases, capaliases;
     Phen      *phens;
     size_t     nphens, capphens;
     NarrowCtx **nctx;
@@ -467,7 +470,9 @@ void qw_free(QWorld *w)
         free(w->kinds[i].name);
     }
     for (size_t i = 0; i < w->ncells; i++) free(w->cells[i].path);
+    for (size_t i = 0; i < w->naliases; i++) free(w->aliases[i].path);
     for (size_t i = 0; i < w->nnctx; i++) free(w->nctx[i]);
+    free(w->aliases);
     free(w->bases);
     free(w->kinds);
     free(w->cells);
@@ -680,6 +685,11 @@ QwStatus qw_find(const QWorld *w, const char *path, QnCell *out)
             *out = (QnCell) i;
             return QW_OK;
         }
+    for (size_t i = 0; i < w->naliases; i++)
+        if (!strcmp(w->aliases[i].path, path)) {
+            *out = w->aliases[i].cell;
+            return QW_OK;
+        }
     return QW_ENAME;
 }
 
@@ -753,6 +763,23 @@ QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCel
 QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out)
 {
     return add_cell(w, path, kind, true, qi_top(), base, false, out);
+}
+
+QwStatus qw_alias(QWorld *w, const char *path, const char *cell)
+{
+    QnCell c, dup;
+    if (qw_find(w, cell, &c) != QW_OK) return fail(w, QW_ENAME, "alias '%s': no cell '%s'", path, cell);
+    const char *dot = strchr(path, '.');
+    QwPhen owner;
+    if (!dot || !dot[1] || !find_phen(w, path, (size_t) (dot - path), &owner))
+        return fail(w, QW_ENAME, "alias '%s' names no phenomenon", path);
+    if (owner != w->cells[c].owner)
+        return fail(w, QW_EOWNER, "alias '%s': the cell '%s' belongs to another phenomenon", path, w->cells[c].path);
+    if (qw_find(w, path, &dup) == QW_OK) return fail(w, QW_EDUP, "alias '%s': the path already exists", path);
+    if (!grow((void **) &w->aliases, &w->capaliases, w->naliases + 1, sizeof *w->aliases)) return QW_ENOMEM;
+    if (!(w->aliases[w->naliases].path = dupstr(path))) return QW_ENOMEM;
+    w->aliases[w->naliases++].cell = c;
+    return QW_OK;
 }
 
 QwStatus qw_connect(QWorld *w, QwPhen pid, const char *port, const char *target)

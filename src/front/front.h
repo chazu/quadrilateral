@@ -11,6 +11,10 @@
  * (types.c), feature structures and unification (fs.c), the quick check
  * (qc.c), and the load that unifies each declaration (resolve.c).
  *
+ * Stage 3 is the elaborator (elab.c): the result of a load to the IR of
+ * quad/ir.h (ADR 0016). ir.c has the text form of the IR, and instantiate.c
+ * builds a world from it.
+ *
  * The code comes from Triangle (bruggadung f425574), under ADR 0003. Each
  * file says what it changes.
  *
@@ -22,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "quad/ir.h"
 #include "quad/quantity.h"
 
 typedef const char *Sym;   /* interned in a Front; compare by pointer */
@@ -231,6 +236,13 @@ typedef struct {
 } ArithRec;
 typedef VEC(ArithRec) ArithVec;
 
+/* A reference record: the structure at `path` is a copy of the instance
+ * `inst`, or of its part at `sub`. `hot: roomA.west` gives (hot, roomA, west).
+ * A copy has no link to its source, so stage 3 reads these records to find
+ * the connections between phenomena (ADR 0016). */
+typedef struct { U32Vec path; Sym inst; U32Vec sub; } InstRef;
+typedef VEC(InstRef) InstRefVec;
+
 typedef struct QfNode QfNode;
 
 typedef struct {
@@ -249,6 +261,7 @@ typedef struct {
     int       xstate;                   /* 0 none, 1 in progress, 2 done */
     QfNode   *expansion;
     ArithVec  ariths;                   /* constraint records, own and inherited */
+    InstRefVec refs;                    /* reference records, own and inherited */
     Sym       home;                     /* the package it is declared in, or NULL (the root) */
     bool      isdisj;                   /* its subtypes are alternatives (TK_ALT) */
     VEC(Attr *) field_attrs;            /* parallel to own introduced features */
@@ -369,6 +382,7 @@ typedef struct {
     QfNode   *node;              /* its structure */
     VEC(TagPath) tags;           /* where each tag and reference stands */
     ArithVec  ariths;            /* its constraint records */
+    InstRefVec refs;             /* its reference records */
 } InstInfo;
 
 /* --- the front end -------------------------------------------------------------------- */
@@ -608,6 +622,23 @@ typedef struct { const ArithRec *rec; U32Vec prefix; } QfRecUse;
 typedef VEC(QfRecUse) QfRecUses;
 void     qf_records(const Front *f, const QfNode *root, const ArithVec *own, QfRecUses *out);
 void     qf_records_free(QfRecUses *v);
+
+/* Every reference record of a structure, with paths from its root: `own`
+ * (the records of an instance, or NULL), then the records of the type of
+ * each node. Free the result with qf_refs_free. */
+void     qf_refs(const Front *f, const QfNode *root, const InstRefVec *own, InstRefVec *out);
+void     qf_refs_free(InstRefVec *v);
+
+void     qf_sort_diags(Front *f);                        /* by location, then by message */
+
+/* --- the elaborator (elab.c, ir.c) ------------------------------------------------------------ */
+
+/* Makes the IR of a loaded content (ADR 0016). NULL if the content has an
+ * error: the diagnostics are in f->diags. The IR owns its memory, so it
+ * lives after the Front. */
+QIr     *qf_elaborate(Front *f, const QiOptions *opt);
+/* The kernel that source names, from `opt` or from the native kernels. NULL if none. */
+const QkKernel *qi_find_kernel(const QiOptions *opt, const char *name);
 
 QfNode  *type_expansion(QfOp *c, uint32_t t);            /* NULL while t is being expanded */
 QfNode  *type_instance(QfOp *c, uint32_t t, QfStore *a); /* a copy, or a lazy node */

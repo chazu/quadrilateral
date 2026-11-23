@@ -78,6 +78,13 @@ QwStatus qw_phenomenon(QWorld *w, const char *name, QwPhen *out);
 QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out);
 /* A set cell of an enumeration kind, with the mask of its possible atoms */
 QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out);
+/* A second path for the cell `cell`, in the same phenomenon. A port that is a
+ * view of the phenomenon's own state uses it: after
+ * qw_alias(w, "roomA.west.energy", "roomA.energy"), a connection to
+ * "roomA.west" reaches the room's cells. An alias is a name, not state:
+ * qw_hash does not cover it, and qw_cell_path gives the cell's first path. */
+QwStatus qw_alias(QWorld *w, const char *path, const char *cell);
+/* The cell at a path or at an alias */
 QwStatus qw_find(const QWorld *w, const char *path, QnCell *out);
 const char *qw_cell_path(const QWorld *w, QnCell c);
 QwStatus qw_connect(QWorld *w, QwPhen p, const char *port, const char *target);

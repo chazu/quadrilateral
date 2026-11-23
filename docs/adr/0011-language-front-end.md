@@ -18,7 +18,7 @@ Phases 1 to 5 built the semantic core as a C API: quantity types, propagators, e
 
 ### 2. The prelude
 
-A prelude defines the types that the elaborator recognizes: `#Phenomenon`, `#Port`, `#Interaction`, `#Model`, `#Reaction`, and `#Rule`. A kind is not a prelude type: a declaration with the prefix `%` declares it (ADR 0015). They are ordinary types, so an author specializes them by unification, for example `#WoodCombustion: #Combustion & {…}`. This keeps the decision that a process is a typed feature structure.
+A prelude defines the types that the elaborator recognizes: `#Phenomenon`, `#Port`, `#Interaction`, `#Model`, `#Reaction`, and `#Rule`. A kind is not a prelude type: a declaration with the prefix `%` declares it (ADR 0015). They are ordinary types, so an author specializes them by unification, for example `#WoodCombustion: #Combustion & {…}`. This keeps the decision that a process is a typed feature structure. The prelude types are in the package `quad`, and a law is a field with a name (ADR 0016).
 
 An illustrative sketch of the wall of design section 9.2. The syntax is not final.
 
@@ -38,7 +38,7 @@ An illustrative sketch of the wall of design section 9.2. The syntax is not fina
 #ThermalPort: #Port & #Thermal
 
 #LumpedRoom: #Phenomenon & #Thermal & {
-    laws: [ .energy == .capacity * .temperature ]
+    storage: .energy == .capacity * .temperature   // a law is a named field (ADR 0016)
     west: #ThermalPort & { temperature: .temperature, capacity: .capacity, energy: .energy }
 }
 

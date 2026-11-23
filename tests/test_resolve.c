@@ -809,7 +809,7 @@ void test_resolve_fixture(void)
     const QfNode *a = inst(f, "roomA");
     STR_EQ(node_text(f, a),
            "#LumpedRoom & { capacity: $1 & %capacity & 1000, door: \"open\", energy: $2 & %energy & 293150, "
-           "laws: [constraint, ...constraint] & { first: .energy == (.capacity * .temperature), rest: #Null }, "
+           "evaluator: text, laws: [constraint, ...constraint] & { first: .energy == (.capacity * .temperature), rest: #Null }, "
            "temperature: $3 & %temperature & 293.15, west: #ThermalPort & { capacity: $1, energy: $2, temperature: $3 } }");
     const QfNode *e = at(f, a, "energy");
     CHECK(e && e->lo == 293150000 && e->hi == 293150000);                       /* millijoules */
@@ -1453,4 +1453,84 @@ void test_prop_load_order(void)
         qf_free(f);
     }
     for (int i = 0; i < NFIX; i++) free(src[i]);
+}
+
+/* A reference record says where a structure holds a copy of an instance, or
+ * of a part of one (ADR 0016 section 3). */
+static const char *refs_text(Front *f, const char *name)
+{
+    static Buf out;
+    out.len = 0;
+    qf_buf_puts(&out, "");
+    uint32_t i = qf_instance(f, name);
+    if (i == QF_BOTTOM) return "no such instance";
+    InstRefVec refs = { 0 };
+    qf_refs(f, f->insts.v[i].node, &f->insts.v[i].refs, &refs);
+    VEC(char *) lines = { 0 };
+    for (size_t k = 0; k < refs.n; k++) {
+        Buf l = { 0 };
+        path_format(f, &l, refs.v[k].path.v, refs.v[k].path.n);
+        qf_buf_printf(&l, " = %s", refs.v[k].inst);
+        if (refs.v[k].sub.n) {
+            qf_buf_putc(&l, '.');
+            path_format(f, &l, refs.v[k].sub.v, refs.v[k].sub.n);
+        }
+        VEC_PUSH(lines, l.s);
+    }
+    for (size_t a = 0; a < lines.n; a++)             /* a small list: in the order of the text */
+        for (size_t b = a + 1; b < lines.n; b++)
+            if (strcmp(lines.v[b], lines.v[a]) < 0) { char *t = lines.v[a]; lines.v[a] = lines.v[b]; lines.v[b] = t; }
+    for (size_t k = 0; k < lines.n; k++) {
+        qf_buf_printf(&out, "%s%s", k ? "; " : "", lines.v[k]);
+        free(lines.v[k]);
+    }
+    VEC_FREE(lines);
+    qf_refs_free(&refs);
+    return out.s;
+}
+
+void test_reference_records(void)
+{
+    bool ok;
+    Front *f = load1(with_kinds("#Leg: { len: %length }\n"
+                                "#Table: { leg: #Leg, spare: #Leg, legs: [...#Leg] }\n"
+                                "#Room: { table: #Table, other: #Table }\n"
+                                "oak: #Leg & { len: 1m }\n"
+                                "t: #Table & { leg: oak, legs: [oak, #Leg & { len: 2m }] }\n"
+                                "u: #Table & { spare: t.leg, leg: t.legs[1] }\n"
+                                "r: #Room & { table: t, other: u }\n"
+                                "#OakTable: #Table & { spare: oak }\n"
+                                "#Den: #Room & { table: #OakTable }\n"
+                                "v: #OakTable & { leg: { len: 3m } }\n"
+                                "d: #Den\n"
+                                "#Nook: #Room & { other: #OakTable }\n"
+                                "n: #Nook\n"
+                                "plain: #Table & { leg: { len: 1m } }\n"),
+                     &ok);
+    CHECK(ok);
+    for (size_t i = 0; i < f->diags.n; i++) fprintf(stderr, "  %s\n", f->diags.v[i].msg);
+    if (ok) {
+        STR_EQ(refs_text(f, "oak"), "");
+        STR_EQ(refs_text(f, "plain"), "");
+        /* a whole instance, and an item of a list */
+        STR_EQ(refs_text(f, "t"), "leg = oak; legs.first = oak");
+        /* a path into an instance. A copy of a copy names the instance that the author wrote. */
+        STR_EQ(refs_text(f, "u"), "leg = t.legs.rest.first; spare = t.leg");
+        /* a copy holds the references below it, at their new paths */
+        STR_EQ(refs_text(f, "r"), "other = u; other.leg = t.legs.rest.first; other.spare = t.leg; table = t; "
+                                  "table.leg = oak; table.legs.first = oak");
+        /* a type that names an instance gives the reference to its instances, at the path of each node of the type */
+        STR_EQ(refs_text(f, "v"), "spare = oak");
+        STR_EQ(refs_text(f, "d"), "table.spare = oak");
+        STR_EQ(refs_text(f, "n"), "other.spare = oak");            /* at the first field of the structure */
+        uint32_t ot = type_lookup(f, qf_sym(f, "#OakTable")), den = type_lookup(f, qf_sym(f, "#Den"));
+        CHECK(f->types.v[ot].refs.n == 1 && f->types.v[den].refs.n == 0);
+        /* the text form of the load has the records, so the content hash covers them */
+        Buf dump = { 0 };
+        qf_dump(f, &dump);
+        CHECK(strstr(dump.s, "\n  reference at leg: t.legs.rest.first\n  reference at spare: t.leg\n") != NULL);
+        CHECK(strstr(dump.s, "\n  reference at spare: oak\n") != NULL);
+        qf_buf_free(&dump);
+    }
+    qf_free(f);
 }
