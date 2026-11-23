@@ -1291,16 +1291,16 @@ void test_elab_errors(void)
     STR_EQ(compile_error("#W: #Phenomenon & { e: %energy, c: %capacity, t: %temperature, rule: .e == .c * (.t + .c) }\n"
                          "w: #W & { e: 1J }\n"),
            "world.quad:1:73: error: the law .e == (.c * (.t + .c)) does not fit the kinds of its quantities: dimension "
-           "mismatch\n");
+           "mismatch (w.t is a %temperature, w.c is a %capacity)\n");
     STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, rule: .t == 2 * .t + 5m }\nw: #W\n"),
            "world.quad:1:47: error: the law .t == ((2 * .t) + 5m) does not fit the kinds of its quantities: dimension "
-           "mismatch\n");
+           "mismatch (w.t is a %temperature, an inner value is in K, an inner value is in m)\n");
     STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, rule: .t <= 5furlong }\nw: #W\n"),
            "world.quad:1:50: error: unknown unit 'furlong'\nworld.quad:2:4: error: cannot expand #W\n");
     STR_EQ(compile_error("#W: #Phenomenon & { e: %energy, c: %capacity, t: %temperature, rule: .e == .c + .t }\n"
                          "w: #W & { e: 1J }\n"),
            "world.quad:1:73: error: the law .e == (.c + .t) does not fit the kinds of its quantities: dimension "
-           "mismatch\n");
+           "mismatch (w.e is a %energy, w.c is a %capacity, w.t is a %temperature)\n");
     STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, door: \"open\" | \"closed\", rule: .t == .door }\nw: #W\n"),
            "world.quad:1:72: error: the law .t == .door uses w.door, which is a set of atoms: arithmetic needs quantities\n");
     STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, note: text, rule: .t == .note }\nw: #W\n"),
@@ -1355,4 +1355,95 @@ void test_elab_errors(void)
            "value is a point\n"
            "world.quad:3:1: error: a.size is a number with no kind and no dimension: a cell needs one, as in "
            "`size: %energy`\n");
+}
+
+/* --- the examples ------------------------------------------------------------------------------------ */
+
+/* Compiles the files of an example from examples/. NULL with the diagnostics on stderr. */
+static QIr *example(const char *first, const char *second)
+{
+    const char *names[2] = { first, second };
+    char *src[2] = { NULL, NULL };
+    char path[2][128];
+    size_t n = second ? 2 : 1;
+    for (size_t i = 0; i < n; i++) {
+        snprintf(path[i], sizeof path[i], "examples/%s", names[i]);
+        src[i] = read_file(path[i]);
+        CHECK(src[i] != NULL);
+        if (!src[i]) return NULL;
+    }
+    char *diag = NULL;
+    QIr *ir = qi_compile(names, (const char *const *) src, n, NULL, &diag);
+    CHECK(ir != NULL);
+    if (!ir) fprintf(stderr, "%s", diag);
+    free(diag);
+    for (size_t i = 0; i < n; i++) free(src[i]);
+    return ir;
+}
+
+/* Each example in examples/ compiles and gives the result that its text promises. */
+void test_examples(void)
+{
+    QIr *ir = example("ohm.quad", NULL);
+    QWorld *w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 0));
+        CHECK_I64(qw_get(w, "lamp.current").lo, 120);            /* 12 V / 100 ohm = 0.12 A */
+        CHECK_I64(qw_get(w, "lamp.current").hi, 120);
+        CHECK_I64(qw_get(w, "heater.voltage").lo, 50000);        /* 2 A × 25 ohm = 50 V */
+        CHECK_I64(qw_get(w, "heater.power").lo, 100000);
+        CHECK_I64(qw_get(w, "sensor.voltage").lo, 950);          /* 10 mA × 95 ohm */
+        CHECK_I64(qw_get(w, "sensor.voltage").hi, 2100);         /* 20 mA × 105 ohm */
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    ir = example("load.quad", NULL);
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 0));
+        CHECK_I64(qw_get(w, "van.crates").lo, 1);
+        CHECK_I64(qw_get(w, "van.crates").hi, 78);               /* (1000 kg - 25 kg) / 12.5 kg */
+        CHECK_I64(qw_get(w, "order.crate_mass").hi, 24375);      /* 975 kg / 40 */
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* the plan that cannot work: the network names the propagator, and the IR has its law */
+    ir = example("load-too-heavy.quad", NULL);
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        CHECK(qw_run(w, 0) == QW_ECONTRADICTION);
+        uint32_t prop = 0;
+        CHECK(qn_contradicted_by(qw_net(w), &prop) && prop < ir->nprops);
+        if (prop < ir->nprops) CHECK(!strcmp(ir->props[prop].name, "plan.total") || !strcmp(ir->props[prop].name, "plan.limit"));
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    ir = example("thermal.quad", "two-rooms.quad");
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 0));
+        CHECK_I64(qw_get(w, "wall.power").lo, 100000);           /* 10 W/K × 10 K */
+        int64_t total = qw_get(w, "living.energy").lo + qw_get(w, "cellar.energy").lo;
+        OK(qw_run(w, 1800000000));
+        CHECK_I64(qw_get(w, "living.energy").lo + qw_get(w, "cellar.energy").lo, total);
+        CHECK(qw_get(w, "wall.power").hi < 3000 && qw_get(w, "wall.power").lo > 2000);
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    ir = example("thermal.quad", "house.quad");
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 3600000000LL));
+        /* the heat goes from the kitchen to the outside: each room is colder than the room before it */
+        CHECK(qw_get(w, "kitchen.temperature").lo > qw_get(w, "hall.temperature").hi);
+        CHECK(qw_get(w, "hall.temperature").lo > qw_get(w, "bedroom.temperature").hi);
+        CHECK(qw_get(w, "bedroom.temperature").lo > qw_get(w, "outside.temperature").hi);
+        CHECK(qw_get(w, "outside.temperature").lo >= 273150000 && qw_get(w, "outside.temperature").hi < 273160000);
+    }
+    qw_free(w);
+    qi_free(ir);
 }

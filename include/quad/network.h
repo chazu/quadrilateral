@@ -134,6 +134,10 @@ QnStatus qn_propagate(QNet *net);
 void     qn_set_budget(QNet *net, uint64_t runs);
 uint64_t qn_runs(const QNet *net);   /* all propagator runs so far */
 bool     qn_contradicted(const QNet *net, QnCell *where);
+/* The propagator that ran when the contradiction came: its number in the
+ * order in which the propagators were added, from 0. False if the network has
+ * no contradiction, or if a tell outside a propagator made it. */
+bool     qn_contradicted_by(const QNet *net, uint32_t *propagator);
 
 /* --- epoch boundaries (non-monotonic) ------------------------------------- */
 

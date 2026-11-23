@@ -594,9 +594,23 @@ static bool fits(const QType *z, const QType *x, const QType *y, QiOp op, QStatu
     return false;
 }
 
-static void misfit(Law *l, QStatus why)
+/* A law with quantities that do not fit. The message names each quantity
+ * with its kind, so the author sees which one is wrong. */
+static void misfit(Law *l, QStatus why, uint32_t z, uint32_t a, uint32_t b)
 {
-    err(l->e, l->loc, "the law %s does not fit the kinds of its quantities: %s", l->law, q_status_str(why));
+    Elab *e = l->e;
+    Buf who = { 0 };
+    uint32_t cs[3] = { z, a, b };
+    for (int i = 0; i < 3; i++) {
+        if (cs[i] == QI_NONE) continue;
+        const QiCell *c = &e->cells.v[cs[i]];
+        const QiKind *k = &e->kinds.v[c->kind];
+        qf_buf_printf(&who, "%s%s is ", who.len ? ", " : "", c->derived ? "an inner value" : c->path);
+        if (k->anonymous) qf_buf_printf(&who, "in %s", k->dimension);
+        else qf_buf_printf(&who, "a %s", k->name);
+    }
+    err(e, l->loc, "the law %s does not fit the kinds of its quantities: %s (%s)", l->law, q_status_str(why), who.s);
+    qf_buf_free(&who);
 }
 
 /* A derived cell of a law (ADR 0018): the value of an inner expression, or
@@ -648,12 +662,12 @@ static uint32_t lower_arith(Law *l, const X *x, uint32_t z)
     if (z == QI_NONE) {
         QType t;
         why = op == QI_PRODUCT ? qtype_mul(&ta, &tb, &t) : op == QI_QUOTIENT ? qtype_div(&ta, &tb, &t) : qtype_sum(&ta, &tb, &t);
-        if (why) { misfit(l, why); return QI_NONE; }
+        if (why) { misfit(l, why, QI_NONE, a, b); return QI_NONE; }
         z = derived(l, &t, qi_top());
         if (z == QI_NONE) return QI_NONE;
     } else {
         QType tz = e->ctypes.v[z];
-        if (!fits(&tz, &ta, &tb, op, &why)) { misfit(l, why); return QI_NONE; }
+        if (!fits(&tz, &ta, &tb, op, &why)) { misfit(l, why, z, a, b); return QI_NONE; }
     }
     emit(l, op, z, a, b);
     return z;
@@ -718,7 +732,7 @@ static void lower(Elab *e, uint32_t phen, const QfRecUse *use)
                 if (b != QI_NONE) {
                     QType ta = e->ctypes.v[a], tb = e->ctypes.v[b];
                     QStatus why = Q_OK;
-                    if (!fits(&ta, &tb, NULL, QI_EQUAL, &why)) misfit(&l, why);
+                    if (!fits(&ta, &tb, NULL, QI_EQUAL, &why)) misfit(&l, why, QI_NONE, a, b);
                     else emit(&l, QI_EQUAL, a, b, QI_NONE);
                 }
             }
@@ -728,7 +742,7 @@ static void lower(Elab *e, uint32_t phen, const QfRecUse *use)
             if (b != QI_NONE) {
                 QType ta = e->ctypes.v[a], tb = e->ctypes.v[b];
                 QStatus why = Q_OK;
-                if (!fits(&ta, &tb, NULL, QI_LESS_EQUAL, &why)) misfit(&l, why);
+                if (!fits(&ta, &tb, NULL, QI_LESS_EQUAL, &why)) misfit(&l, why, QI_NONE, a, b);
                 else emit(&l, strict ? QI_LESS : QI_LESS_EQUAL, greater ? b : a, greater ? a : b, QI_NONE);
             }
         } else if (x->k == X_ARITH) {

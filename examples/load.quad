@@ -1,0 +1,18 @@
+// A load plan with limits. An inequality is a law too. The world finds the
+// limits that follow from the laws: here, how many crates fit.
+
+#Truck: #Phenomenon & {
+    crates:     %count & >=1
+    crate_mass: %mass
+    pallet:     %mass
+    load:       %mass
+    capacity:   %mass
+    total: .load == .crates * .crate_mass + .pallet
+    limit: .load <= .capacity
+}
+
+// How many crates of 12.5 kg fit on a truck for 1000 kg, with a pallet of 25 kg?
+van: #Truck & { crate_mass: 12.5kg, pallet: 25kg, capacity: 1000kg }
+
+// The other direction: 40 crates must fit. How heavy can one crate be?
+order: #Truck & { crates: 40, pallet: 25kg, capacity: 1000kg }

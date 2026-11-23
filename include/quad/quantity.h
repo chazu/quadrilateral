@@ -148,7 +148,8 @@ QStatus qp_div(int64_t a, int64_t b, const QConv *c, int64_t *out);
  *   term  := symbol [ "^" ["-"] digits ]
  *
  * The symbols are the SI base units (m kg s A K mol cd), the derived units
- * N, J, W, Pa and Hz, and the names of the world's declared base dimensions:
+ * N, J, W, Pa, Hz, C, V, ohm, F, H, S, T and Wb, and the names of the
+ * world's declared base dimensions:
  * names[i] is base dimension Q_NSI + i. Every term after "/" is negated.
  * Example: "kg m^2 s^-2" and "J" and "W s" are the same dimension. */
 QStatus q_parse_dim(const char *s, size_t len, const char *const *names, size_t nnames, QDim *out);
