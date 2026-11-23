@@ -608,3 +608,76 @@ void test_host_narrow(void)
     }
     narrow_misbehave = false;
 }
+
+/* An alias is a second path for a cell of the same phenomenon (ADR 0016). */
+void test_world_alias(void)
+{
+    Rooms plain = make_rooms(1, 303.15, 293.15, 10000, 10000, 10, 10000000);
+    OK(qw_attach(plain.w, plain.wall, qk_conduction()));
+
+    /* the same world, but the wall connects to a port of each room */
+    QWorld *w = qw_new(1, -6);
+    QwKind energy, temp, cap, cond, ratio;
+    QwPhen a, b, wall;
+    OK(qw_kind(w, "energy", "J", -3, true, &energy));
+    OK(qw_kind(w, "temperature", "K", -6, false, &temp));
+    OK(qw_kind(w, "capacity", "J/K", -3, false, &cap));
+    OK(qw_kind(w, "conductance", "W/K", -3, false, &cond));
+    OK(qw_kind(w, "ratio", "", -9, false, &ratio));
+    OK(qw_phenomenon(w, "roomA", &a));
+    OK(qw_phenomenon(w, "roomB", &b));
+    OK(qw_phenomenon(w, "wall", &wall));
+    const char *names[2] = { "roomA", "roomB" };
+    int64_t energies[2] = { 3031500000, 2931500000 };
+    for (int i = 0; i < 2; i++) {
+        const char *fields[3] = { "energy", "capacity", "temperature" };
+        QwKind kinds[3] = { energy, cap, temp };
+        QInterval bases[3] = { qi_point(energies[i]), qi_point(10000000), qi_top() };
+        QnCell c[3];
+        for (int k = 0; k < 3; k++) {
+            char path[64], alias[64];
+            snprintf(path, sizeof path, "%s.%s", names[i], fields[k]);
+            snprintf(alias, sizeof alias, "%s.west.%s", names[i], fields[k]);
+            OK(qw_cell(w, path, kinds[k], bases[k], &c[k]));
+            OK(qw_alias(w, alias, path));
+        }
+        CHECK(qn_product(qw_net(w), c[0], c[1], c[2], NULL) == QN_OK);
+    }
+    OK(qw_cell(w, "wall.conductance", cond, qi_point(10000), NULL));
+    OK(qw_cell(w, "wall.tolerance", ratio, qi_point(10000000), NULL));
+    OK(qw_connect(w, wall, "hot", "roomA.west"));
+    OK(qw_connect(w, wall, "cold", "roomB.west"));
+    OK(qw_attach(w, wall, qk_conduction()));
+
+    /* an alias is a name, not state: the hash is the hash of the world without aliases */
+    CHECK(qw_hash(w) == qw_hash(plain.w));
+    OK(qw_run(w, 1000000000));
+    OK(qw_run(plain.w, 1000000000));
+    CHECK(qw_hash(w) == qw_hash(plain.w));
+    CHECK_I64((int64_t) qw_boundaries(w), 200);
+
+    QnCell direct, through;
+    OK(qw_find(w, "roomA.energy", &direct));
+    OK(qw_find(w, "roomA.west.energy", &through));
+    CHECK(direct == through);
+    CHECK(!strcmp(qw_cell_path(w, through), "roomA.energy"));
+    CHECK_I64(qw_get(w, "roomA.west.temperature").lo, qw_get(w, "roomA.temperature").lo);
+    /* an input through an alias changes the cell */
+    OK(qw_input(w, "roomA.west.capacity", qi_point(20000000)));
+    CHECK_I64(qw_get(w, "roomA.capacity").lo, 20000000);
+    CHECK(qw_input(w, "roomA.west.energy", qi_point(5)) == QW_ESTOCK);
+
+    CHECK(qw_alias(w, "roomA.west.energy", "roomA.energy") == QW_EDUP);       /* the alias exists */
+    CHECK(qw_alias(w, "roomA.capacity", "roomA.energy") == QW_EDUP);          /* the path of a cell */
+    CHECK(qw_alias(w, "roomA.other", "roomA.missing") == QW_ENAME);
+    CHECK(strstr(qw_error(w), "roomA.missing") != NULL);
+    CHECK(qw_alias(w, "nowhere.x", "roomA.energy") == QW_ENAME);
+    CHECK(qw_alias(w, "roomA", "roomA.energy") == QW_ENAME);
+    CHECK(qw_alias(w, "roomB.stolen", "roomA.energy") == QW_EOWNER);          /* a view stays in its phenomenon */
+    CHECK(qw_alias(w, "roomA.again", "roomA.west.energy") == QW_OK);          /* an alias of an alias names the cell */
+    OK(qw_find(w, "roomA.again", &through));
+    CHECK(direct == through);
+    CHECK(qw_cell(w, "roomA.again", energy, qi_point(0), NULL) == QW_EDUP);   /* a cell cannot take the path of an alias */
+    qw_free(w);
+    qw_free(plain.w);
+}

@@ -18,10 +18,21 @@
  *     comprehensions and functions (quad-ijx.9), and text constraints and
  *     interpolation (quad-ijx.11) are errors that name their issue. */
 
+/* The prelude: the types that the front end knows (ADR 0011 section 2).
+ * The list types are in the root. #Phenomenon and #Port, which the
+ * elaborator of stage 3 recognizes, are in the package `quad` (ADR 0016), so
+ * their labels stay free for the content. The other prelude types come with
+ * their stages. */
 static const char *prelude =
     "#List: {}\n"
     "#Cons: #List & { first: _, rest: #List }\n"
     "#Null: #List\n";
+static const char *prelude_quad =
+    "package quad\n"
+    "#Phenomenon: { evaluator: text }\n"
+    "#Port: {}\n";
+#define PRELUDE_FILE "<prelude>"
+#define PRELUDE_PKG  "quad"
 
 static Loc noloc;
 
@@ -38,6 +49,7 @@ typedef struct {
     uint32_t owner;  /* type whose body is being built, or QF_BOTTOM */
     size_t decl;     /* which of its declarations */
     ArithVec ariths; /* constraint records met while building; tags resolved afterwards */
+    InstRefVec refs; /* reference records met while building */
     uint32_t ctx1;   /* the type a struct's labels are written against (T & { … }), + 1; 0: none */
 } Build;
 
@@ -96,6 +108,7 @@ static void build_free(Build *b)
     VEC_FREE(b->tags);
     VEC_FREE(b->path);
     free_ariths(&b->ariths);
+    qf_refs_free(&b->refs);
 }
 
 static void reset_failure(QfOp *c)
@@ -217,6 +230,41 @@ static void include_ariths(Build *b, const InstInfo *ri)
     }
 }
 
+/* The reference record of a copy of an instance, or of its part at `sub`,
+ * that stands at the current path. The copy also holds a copy of each
+ * reference that the instance has below `sub`. */
+static void include_refs(Build *b, const InstInfo *ri, const uint32_t *sub, size_t nsub)
+{
+    InstRef r = { { 0 }, ri->name, { 0 } };
+    for (size_t k = 0; k < b->path.n; k++) VEC_PUSH(r.path, b->path.v[k]);
+    for (size_t k = 0; k < nsub; k++) VEC_PUSH(r.sub, sub[k]);
+    VEC_PUSH(b->refs, r);
+    for (size_t i = 0; i < ri->refs.n; i++) {
+        const InstRef *src = &ri->refs.v[i];
+        /* a reference at `sub` itself says what the part is a copy of: this record replaces it */
+        if (src->path.n <= nsub || (nsub && memcmp(src->path.v, sub, nsub * sizeof(uint32_t)))) continue;
+        InstRef in = { { 0 }, src->inst, { 0 } };
+        for (size_t k = 0; k < b->path.n; k++) VEC_PUSH(in.path, b->path.v[k]);
+        for (size_t k = nsub; k < src->path.n; k++) VEC_PUSH(in.path, src->path.v[k]);
+        for (size_t k = 0; k < src->sub.n; k++) VEC_PUSH(in.sub, src->sub.v[k]);
+        VEC_PUSH(b->refs, in);
+    }
+}
+
+static void copy_ref(InstRefVec *dst, const InstRef *src)
+{
+    for (size_t i = 0; i < dst->n; i++) {        /* through two parents: once */
+        const InstRef *d = &dst->v[i];
+        if (d->inst == src->inst && d->path.n == src->path.n && d->sub.n == src->sub.n &&
+            (!d->path.n || !memcmp(d->path.v, src->path.v, d->path.n * sizeof(uint32_t))) &&
+            (!d->sub.n || !memcmp(d->sub.v, src->sub.v, d->sub.n * sizeof(uint32_t)))) return;
+    }
+    InstRef r = { { 0 }, src->inst, { 0 } };
+    for (size_t k = 0; k < src->path.n; k++) VEC_PUSH(r.path, src->path.v[k]);
+    for (size_t k = 0; k < src->sub.n; k++) VEC_PUSH(r.sub, src->sub.v[k]);
+    VEC_PUSH(*dst, r);
+}
+
 /* A path into another declaration, as in wrench_19.size or #Wrench.size: a
  * copy of the declaration, at the path. The longest prefix that names a type
  * or an instance is the declaration, so a package's names come first. */
@@ -233,6 +281,8 @@ static QfNode *name_path(Build *b, X *x)
         QfNode *node = NULL;
         uint32_t t = type_lookup(f, name);
         uint64_t v;
+        uint32_t from = QF_BOTTOM;               /* the instance that the path goes into */
+        U32Vec sub = { 0 };
         if (t != QF_BOTTOM && f->types.v[t].kind != TK_ATOM) {
             QfNode *e = type_expansion(c, t);
             if (!e) { build_error(b, x->loc, "cannot expand %s", name); return NULL; }
@@ -243,6 +293,7 @@ static QfNode *name_path(Build *b, X *x)
                 return NULL;
             }
             node = copy_raw(c, &c->scratch, f->insts.v[v - 1].node);
+            from = (uint32_t) v - 1;
         } else continue;
         /* the rest: .name and [k] */
         for (const char *p = s + end; *p && node;) {
@@ -252,6 +303,7 @@ static QfNode *name_path(Build *b, X *x)
                 char msg[600];
                 snprintf(msg, sizeof msg, "%s is a value, with no fields (in %s)", name, s);
                 build_error(b, x->loc, "%s", msg);
+                VEC_FREE(sub);
                 return NULL;
             }
             if (*p == '.') {
@@ -265,8 +317,10 @@ static QfNode *name_path(Build *b, X *x)
                     char msg[600];
                     snprintf(msg, sizeof msg, "%s has no field %s (in %s)", name, seg, s);
                     build_error(b, x->loc, "%s", msg);
+                    VEC_FREE(sub);
                     return NULL;
                 }
+                VEC_PUSH(sub, ft);
                 node = next;
             } else {
                 long k = strtol(p + 1, NULL, 10);
@@ -279,12 +333,16 @@ static QfNode *name_path(Build *b, X *x)
                         char msg[600];
                         snprintf(msg, sizeof msg, "%s has no item %ld (in %s)", name, k, s);
                         build_error(b, x->loc, "%s", msg);
+                        VEC_FREE(sub);
                         return NULL;
                     }
+                    VEC_PUSH(sub, i == k ? f->ffirst : f->frest);
                     node = next;
                 }
             }
         }
+        if (node && from != QF_BOTTOM) include_refs(b, &f->insts.v[from], sub.v, sub.n);
+        VEC_FREE(sub);
         return node;
     }
     return NULL;
@@ -541,6 +599,7 @@ static QfNode *build_raw(Build *b, X *x)
             }
             /* a name unifies a copy of its constraints, its records among them */
             include_ariths(b, &f->insts.v[v - 1]);
+            include_refs(b, &f->insts.v[v - 1], NULL, 0);
             return copy_raw(c, &c->scratch, f->insts.v[v - 1].node);
         }
         if (strchr(x->u.name, '.') || strchr(x->u.name, '[')) {
@@ -994,6 +1053,11 @@ QfNode *type_expansion(QfOp *c, uint32_t t)
             const ArithVec *pa = &f->types.v[ti->parents.v[k]].ariths;
             for (size_t i = 0; i < pa->n; i++) copy_arith(&ti->ariths, &pa->v[i]);
         }
+        for (size_t i = 0; i < b.refs.n; i++) copy_ref(&ti->refs, &b.refs.v[i]);
+        for (size_t k = 0; k < ti->parents.n; k++) {
+            const InstRefVec *pr = &f->types.v[ti->parents.v[k]].refs;
+            for (size_t i = 0; i < pr->n; i++) copy_ref(&ti->refs, &pr->v[i]);
+        }
     }
     build_free(&b);
 
@@ -1073,6 +1137,7 @@ static bool inst_build(QfOp *c, uint32_t i)
                 VEC_PUSH(in->tags, tp);
             }
             if (!resolve_ariths(&b, pat, &in->ariths, in->name)) b.ok = false;
+            for (size_t q = 0; q < b.refs.n; q++) copy_ref(&in->refs, &b.refs.v[q]);
         }
     } else {
         b.ok = false;
@@ -1105,8 +1170,10 @@ static Sym qualify(Front *c, Sym pkg, Sym name)
 }
 
 /* A plain name means the package's own if it declares one, else the root's,
- * else the one package's that declares it; where two do and neither is the
- * package's or the root's, it stays plain, and is unknown. */
+ * else the prelude's, else the one package's that declares it; where two do
+ * and none of the above has it, it stays plain, and is unknown. So a package
+ * that declares its own #Phenomenon does not take the prelude's name from
+ * the other packages. */
 static Sym resolve_plain(Front *c, Sym name, Sym pkg, const U64Map *declared, const U64Map *root)
 {
     if (pkg) {
@@ -1114,6 +1181,8 @@ static Sym resolve_plain(Front *c, Sym name, Sym pkg, const U64Map *declared, co
         if (u64map_get(declared, (uint64_t) (uintptr_t) q, NULL)) return q;
     }
     if (u64map_get(root, (uint64_t) (uintptr_t) name, NULL) || qf_builtin_kind(name)) return name;
+    Sym pq = qualify(c, qf_sym(c, PRELUDE_PKG), name);
+    if (u64map_get(declared, (uint64_t) (uintptr_t) pq, NULL)) return pq;
     uint64_t v;
     if (u64map_get(&c->plainidx, (uint64_t) (uintptr_t) name, &v) && v != PLAIN_AMBIGUOUS) return (Sym) (uintptr_t) v;
     return name;
@@ -1390,6 +1459,29 @@ static void dump_records(const Front *f, Buf *b, const ArithVec *v)
     VEC_FREE(lines);
 }
 
+/* The reference records of one owner, as sorted lines. */
+static void dump_refs(const Front *f, Buf *b, const InstRefVec *v)
+{
+    VEC(char *) lines = { 0 };
+    for (size_t i = 0; i < v->n; i++) {
+        Buf l = { 0 };
+        qf_buf_puts(&l, "  reference at ");
+        path_format(f, &l, v->v[i].path.v, v->v[i].path.n);
+        qf_buf_printf(&l, ": %s", v->v[i].inst);
+        if (v->v[i].sub.n) {
+            qf_buf_putc(&l, '.');
+            path_format(f, &l, v->v[i].sub.v, v->v[i].sub.n);
+        }
+        VEC_PUSH(lines, l.s);
+    }
+    if (lines.n) qsort(lines.v, lines.n, sizeof(char *), cmp_strp);
+    for (size_t i = 0; i < lines.n; i++) {
+        qf_buf_printf(b, "%s\n", lines.v[i]);
+        free(lines.v[i]);
+    }
+    VEC_FREE(lines);
+}
+
 void qf_dump(const Front *f, Buf *b)
 {
     static const char *const rounding[] = { "half-even", "floor", "ceiling", "zero" };
@@ -1416,6 +1508,7 @@ void qf_dump(const Front *f, Buf *b)
         if (ti->expansion) qf_node_print(f, b, ti->expansion);
         qf_buf_putc(b, '\n');
         dump_records(f, b, &ti->ariths);
+        dump_refs(f, b, &ti->refs);
     }
     for (uint32_t ft = 0; ft < f->feats.n; ft++)
         qf_buf_printf(b, "feature %s of %s\n", f->feats.v[ft].full, f->types.v[f->feats.v[ft].intro].name);
@@ -1428,6 +1521,7 @@ void qf_dump(const Front *f, Buf *b)
         if (is[i]->node) qf_node_print(f, b, is[i]->node);
         qf_buf_putc(b, '\n');
         dump_records(f, b, &is[i]->ariths);
+        dump_refs(f, b, &is[i]->refs);
     }
     free(is);
 }
@@ -1472,6 +1566,50 @@ void qf_records_free(QfRecUses *v)
     VEC_FREE(*v);
 }
 
+/* --- the references of a structure ---------------------------------------------------------------- */
+
+static void refs_walk(const Front *f, const QfNode *n, U32Vec *path, U64Map *seen, InstRefVec *out)
+{
+    uint64_t k = (uint64_t) (uintptr_t) n;
+    if (u64map_get(seen, k, NULL)) return;       /* a shared node: its first path */
+    u64map_put(seen, k, 1);
+    const InstRefVec *v = &f->types.v[n->type].refs;
+    for (size_t i = 0; i < v->n; i++) {
+        InstRef r = { { 0 }, v->v[i].inst, { 0 } };
+        for (size_t p = 0; p < path->n; p++) VEC_PUSH(r.path, path->v[p]);
+        for (size_t p = 0; p < v->v[i].path.n; p++) VEC_PUSH(r.path, v->v[i].path.v[p]);
+        for (size_t p = 0; p < v->v[i].sub.n; p++) VEC_PUSH(r.sub, v->v[i].sub.v[p]);
+        copy_ref(out, &r);
+        VEC_FREE(r.path);
+        VEC_FREE(r.sub);
+    }
+    if (n->flags & NF_VALUE) return;
+    for (uint32_t i = 0; i < n->narcs; i++) {
+        VEC_PUSH(*path, n->arcs[i].feat);
+        refs_walk(f, n->arcs[i].val, path, seen, out);
+        path->n--;
+    }
+}
+
+void qf_refs(const Front *f, const QfNode *root, const InstRefVec *own, InstRefVec *out)
+{
+    for (size_t i = 0; own && i < own->n; i++) copy_ref(out, &own->v[i]);
+    U32Vec path = { 0 };
+    U64Map seen = { 0 };
+    refs_walk(f, root, &path, &seen, out);
+    VEC_FREE(path);
+    u64map_free(&seen);
+}
+
+void qf_refs_free(InstRefVec *v)
+{
+    for (size_t i = 0; i < v->n; i++) {
+        VEC_FREE(v->v[i].path);
+        VEC_FREE(v->v[i].sub);
+    }
+    VEC_FREE(*v);
+}
+
 /* --- loading ----------------------------------------------------------------------------------- */
 
 static int cmp_diag(const void *a, const void *b)
@@ -1482,6 +1620,11 @@ static int cmp_diag(const void *a, const void *b)
     if (x->loc.line != y->loc.line) return x->loc.line - y->loc.line;
     if (x->loc.col != y->loc.col) return x->loc.col - y->loc.col;
     return strcmp(x->msg, y->msg);
+}
+
+void qf_sort_diags(Front *f)
+{
+    if (f->diags.n) qsort(f->diags.v, f->diags.n, sizeof(Diag), cmp_diag);
 }
 
 static bool resolve(Front *c)
@@ -1510,11 +1653,23 @@ bool qf_load(Front *c, const char *const *names, const char *const *sources, siz
         qf_diag(c, true, noloc, "this front end already has a content: a load happens once");
         return false;
     }
-    bool ok = qf_parse(c, "<prelude>", prelude, &c->decls);
+    bool ok = qf_parse(c, PRELUDE_FILE, prelude, &c->decls);
+    ok &= qf_parse(c, PRELUDE_FILE, prelude_quad, &c->decls);
+    size_t own = c->decls.n;
     for (size_t i = 0; i < n; i++) ok &= qf_parse(c, names[i], sources[i], &c->decls);
+    /* the package of the prelude has only the prelude's declarations */
+    Sym quad = qf_sym(c, PRELUDE_PKG);
+    Sym said = NULL;
+    for (size_t i = own; i < c->decls.n; i++) {
+        const Decl *d = &c->decls.v[i];
+        if (d->pkg != quad || d->loc.file == said) continue;
+        said = d->loc.file;
+        qf_diag(c, true, d->loc, "the package quad is the prelude: a content cannot declare in it");
+        ok = false;
+    }
     ok = ok && resolve(c);
     c->loaded = true;            /* also after an error: the content does not change again */
-    if (c->diags.n) qsort(c->diags.v, c->diags.n, sizeof(Diag), cmp_diag);
+    qf_sort_diags(c);
     return ok;
 }
 
