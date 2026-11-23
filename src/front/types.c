@@ -13,7 +13,6 @@
  * after load use op_meet, which keeps its cache in the operation's context. */
 
 static Loc noloc;
-static Loc field_decl_loc(Front *c, uint32_t t, Sym label);
 
 uint32_t type_lookup(const Front *c, Sym name)
 {
@@ -124,7 +123,7 @@ static Sym qualified_name(Front *c, Sym pkg, Sym name)
     return q;
 }
 
-typedef struct { Sym label; Sym pkg; uint32_t intro; } NewFeat;
+typedef struct { Sym label; Sym pkg; U32Vec intros; } NewFeat;
 typedef struct { uint32_t type; uint32_t label; Sym pkg; } DeclPair;
 
 static int cmp_newfeat(const void *a, const void *b)
@@ -134,6 +133,23 @@ static int cmp_newfeat(const void *a, const void *b)
     if (r) return r;
     if (!x->pkg || !y->pkg) return x->pkg ? 1 : y->pkg ? -1 : 0;
     return strcmp(x->pkg, y->pkg);
+}
+
+/* t is below a type that introduces f: t has the field. */
+static bool below_intro(const Front *c, uint32_t t, uint32_t f)
+{
+    const U32Vec *in = &c->feats.v[f].intros;
+    for (size_t i = 0; i < in->n; i++)
+        if (is_subtype(c, t, in->v[i])) return true;
+    return false;
+}
+
+bool introduces(const Front *c, uint32_t t, uint32_t f)
+{
+    const U32Vec *in = &c->feats.v[f].intros;
+    for (size_t i = 0; i < in->n; i++)
+        if (in->v[i] == t) return true;
+    return false;
 }
 
 uint32_t feat_resolve(const Front *c, Sym label, uint32_t ctx, Sym pkg, bool *ambiguous)
@@ -150,7 +166,7 @@ uint32_t feat_resolve(const Front *c, Sym label, uint32_t ctx, Sym pkg, bool *am
     if (ctx != QF_BOTTOM && ctx < c->types.n) {
         uint32_t found = QF_BOTTOM, n = 0;
         for (uint32_t f = first; f < end; f++)
-            if (is_subtype(c, ctx, c->feats.v[f].intro)) { found = f; n++; }
+            if (below_intro(c, ctx, f)) { found = f; n++; }
         if (n == 1) return found;
     }
     /* else the package's own, else the root's */
@@ -163,34 +179,6 @@ uint32_t feat_resolve(const Front *c, Sym label, uint32_t ctx, Sym pkg, bool *am
 bool label_names(const Front *c, Sym label, uint32_t f)
 {
     return f < c->feats.n && (label == c->feats.v[f].label || label == c->feats.v[f].full);
-}
-
-/* Two unrelated types of one package (or of the root) introduce one label. */
-static void report_introducers(Front *c, Sym label, const U32Vec *minimal)
-{
-    Buf b = { 0 };
-    Loc first = noloc;
-    for (size_t i = 0; i < minimal->n; i++) {
-        Loc fl = field_decl_loc(c, minimal->v[i], label);
-        if (!i) first = fl;
-        qf_buf_printf(&b, "%s%s (%s:%d)", i ? " and " : "", c->types.v[minimal->v[i]].name, fl.file ? fl.file : "?", fl.line);
-    }
-    /* the most specific named common supertype: IDs follow topological order */
-    uint32_t common = QF_BOTTOM;
-    for (uint32_t u = 0; u < c->types.n; u++) {
-        if (c->types.v[u].kind != TK_DEF) continue;
-        bool all = true;
-        for (size_t i = 0; i < minimal->n && all; i++) all = is_subtype(c, minimal->v[i], u);
-        if (all) common = u;
-    }
-    Buf hint = { 0 };
-    if (common != QF_BOTTOM) qf_buf_printf(&hint, "on %s, which both inherit from", c->types.v[common].name);
-    else qf_buf_printf(&hint, "on a new common supertype (say #Has%c%s)", (char) (label[0] >= 'a' && label[0] <= 'z' ? label[0] - 32 : label[0]),
-                    label + 1);
-    qf_diag(c, true, first.file ? first : c->types.v[minimal->v[0]].decls.v[0]->loc,
-         "feature '%s' is introduced by both %s; declare it once %s, and inherit it", label, b.s, hint.s);
-    qf_buf_free(&hint);
-    qf_buf_free(&b);
 }
 
 /* --- codes ----------------------------------------------------------------------- */
@@ -933,21 +921,6 @@ static uint32_t inst_get(Front *c, Sym name)
 }
 
 /* Where type t's own body declares a field, or its first declaration. */
-static Loc field_decl_loc(Front *c, uint32_t t, Sym label)
-{
-    TypeInfo *ti = &c->types.v[t];
-    for (size_t k = 0; k < ti->decls.n; k++) {
-        XPtrVec cj = { 0 };
-        conjuncts(ti->decls.v[k]->value, &cj);
-        for (size_t j = 0; j < cj.n; j++) {
-            if (cj.v[j]->k != X_STRUCT) continue;
-            for (int f = 0; f < cj.v[j]->u.st.n; f++)
-                if (cj.v[j]->u.st.fields[f].label == label) { Loc l = cj.v[j]->u.st.fields[f].loc; VEC_FREE(cj); return l; }
-        }
-        VEC_FREE(cj);
-    }
-    return ti->decls.n ? ti->decls.v[0]->loc : noloc;
-}
 
 /* --- disjunctions of structures ------------------------------------------------------------ */
 
@@ -977,9 +950,10 @@ static int alt_siblings_declaring(Front *c, uint32_t d, Sym lab)
     return n;
 }
 
-/* The types an alternative is known to lie below: its named conjuncts, and for
- * each field of its structure, the most general named type declaring it. */
-static void alt_bases(Front *c, X *a, U64Map *declarers, U32Vec *out)
+/* The types an alternative is known to lie below: its named conjuncts. A
+ * structure in an alternative declares its own fields. It does not get a
+ * supertype from a named type that declares the same field (ADR 0017). */
+static void alt_bases(Front *c, X *a, U32Vec *out)
 {
     XPtrVec cj = { 0 };
     conjuncts(a, &cj);
@@ -989,19 +963,7 @@ static void alt_bases(Front *c, X *a, U64Map *declarers, U32Vec *out)
             uint32_t t = type_lookup(c, x->u.name);
             if (t == QF_BOTTOM) qf_diag(c, true, x->loc, "unknown name %s", x->u.name);
             else VEC_PUSH(*out, t);
-        } else if (x->k == X_STRUCT) {
-            for (int f = 0; f < x->u.st.n; f++) {
-                uint64_t v;
-                if (!u64map_get(declarers, (uint64_t) (uintptr_t) x->u.st.fields[f].label, &v)) continue;
-                U32Vec *dv = (U32Vec *) (uintptr_t) v;
-                for (size_t i = 0; i < dv->n; i++) {
-                    bool minimal = true;
-                    for (size_t k = 0; k < dv->n && minimal; k++)
-                        if (k != i && is_subtype(c, dv->v[i], dv->v[k])) minimal = false;
-                    if (minimal) VEC_PUSH(*out, dv->v[i]);
-                }
-            }
-        } else if (x->k != X_TOP) {
+        } else if (x->k != X_STRUCT && x->k != X_TOP) {
             qf_diag(c, true, x->loc, "an alternative may conjoin only names and structures");
         }
     }
@@ -1066,33 +1028,6 @@ static void make_list_types(Front *c)
 static void make_disjunctions(Front *c)
 {
     if (!c->disjs.n) return;
-    /* fields declared by named types, by label */
-    U64Map declarers = { 0 };
-    VEC(U32Vec *) owned = { 0 };
-    for (uint32_t t = 0; t < c->types.n; t++) {
-        if (c->types.v[t].kind != TK_DEF) continue;
-        for (size_t k = 0; k < c->types.v[t].decls.n; k++) {
-            XPtrVec cj = { 0 };
-            conjuncts(c->types.v[t].decls.v[k]->value, &cj);
-            for (size_t j = 0; j < cj.n; j++) {
-                if (cj.v[j]->k != X_STRUCT) continue;
-                for (int f = 0; f < cj.v[j]->u.st.n; f++) {
-                    uint64_t key = (uint64_t) (uintptr_t) cj.v[j]->u.st.fields[f].label, v;
-                    U32Vec *dv;
-                    if (u64map_get(&declarers, key, &v)) dv = (U32Vec *) (uintptr_t) v;
-                    else {
-                        dv = qf_xcalloc(1, sizeof *dv);
-                        VEC_PUSH(owned, dv);
-                        u64map_put(&declarers, key, (uint64_t) (uintptr_t) dv);
-                    }
-                    bool dup = false;
-                    for (size_t q = 0; q < dv->n && !dup; q++) dup = dv->v[q] == t;
-                    if (!dup) VEC_PUSH(*dv, t);
-                }
-            }
-            VEC_FREE(cj);
-        }
-    }
     size_t nbefore = c->types.n;
     for (size_t i = 0; i < c->disjs.n; i++) {
         DisjInfo *d = &c->disjs.v[i];
@@ -1100,7 +1035,7 @@ static void make_disjunctions(Front *c)
         U32Vec *bases = qf_xcalloc(na, sizeof(U32Vec));
         bool simple = true;               /* every alternative is a bare name or atom */
         for (size_t k = 0; k < na; k++) {
-            alt_bases(c, d->altx.v[k], &declarers, &bases[k]);
+            alt_bases(c, d->altx.v[k], &bases[k]);
             if (d->altx.v[k]->k != X_NAME && d->altx.v[k]->k != X_ATOM) simple = false;
         }
         if (simple && !d->owner) {
@@ -1192,9 +1127,128 @@ static void make_disjunctions(Front *c)
         for (size_t k = 0; k < na; k++) VEC_FREE(bases[k]);
         free(bases);
     }
-    for (size_t i = 0; i < owned.n; i++) { VEC_FREE(*owned.v[i]); free(owned.v[i]); }
-    VEC_FREE(owned);
-    u64map_free(&declarers);
+}
+
+typedef VEC(DeclPair) DeclPairs;
+typedef struct { Sym label; Sym pkg; U32Vec types; } IntroGroup;
+typedef VEC(IntroGroup) IntroGroups;
+
+/* Each label that the body of a type declares, in `fnames`, and for each
+ * label the types that declare it, with the package of the declaring file. */
+static DeclPairs *label_declarers(Front *c, SymVec *fnames_out)
+{
+    /* features: introduced by the top-level fields of each type's own body */
+    SymVec fnames = { 0 };
+    VEC(DeclPair) declpairs = { 0 };      /* a type declaring a label, in a package's file */
+    U64Map labidx = { 0 };                /* label Sym → index into fnames + 1 */
+    U64Map altonly = { 0 };               /* labels only alternatives declare */
+    /* named types first; then alternatives, where a field several alternatives
+     * of one disjunction declare (and no named type does) is the disjunction's */
+    for (int pass = 0; pass < 2; pass++)
+    for (uint32_t t = 0; t < c->types.n; t++) {
+        TypeInfo *ti = &c->types.v[t];
+        if (ti->kind != (pass ? TK_ALT : TK_DEF)) continue;
+        for (size_t k = 0; k < ti->decls.n; k++) {
+            XPtrVec cj = { 0 };
+            conjuncts(ti->decls.v[k]->value, &cj);
+            for (size_t j = 0; j < cj.n; j++) {
+                X *x = cj.v[j];
+                if (x->k != X_STRUCT || x->u.st.refs) continue;     /* a reference's place introduces nothing */
+                if (pass) {
+                    for (int f = 0; f < x->u.st.n; f++) {
+                        Sym lab = x->u.st.fields[f].label;
+                        uint64_t li;
+                        if (strchr(lab, '.')) continue;     /* pkg.label narrows that package's */
+                        uint32_t declarer = t;
+                        if (!u64map_get(&labidx, (uint64_t) (uintptr_t) lab, &li)) {
+                            uint32_t d = ti->parents.v[0];
+                            if (alt_siblings_declaring(c, d, lab) >= 2) declarer = d;
+                            VEC_PUSH(fnames, lab);
+                            li = fnames.n;
+                            u64map_put(&labidx, (uint64_t) (uintptr_t) lab, li);
+                            u64map_put(&altonly, (uint64_t) (uintptr_t) lab, 1);
+                        } else if (u64map_get(&altonly, (uint64_t) (uintptr_t) lab, NULL) &&
+                                   alt_siblings_declaring(c, ti->parents.v[0], lab) >= 2) {
+                            declarer = ti->parents.v[0];
+                        }
+                        DeclPair dp = { declarer, (uint32_t) (li - 1), ti->decls.v[k]->pkg };
+                        VEC_PUSH(declpairs, dp);
+                    }
+                    continue;
+                }
+                for (int f = 0; f < x->u.st.n; f++) {
+                    Sym lab = x->u.st.fields[f].label;
+                    uint64_t li;
+                    if (strchr(lab, '.')) continue;         /* pkg.label narrows that package's */
+                    if (!u64map_get(&labidx, (uint64_t) (uintptr_t) lab, &li)) {
+                        VEC_PUSH(fnames, lab);
+                        li = fnames.n;
+                        u64map_put(&labidx, (uint64_t) (uintptr_t) lab, li);
+                    }
+                    DeclPair dp = { t, (uint32_t) (li - 1), ti->decls.v[k]->pkg };
+                    VEC_PUSH(declpairs, dp);
+                }
+            }
+            VEC_FREE(cj);
+        }
+    }
+    /* each label's declarers, by type and the package of the file that
+     * declares it there; the most general of them in a package introduces
+     * the label's feature there (CONTENT_LANGUAGE.md decision 12) */
+    DeclPairs *declarers = qf_xcalloc(fnames.n ? fnames.n : 1, sizeof *declarers);
+    for (size_t i = 0; i < declpairs.n; i++) {
+        DeclPair dp = declpairs.v[i];
+        bool dup = false;
+        for (size_t q = 0; q < declarers[dp.label].n && !dup; q++)
+            dup = declarers[dp.label].v[q].type == dp.type && declarers[dp.label].v[q].pkg == dp.pkg;
+        if (!dup) VEC_PUSH(declarers[dp.label], dp);
+    }
+    VEC_FREE(declpairs);
+    u64map_free(&labidx);
+    u64map_free(&altonly);
+    *fnames_out = fnames;
+    return declarers;
+}
+
+/* For each label and each package: the types that declare the label there
+ * and have no supertype that declares it. They introduce the feature. There
+ * can be several, because unrelated types can each have a field with the
+ * same name (ADR 0017). */
+static void intro_groups(Front *c, IntroGroups *out)
+{
+    SymVec fnames = { 0 };
+    DeclPairs *declarers = label_declarers(c, &fnames);
+    for (size_t li = 0; li < fnames.n; li++) {
+        DeclPair *d = declarers[li].v;
+        size_t nd = declarers[li].n;
+        /* a declaration narrows the field when a supertype declares it, or
+         * the type's own package does where another package adds to it */
+        bool *narrows = qf_xcalloc(nd ? nd : 1, sizeof(bool));
+        for (size_t i = 0; i < nd; i++)
+            for (size_t j = 0; j < nd && !narrows[i]; j++) {
+                if (i == j) continue;
+                if (d[j].type != d[i].type) narrows[i] = is_subtype(c, d[i].type, d[j].type);
+                else narrows[i] = d[j].pkg == type_pkg(c, d[i].type) && d[i].pkg != d[j].pkg;
+            }
+        bool *taken = qf_xcalloc(nd ? nd : 1, sizeof(bool));
+        for (size_t i = 0; i < nd; i++) {
+            if (taken[i] || narrows[i]) continue;
+            IntroGroup g = { fnames.v[li], d[i].pkg, { 0 } };
+            for (size_t j = i; j < nd; j++)
+                if (!taken[j] && !narrows[j] && d[j].pkg == g.pkg) {
+                    taken[j] = true;
+                    bool seen = false;
+                    for (size_t q = 0; q < g.types.n && !seen; q++) seen = g.types.v[q] == d[j].type;
+                    if (!seen) VEC_PUSH(g.types, d[j].type);
+                }
+            VEC_PUSH(*out, g);
+        }
+        free(taken);
+        free(narrows);
+        VEC_FREE(declarers[li]);
+    }
+    free(declarers);
+    VEC_FREE(fnames);
 }
 
 bool types_build(Front *c)
@@ -1476,121 +1530,27 @@ bool types_build(Front *c)
     for (uint32_t k = 0; k < c->kinds.n; k++) c->kinds.v[k].type = type_lookup(c, c->kinds.v[k].name);
     c->tbool = type_lookup(c, qf_sym(c, "bool"));
 
-    /* features: introduced by the top-level fields of each type's own body */
-    SymVec fnames = { 0 };
-    VEC(DeclPair) declpairs = { 0 };      /* a type declaring a label, in a package's file */
-    U64Map labidx = { 0 };                /* label Sym → index into fnames + 1 */
-    U64Map altonly = { 0 };               /* labels only alternatives declare */
-    /* named types first; then alternatives, where a field several alternatives
-     * of one disjunction declare (and no named type does) is the disjunction's */
-    for (int pass = 0; pass < 2; pass++)
-    for (uint32_t t = 0; t < c->types.n; t++) {
-        TypeInfo *ti = &c->types.v[t];
-        if (ti->kind != (pass ? TK_ALT : TK_DEF)) continue;
-        for (size_t k = 0; k < ti->decls.n; k++) {
-            XPtrVec cj = { 0 };
-            conjuncts(ti->decls.v[k]->value, &cj);
-            for (size_t j = 0; j < cj.n; j++) {
-                X *x = cj.v[j];
-                if (x->k != X_STRUCT || x->u.st.refs) continue;     /* a reference's place introduces nothing */
-                if (pass) {
-                    for (int f = 0; f < x->u.st.n; f++) {
-                        Sym lab = x->u.st.fields[f].label;
-                        uint64_t li;
-                        if (strchr(lab, '.')) continue;     /* pkg.label narrows that package's */
-                        uint32_t declarer = t;
-                        if (!u64map_get(&labidx, (uint64_t) (uintptr_t) lab, &li)) {
-                            uint32_t d = ti->parents.v[0];
-                            if (alt_siblings_declaring(c, d, lab) >= 2) declarer = d;
-                            VEC_PUSH(fnames, lab);
-                            li = fnames.n;
-                            u64map_put(&labidx, (uint64_t) (uintptr_t) lab, li);
-                            u64map_put(&altonly, (uint64_t) (uintptr_t) lab, 1);
-                        } else if (u64map_get(&altonly, (uint64_t) (uintptr_t) lab, NULL) &&
-                                   alt_siblings_declaring(c, ti->parents.v[0], lab) >= 2) {
-                            declarer = ti->parents.v[0];
-                        }
-                        DeclPair dp = { declarer, (uint32_t) (li - 1), ti->decls.v[k]->pkg };
-                        VEC_PUSH(declpairs, dp);
-                    }
-                    continue;
-                }
-                for (int f = 0; f < x->u.st.n; f++) {
-                    Sym lab = x->u.st.fields[f].label;
-                    uint64_t li;
-                    if (strchr(lab, '.')) continue;         /* pkg.label narrows that package's */
-                    if (!u64map_get(&labidx, (uint64_t) (uintptr_t) lab, &li)) {
-                        VEC_PUSH(fnames, lab);
-                        li = fnames.n;
-                        u64map_put(&labidx, (uint64_t) (uintptr_t) lab, li);
-                    }
-                    DeclPair dp = { t, (uint32_t) (li - 1), ti->decls.v[k]->pkg };
-                    VEC_PUSH(declpairs, dp);
-                }
-            }
-            VEC_FREE(cj);
-        }
-    }
-    /* each label's declarers, by type and the package of the file that
-     * declares it there; the most general of them in a package introduces
-     * the label's feature there (CONTENT_LANGUAGE.md decision 12) */
-    VEC(DeclPair) *declarers = qf_xcalloc(fnames.n ? fnames.n : 1, sizeof *declarers);
-    for (size_t i = 0; i < declpairs.n; i++) {
-        DeclPair dp = declpairs.v[i];
-        bool dup = false;
-        for (size_t q = 0; q < declarers[dp.label].n && !dup; q++)
-            dup = declarers[dp.label].v[q].type == dp.type && declarers[dp.label].v[q].pkg == dp.pkg;
-        if (!dup) VEC_PUSH(declarers[dp.label], dp);
-    }
-    VEC_FREE(declpairs);
-    u64map_free(&labidx);
-    u64map_free(&altonly);
+    /* features: the top-level fields of the body of a type declare them */
+    IntroGroups groups = { 0 };
+    intro_groups(c, &groups);
     VEC(NewFeat) made = { 0 };
-    for (size_t li = 0; li < fnames.n; li++) {
-        DeclPair *d = declarers[li].v;
-        size_t nd = declarers[li].n;
-        /* a declaration narrows the field when a supertype declares it, or
-         * the type's own package does where another package adds to it */
-        bool *narrows = qf_xcalloc(nd ? nd : 1, sizeof(bool));
-        for (size_t i = 0; i < nd; i++)
-            for (size_t j = 0; j < nd && !narrows[i]; j++) {
-                if (i == j) continue;
-                if (d[j].type != d[i].type) narrows[i] = is_subtype(c, d[i].type, d[j].type);
-                else narrows[i] = d[j].pkg == type_pkg(c, d[i].type) && d[i].pkg != d[j].pkg;
+    for (size_t gi = 0; gi < groups.n; gi++) {
+        IntroGroup *g = &groups.v[gi];
+        for (size_t i = 1; i < g->types.n; i++)          /* ascending */
+            for (size_t j = i; j > 0 && g->types.v[j - 1] > g->types.v[j]; j--) {
+                uint32_t x = g->types.v[j]; g->types.v[j] = g->types.v[j - 1]; g->types.v[j - 1] = x;
             }
-        /* by package: one introduces it there; two unrelated ones, an error */
-        bool *taken = qf_xcalloc(nd ? nd : 1, sizeof(bool));
-        for (size_t i = 0; i < nd; i++) {
-            if (taken[i] || narrows[i]) continue;
-            Sym pkg = d[i].pkg;
-            U32Vec same = { 0 };
-            for (size_t j = i; j < nd; j++)
-                if (!taken[j] && !narrows[j] && d[j].pkg == pkg) {
-                    taken[j] = true;
-                    bool seen = false;
-                    for (size_t q = 0; q < same.n && !seen; q++) seen = same.v[q] == d[j].type;
-                    if (!seen) VEC_PUSH(same, d[j].type);
-                }
-            if (same.n == 1) {
-                NewFeat nf = { fnames.v[li], pkg, same.v[0] };
-                VEC_PUSH(made, nf);
-            } else
-                report_introducers(c, fnames.v[li], &same);
-            VEC_FREE(same);
-        }
-        free(taken);
-        free(narrows);
-        VEC_FREE(declarers[li]);
+        NewFeat nf = { g->label, g->pkg, g->types };     /* the feature owns the list now */
+        VEC_PUSH(made, nf);
     }
-    free(declarers);
-    VEC_FREE(fnames);
+    VEC_FREE(groups);
     /* numbered by label, then package, the root's first */
     qsort(made.v, made.n, sizeof(NewFeat), cmp_newfeat);
     for (size_t i = 0; i < made.n; i++) {
         FeatInfo fi = { 0 };
         fi.label = made.v[i].label;
         fi.pkg = made.v[i].pkg;
-        fi.intro = made.v[i].intro;
+        fi.intros = made.v[i].intros;
         fi.full = fi.pkg ? qualified_name(c, fi.pkg, fi.label) : fi.label;
         VEC_PUSH(c->feats, fi);
         u64map_put(&c->featidx, (uint64_t) (uintptr_t) fi.full, i + 1);
@@ -1611,7 +1571,7 @@ bool types_build(Front *c)
 
     for (uint32_t t = 0; t < c->types.n; t++)
         for (uint32_t f = 0; f < c->feats.n; f++)
-            if (is_subtype(c, t, c->feats.v[f].intro)) VEC_PUSH(c->types.v[t].feats, f);
+            if (below_intro(c, t, f)) VEC_PUSH(c->types.v[t].feats, f);
 
     /* field attributes on each type's own fields */
     for (uint32_t t = 0; t < c->types.n; t++) {

@@ -593,6 +593,67 @@ void test_elab_named_laws(void)
     qi_free(ir);
 }
 
+/* Unrelated types can declare the same field, port or law (ADR 0017). */
+void test_elab_shared_fields(void)
+{
+    /* two wall types, each with its own ports, and two types with a law of one name */
+    QIr *ir = compile("roomA: #LumpedRoom & { energy: 3031500J, capacity: 10000J/K }\n"
+                      "roomB: #LumpedRoom & { energy: 2931500J, capacity: 10000J/K }\n"
+                      "#Pane: #Phenomenon & { hot: #ThermalPort, cold: #ThermalPort, shine: %ratio }\n"
+                      "#Tank: #Phenomenon & #Thermal & { storage: .energy == .capacity * .temperature }\n"
+                      "pane: #Pane & { hot: roomA.west, cold: roomB.west, shine: 0.5 }\n"
+                      "tank: #Tank & { energy: 5J, capacity: 1J/K }\n"
+                      "wall: #ConductiveWall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 0.01 }\n",
+                      NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "phenomenon pane: #Pane\n"
+                  "  cell pane.shine: %ratio = 0.5\n"
+                  "  port cold: #ThermalPort, connected to roomB.west\n"
+                  "  port hot: #ThermalPort, connected to roomA.west\n");
+        HAS(text, "    law tank.storage: .energy == (.capacity * .temperature)\n");
+        HAS(text, "    law roomA.storage: .energy == (.capacity * .temperature)\n");
+        HAS(text, "    link hot.energy = roomA.energy\n");
+        free(text);
+        /* the world is the two-room world, with two more phenomena that do not change it */
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 1000000000));
+            CHECK_I64((int64_t) qw_boundaries(w), 200);
+            CHECK_I64(qw_get(w, "tank.temperature").lo, 5000000);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* Two types give one field two enumerations. Each cell has the
+     * enumeration of its own type. */
+    ir = compile("#Gate: #Phenomenon & { state: \"open\" | \"closed\" }\n"
+                 "#Lamp: #Phenomenon & { state: \"on\" | \"off\" | \"dim\" }\n"
+                 "#Night: #Lamp & { state: \"off\" | \"dim\" }\n"
+                 "gate: #Gate & { state: \"open\" }\n"
+                 "lamp: #Lamp\n"
+                 "late: #Night\n",
+                 NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "enumeration \"closed\" | \"open\": closed open\n");
+        HAS(text, "enumeration \"dim\" | \"off\" | \"on\": dim off on\n");
+        HAS(text, "  cell gate.state: \"closed\" | \"open\" = open\n");
+        HAS(text, "  cell lamp.state: \"dim\" | \"off\" | \"on\" = dim | off | on\n");
+        HAS(text, "  cell late.state: \"dim\" | \"off\" | \"on\" = dim | off\n");      /* the enumeration of the supertype */
+        free(text);
+        CHECK(ir->nenums == 2);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            CHECK(qw_get_set(w, "gate.state") == 2);
+            CHECK(qw_get_set(w, "late.state") == 3);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+}
+
 /* --- data, and types that connect ------------------------------------------------------------------ */
 
 void test_elab_data_and_types(void)

@@ -64,7 +64,7 @@ Stage 2 of the front end (ADR 0011 section 3) builds the type hierarchy and unif
 
 ### 5. Structures, types, and equations
 
-- The type hierarchy, its completion with generated meet types, features, enums, disjunction types, typed lists, and packages work as in Triangle. A type introduces each feature, and a structure cannot have a feature that its type does not allow.
+- The type hierarchy, its completion with generated meet types, features, enums, disjunction types, typed lists, and packages work as in Triangle. A structure cannot have a feature that its type does not allow. The first version of this ADR also kept Triangle's rule that one type introduces each feature. ADR 0017 reversed that rule: unrelated types can each have a field with the same name.
 - The constraint of a type is its expansion: one structure, built once. An instance has one structure, which is the unification of its declarations and of the types that it names.
 - A struct states its type. In Triangle, a struct gets the type that introduces its fields, so `head: { size: .size }` silently becomes a full `#Tool`, with the laws and the stocks of that type. In Quadrilateral, the place where a struct stands must already have that type: the declared type of its field, the element type of its list, or a type or an instance that the author names with `&`. If the place has no type, or a less specific type, the struct is an error, and the message gives the type to write: `#Tool & { … }`. The order of the conjuncts and of the declarations does not count.
 - A reference is a path that the author wrote, so it can still go through a field with no type.
@@ -77,6 +77,7 @@ Stage 2 of the front end (ADR 0011 section 3) builds the type hierarchy and unif
 - Later, each in its own issue: comprehensions and built-in functions (`quad-ijx.9`), defaults and the variants of an instance (`quad-ijx.10`), and text constraints and interpolation (`quad-ijx.11`). Until then, each of these in source is an error that names the missing stage.
 - Not taken: Triangle's arithmetic settling (the propagator network does this work), `@vary` and random construction, derived fields, families, the TDL front end, component generation, and the fixed dimension table.
 - Matching with three results, and explanations of a match, are for stage 6.
+- Since ADR 0017, a structure that is an alternative of a disjunction is below only the types that it names. Triangle also puts it below each type that declares one of its fields.
 
 ### 7. An operation keeps its scratch in its own context
 
@@ -102,7 +103,7 @@ Stage 2 of the front end (ADR 0011 section 3) builds the type hierarchy and unif
 ## Considered options
 
 - **A struct gets its type from its fields, as in Triangle.** It is short to write. But the type comes with constraints that the author did not write, and two of the test contents of stage 2 had a wrong type that nobody saw. We rejected it.
-- **A generated supertype when two types declare one field.** The author would not need a type such as `#Thermal`. But one label could then be a quantity in one type and text in another, with no message. We rejected it: a type introduces each feature once, as in Triangle.
+- **A generated supertype when two types declare one field.** The author would not need a type such as `#Thermal`. But one label could then be a quantity in one type and text in another, with no message. We rejected it at first. ADR 0017 then removed the need: unrelated types can each have a field with the same name, and the compiler generates no supertype.
 - **A bare name for a kind, as in the sketch of ADR 0011: `energy: #Kind & {…}`.** It reads well and matches the design document. But the declaration looks like an instance and makes a type, the resolver must find kinds before the hierarchy exists, and a kind named `gold` takes that name from instances. We rejected it.
 - **A `#` type for a kind: `#Energy: #Kind & {…}`.** Then `x: #Energy` means a structure with a `dimension` field, but the value is a number. A kind declaration is data about a type, not a supertype. We rejected it.
 - **Exact decimals in every structure, and conversion to quanta in the elaborator.** The unifier would need no kinds. But ADR 0011 section 1 puts the conversion in the unifier, two kinds of one dimension would unify, and an inexact literal would be found late and far from its source. We rejected it.
@@ -119,7 +120,7 @@ Stage 2 of the front end (ADR 0011 section 3) builds the type hierarchy and unif
 - A temperature in degrees Celsius has an offset, and it is ambiguous for a temperature difference. Stage 2 has no unit with an offset. Source writes kelvin.
 - A unit with a factor that is not an exact decimal is rejected, also when the value of the literal is exact. Example: `3min^-1` is an error, although it is 0.05 in the dimension of the hertz. The rule is simple to state: a minute cannot be a divisor.
 - Constant arithmetic such as `2 * 500J/K` is a constraint record like every other expression. The world computes the value when it settles.
-- A type introduces each feature once, as in Triangle. The sketch of ADR 0011 declared `temperature`, `capacity`, and `energy` in the port and also in the room, and that is an error. One supertype, `#Thermal`, now declares them in the sketch.
+- The sketch of ADR 0011 declared `temperature`, `capacity`, and `energy` in the port and also in the room. Under the first version of this ADR that was an error, so one supertype, `#Thermal`, declares them in the sketch. Since ADR 0017 the supertype is a choice of the author.
 - The text of a dimension in a kind declaration and in a kernel contract still follows ADR 0009 section 10, where `"J/kg K"` is J/(kg·K). Only the unit of a literal rejects the form with two readings.
 - A world can declare 24 base dimensions, because the angle takes one of the 25.
 - A disjunction of numbers, such as `1m | 2m`, is an error in stage 2. Triangle accepts one that has no gaps.

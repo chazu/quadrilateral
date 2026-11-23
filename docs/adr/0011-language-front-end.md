@@ -27,8 +27,8 @@ An illustrative sketch of the wall of design section 9.2. The syntax is not fina
 %temperature: { dimension: "K",   scale: -6 }
 %capacity:    { dimension: "J/K", scale: -3 }
 
-// A type introduces each feature once (ADR 0015), so one supertype has the
-// three fields that the port and the room share.
+// The port and the room have the same three fields, with the same kinds, so
+// one supertype declares them.
 #Thermal: {
     temperature: %temperature   // an observation: intensive, read only
     capacity:    %capacity
