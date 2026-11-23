@@ -647,6 +647,11 @@ static void emit(Law *l, QiOp op, uint32_t z, uint32_t a, uint32_t b)
 
 static uint32_t cell_of(Law *l, const X *x);
 
+/* The limits of the scale of an inner value: at most 12 decimals, and for a
+ * quotient at least 6 decimals more than the default scale of its dimension. */
+#define DERIVED_FINEST (-12)
+#define DERIVED_DIGITS 6
+
 /* z = a op b for an expression. z is the cell of the result, or QI_NONE:
  * then a new derived cell is the result. The result, or QI_NONE with a diagnostic. */
 static uint32_t lower_arith(Law *l, const X *x, uint32_t z)
@@ -663,6 +668,17 @@ static uint32_t lower_arith(Law *l, const X *x, uint32_t z)
         QType t;
         why = op == QI_PRODUCT ? qtype_mul(&ta, &tb, &t) : op == QI_QUOTIENT ? qtype_div(&ta, &tb, &t) : qtype_sum(&ta, &tb, &t);
         if (why) { misfit(l, why, QI_NONE, a, b); return QI_NONE; }
+        /* The scale of an inner product or quotient (ADR 0018 section 3). The
+         * exact scale of a product is the sum of the scales, and a long
+         * product gets a scale so fine that no value fits. The exact scale of
+         * a quotient is the difference, which can be coarse. So the scale has
+         * limits, and the propagator rounds outward. */
+        if (op == QI_PRODUCT && t.scale < DERIVED_FINEST) t.scale = DERIVED_FINEST;
+        if (op == QI_QUOTIENT) {
+            int fine = qdim_default_scale(&t.dim, e->f->tick_scale) - DERIVED_DIGITS;
+            if (t.scale > fine) t.scale = (int8_t) fine;
+            if (t.scale < DERIVED_FINEST) t.scale = DERIVED_FINEST;
+        }
         z = derived(l, &t, qi_top());
         if (z == QI_NONE) return QI_NONE;
     } else {
