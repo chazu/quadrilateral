@@ -591,6 +591,14 @@ static bool check_expr(Build *b, const X *x, const X *parent)
                      "directly after the number with a negative exponent, for example 0.1%s^-1",
                      x->u.name, x->u.name, x->u.name, x->u.name);
             build_error(b, x->loc, "%s", msg);
+        } else if ((x->u.name[0] == '%' || strstr(x->u.name, ".%")) && qf_kind_lookup(f, x->u.name) == QF_BOTTOM) {
+            /* %energy / %time with a kind that the content does not declare */
+            char msg[400];
+            snprintf(msg, sizeof msg, "unknown kind %s. Declare it: %s: { dimension: \"J\" }", x->u.name, x->u.name);
+            build_error(b, x->loc, "%s", msg);
+        } else if (x->u.name[0] == '%' || strstr(x->u.name, ".%")) {
+            build_error(b, x->loc, "the kind %s stands in an expression with a value. A product or a quotient of kinds, "
+                        "such as %%energy / %%time, has kinds only", x->u.name);
         } else {
             build_error(b, x->loc, "the name '%s' cannot stand in an expression: a value of the structure is a "
                         "reference, for example .size", x->u.name);
@@ -776,7 +784,16 @@ static QfNode *build_raw(Build *b, X *x)
     case X_CMP: case X_LOGIC: case X_NOT: {
         /* a comparison that stands as a value: laws: [ .e == .c * .t ] */
         if (!record_arith(b, x)) return NULL;
-        int64_t q = (int64_t) (intptr_t) x;
+        /* Two comparisons with the same text are the same value, so one law
+         * that two declarations state unifies with itself. */
+        char *text = x_text(x);
+        uint64_t key = (uint64_t) (uintptr_t) qf_sym(f, text), v;
+        free(text);
+        if (!u64map_get(&f->cmpidx, key, &v)) {
+            v = (uint64_t) (uintptr_t) x;
+            u64map_put(&f->cmpidx, key, v);
+        }
+        int64_t q = (int64_t) v;
         return leaf_new(c, &c->scratch, f->tconstraint, q, q);
     }
     case X_CALL: case X_COMP: case X_VAR:

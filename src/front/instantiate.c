@@ -73,6 +73,10 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
             s = QW_ETYPE;
             break;
         }
+        if (k->anonymous) {
+            s = qw_anonymous_kind(w, k->dimension, k->scale, &kinds[i]);
+            continue;
+        }
         names[taken] = world_name(k->name, names, taken);
         s = qw_kind(w, names[taken], k->dimension, k->scale, k->conserved, &kinds[i]);
         taken++;
@@ -91,6 +95,7 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
     for (uint32_t i = 0; i < ir->ncells && !s; i++) {
         const QiCell *c = &ir->cells[i];
         s = c->domain == QI_SET ? qw_set_cell(w, c->path, kinds[ir->nkinds + c->kind], c->mask, &cells[i])
+            : c->derived        ? qw_derived_cell(w, c->path, kinds[c->kind], c->base, &cells[i])
                                 : qw_cell(w, c->path, kinds[c->kind], c->base, &cells[i]);
     }
     for (uint32_t i = 0; i < ir->naliases && !s; i++)
@@ -104,7 +109,8 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
                      : p->op == QI_SUM        ? qn_sum(net, z, x, y, &q)
                      : p->op == QI_DIFFERENCE ? qn_difference(net, z, x, y, &q)
                      : p->op == QI_PRODUCT    ? qn_product(net, z, x, y, &q)
-                                              : qn_quotient(net, z, x, y, &q);
+                     : p->op == QI_QUOTIENT   ? qn_quotient(net, z, x, y, &q)
+                                              : qn_less_equal(net, z, x, p->op == QI_LESS, &q);
         if (n != QN_OK) {
             Buf b = { 0 };
             qf_buf_printf(&b, "the law %s: %s: %s%s%s", p->name, p->law, qn_status_str(n),

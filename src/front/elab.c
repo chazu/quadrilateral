@@ -38,7 +38,9 @@ typedef struct {
     VEC(QiKernelUse)  kernels;
     VEC(Conn)         conns;        /* every connection, with its phenomenon in ports[port] */
     U64Map            paths;        /* Sym of a path → cell + 1 */
-    U32Vec            usedkinds;    /* indices into f->kinds */
+    VEC(QiKind)       kinds;        /* the kinds that cells use, named and anonymous */
+    U64Map            lawcount;     /* Sym of the name of a law → the derived cells that it has */
+    U64Map            lawsdone;     /* Sym of the name and the text of a law → 1 */
     U32Vec            usedenums;    /* types */
     VEC(QiEnum)       enums;        /* parallel to usedenums */
 } Elab;
@@ -220,12 +222,12 @@ static void walk(Walk *w, const QfNode *n)
         if (e->conns.v[c].path.n == len && starts_with(w->path.v, len, &e->conns.v[c].path)) return;
     TypeKind tk = f->types.v[n->type].kind;
     if (n->flags & NF_VALUE) {
-        if (tk == TK_KIND) leaf(w, n, false);
-        else if (tk == TK_DIMT || tk == TK_NUMBER) {
+        if (tk == TK_KIND || tk == TK_DIMT) leaf(w, n, false);
+        else if (tk == TK_NUMBER) {
             Buf b = { 0 };
             rel_text(e, &b, w->path.v, len);
-            err(e, w->loc, "%s.%s is a number with no kind: a cell needs a kind, as in `%s: %%energy`", w->in->name, b.s,
-                f->feats.v[w->path.v[len - 1]].label);
+            err(e, w->loc, "%s.%s is a number with no kind and no dimension: a cell needs one, as in `%s: %%energy`",
+                w->in->name, b.s, f->feats.v[w->path.v[len - 1]].label);
             qf_buf_free(&b);
         }
         return;                                      /* a text or a constraint is not state */
@@ -324,17 +326,49 @@ static uint32_t enum_of(Walk *w, const Leaf *l)
 
 static uint32_t use_kind(Elab *e, uint32_t kindix)
 {
-    for (size_t i = 0; i < e->usedkinds.n; i++)
-        if (e->usedkinds.v[i] == kindix) return (uint32_t) i;
-    VEC_PUSH(e->usedkinds, kindix);
-    return (uint32_t) e->usedkinds.n - 1;
+    const KindInfo *k = &e->f->kinds.v[kindix];
+    for (size_t i = 0; i < e->kinds.n; i++)
+        if (!e->kinds.v[i].anonymous && !strcmp(e->kinds.v[i].name, k->name)) return (uint32_t) i;
+    Buf dim = { 0 };
+    qf_dim_format(e->f, &dim, &e->f->dims.v[k->dimix].dim);
+    QiKind qk = { keep(e, k->name), keep(e, dim.s), k->scale, k->conserved, k->rounding, false };
+    qf_buf_free(&dim);
+    VEC_PUSH(e->kinds, qk);
+    return (uint32_t) e->kinds.n - 1;
+}
+
+/* An anonymous kind: a dimension and a scale (ADR 0001, ADR 0018). */
+static uint32_t use_anonymous(Elab *e, const QDim *dim, int8_t scale)
+{
+    Buf d = { 0 }, name = { 0 };
+    qf_dim_format(e->f, &d, dim);
+    qf_buf_printf(&name, "dim[%s]@%d", d.s, scale);
+    uint32_t at = QI_NONE;
+    for (size_t i = 0; i < e->kinds.n && at == QI_NONE; i++)
+        if (e->kinds.v[i].anonymous && !strcmp(e->kinds.v[i].name, name.s)) at = (uint32_t) i;
+    if (at == QI_NONE) {
+        QiKind qk = { keep(e, name.s), keep(e, d.s), scale, false, Q_ROUND_HALF_EVEN, true };
+        VEC_PUSH(e->kinds, qk);
+        at = (uint32_t) e->kinds.n - 1;
+    }
+    qf_buf_free(&d);
+    qf_buf_free(&name);
+    return at;
+}
+
+/* The kind of the IR for a quantity type: its kind, if the type has the
+ * scale of that kind, and else an anonymous kind. */
+static uint32_t use_qtype(Elab *e, const QType *qt)
+{
+    if (qt->kind && e->f->kinds.v[qt->kind - 1].scale == qt->scale) return use_kind(e, qt->kind - 1);
+    return use_anonymous(e, &qt->dim, qt->scale);
 }
 
 static void add_cell(Walk *w, const Leaf *l)
 {
     Elab *e = w->e;
     Front *f = e->f;
-    QiCell c = { keep(e, l->text), w->phen, QI_INTERVAL, 0, { 0, 0 }, 0, false };
+    QiCell c = { keep(e, l->text), w->phen, QI_INTERVAL, 0, { 0, 0 }, 0, false, false };
     QType qt;
     memset(&qt, 0, sizeof qt);
     if (u64map_get(&e->paths, (uint64_t) (uintptr_t) l->text, NULL)) {
@@ -354,6 +388,20 @@ static void add_cell(Walk *w, const Leaf *l)
             for (uint32_t a = 0; a < e->enums.v[en].natoms; a++)
                 if (!strcmp(e->enums.v[en].atoms[a], name)) c.mask |= (uint64_t) 1 << a;
         }
+    } else if (f->types.v[l->node->type].kind == TK_DIMT) {
+        /* a dimension and no kind: an anonymous kind with the default scale of the dimension */
+        QDim dim = f->dims.v[f->types.v[l->node->type].dimix].dim;
+        int8_t scale = qdim_default_scale(&dim, f->tick_scale);
+        QfDec d = { l->node->lo, l->node->hi, l->node->exp, (l->node->flags & NF_LO_OPEN) != 0,
+                    (l->node->flags & NF_HI_OPEN) != 0 };
+        const char *why = qf_dec_to_quanta(d, scale, &c.base.lo, &c.base.hi);
+        if (why) {
+            err(e, w->loc, "%s has no kind, so it has the scale %d of its dimension, and its value does not fit: %s. "
+                "Give the field a kind with another scale", l->text, scale, why);
+            return;
+        }
+        c.kind = use_anonymous(e, &dim, scale);
+        qt = qtype_make(0, dim, scale);
     } else {
         const TypeInfo *ti = &f->types.v[l->node->type];
         const KindInfo *k = &f->kinds.v[ti->kindix];
@@ -485,7 +533,8 @@ typedef struct {
     Elab           *e;
     uint32_t        phen;
     const QfRecUse *use;
-    const char     *law;
+    const char     *law;         /* the text of the law */
+    const char     *name;        /* its path: roomA.storage */
     Loc             loc;
 } Law;
 
@@ -509,6 +558,10 @@ static uint32_t operand(Law *l, const X *x)
             else
                 err(e, l->loc, "the law %s reads %s.%s, which is not a cell", l->law, e->phens.v[l->phen].name,
                     b.s ? b.s : "");
+        } else if (e->cells.v[c].domain == QI_SET) {
+            err(e, l->loc, "the law %s uses %s, which is a set of atoms: arithmetic needs quantities", l->law,
+                e->cells.v[c].path);
+            c = QI_NONE;
         }
         qf_buf_free(&b);
         return c;
@@ -520,9 +573,8 @@ static uint32_t operand(Law *l, const X *x)
 static void unsupported(Law *l)
 {
     err(l->e, l->loc,
-        "the law %s needs an intermediate cell or another propagator, which this stage does not make (quad-ijx.12). "
-        "A law can be a == b or a == b op c, where a, b and c are references and op is + - * or /. "
-        "Give an intermediate value a field with a kind",
+        "the law %s has a form that the elaborator cannot lower. A law is an equation or an inequality "
+        "(< <= > >=) of references, numbers, and + - * /",
         l->law);
 }
 
@@ -531,7 +583,7 @@ static bool fits(const QType *z, const QType *x, const QType *y, QiOp op, QStatu
     QType t1, t2;
     QConv k;
     switch (op) {
-    case QI_EQUAL: return !(*why = qtype_sum(z, x, &t1));
+    case QI_EQUAL: case QI_LESS_EQUAL: case QI_LESS: return !(*why = qtype_sum(z, x, &t1));
     case QI_SUM: return !(*why = qtype_sum(x, y, &t1)) && !(*why = qtype_sum(&t1, z, &t2));
     case QI_DIFFERENCE: return fits(x, z, y, QI_SUM, why);                 /* x = z + y */
     case QI_PRODUCT:
@@ -542,77 +594,155 @@ static bool fits(const QType *z, const QType *x, const QType *y, QiOp op, QStatu
     return false;
 }
 
+static void misfit(Law *l, QStatus why)
+{
+    err(l->e, l->loc, "the law %s does not fit the kinds of its quantities: %s", l->law, q_status_str(why));
+}
+
+/* A derived cell of a law (ADR 0018): the value of an inner expression, or
+ * a constant. Its path is the name of the law and a number, in the order in
+ * which the expression makes the cells. */
+static uint32_t derived(Law *l, const QType *qt, QInterval base)
+{
+    Elab *e = l->e;
+    uint64_t key = (uint64_t) (uintptr_t) qf_sym(e->f, l->name), n = 0;
+    u64map_get(&e->lawcount, key, &n);
+    u64map_put(&e->lawcount, key, ++n);
+    Buf b = { 0 };
+    qf_buf_printf(&b, "%s.%llu", l->name, (unsigned long long) n);
+    Sym path = qf_sym(e->f, b.s);
+    qf_buf_free(&b);
+    if (u64map_get(&e->paths, (uint64_t) (uintptr_t) path, NULL)) {
+        err(e, l->loc, "the law %s needs the path %s for an inner value, and a field has that path", l->law, path);
+        return QI_NONE;
+    }
+    QiCell c = { keep(e, path), l->phen, QI_INTERVAL, use_qtype(e, qt), base, 0, false, true };
+    VEC_PUSH(e->cells, c);
+    VEC_PUSH(e->ctypes, *qt);
+    u64map_put(&e->paths, (uint64_t) (uintptr_t) path, e->cells.n);
+    return (uint32_t) e->cells.n - 1;
+}
+
+static void emit(Law *l, QiOp op, uint32_t z, uint32_t a, uint32_t b)
+{
+    Elab *e = l->e;
+    QiProp p = { l->phen, op, { z, a, b }, keep(e, l->name), keep(e, l->law), l->loc.file ? keep(e, l->loc.file) : NULL,
+                 l->loc.line, l->loc.col };
+    VEC_PUSH(e->props, p);
+}
+
+static uint32_t cell_of(Law *l, const X *x);
+
+/* z = a op b for an expression. z is the cell of the result, or QI_NONE:
+ * then a new derived cell is the result. The result, or QI_NONE with a diagnostic. */
+static uint32_t lower_arith(Law *l, const X *x, uint32_t z)
+{
+    Elab *e = l->e;
+    uint32_t a = cell_of(l, x->u.ar.a);
+    if (a == QI_NONE) return QI_NONE;
+    uint32_t b = cell_of(l, x->u.ar.b);
+    if (b == QI_NONE) return QI_NONE;
+    QiOp op = x->u.ar.op == '+' ? QI_SUM : x->u.ar.op == '-' ? QI_DIFFERENCE : x->u.ar.op == '*' ? QI_PRODUCT : QI_QUOTIENT;
+    QType ta = e->ctypes.v[a], tb = e->ctypes.v[b];
+    QStatus why = Q_OK;
+    if (z == QI_NONE) {
+        QType t;
+        why = op == QI_PRODUCT ? qtype_mul(&ta, &tb, &t) : op == QI_QUOTIENT ? qtype_div(&ta, &tb, &t) : qtype_sum(&ta, &tb, &t);
+        if (why) { misfit(l, why); return QI_NONE; }
+        z = derived(l, &t, qi_top());
+        if (z == QI_NONE) return QI_NONE;
+    } else {
+        QType tz = e->ctypes.v[z];
+        if (!fits(&tz, &ta, &tb, op, &why)) { misfit(l, why); return QI_NONE; }
+    }
+    emit(l, op, z, a, b);
+    return z;
+}
+
+/* The cell that has the value of an expression: the cell of a reference, a
+ * constant for a number, or a derived cell for an operation. */
+static uint32_t cell_of(Law *l, const X *x)
+{
+    Elab *e = l->e;
+    if (x->k == X_TAG) return operand(l, x);
+    if (x->k == X_ARITH) return lower_arith(l, x, QI_NONE);
+    if (x->k == X_NUM) {
+        /* a number is exact with its own scale: 273.15K is 27315 with the scale -2 */
+        QDim dim;
+        int64_t value;
+        int exp;
+        char why[200];
+        if (!qf_literal(e->f, &x->u.num, &dim, &value, &exp, why, sizeof why)) {
+            err(e, x->loc, "the law %s: %s", l->law, why);
+            return QI_NONE;
+        }
+        while (value && value % 10 == 0 && exp < INT8_MAX) { value /= 10; exp++; }
+        if (!value) exp = 0;
+        if (exp < INT8_MIN || exp > INT8_MAX) {
+            err(e, x->loc, "the law %s has a number with a scale out of range: give the value a field with a kind", l->law);
+            return QI_NONE;
+        }
+        QType qt = qtype_make(0, dim, (int8_t) exp);
+        return derived(l, &qt, qi_point(value));
+    }
+    unsupported(l);
+    return QI_NONE;
+}
+
 static void lower(Elab *e, uint32_t phen, const QfRecUse *use)
 {
     const X *x = use->rec->expr;
     char *text = x_text(x);
-    Law l = { e, phen, use, text, x->loc };
-    uint32_t z = QI_NONE, a = QI_NONE, b = QI_NONE;
-    QiOp op = QI_EQUAL;
-    const X *rhs = NULL;
-    bool ok = true;
-    if (x->k == X_CMP && x->u.ar.op == 'e') {
-        const X *lhs = x->u.ar.a;
-        rhs = x->u.ar.b;
-        if (lhs->k != X_TAG && rhs->k == X_TAG) { const X *t = lhs; lhs = rhs; rhs = t; }
-        if (lhs->k != X_TAG) { unsupported(&l); ok = false; }
-        else ok = (z = operand(&l, lhs)) != QI_NONE;
-    } else if (x->k == X_ARITH) {
-        /* a value that an expression gives: the field where it stands is the result */
-        Buf pb = { 0 };
-        rel_text(e, &pb, use->prefix.v, use->prefix.n);
-        if (pb.len && use->rec->path.n) qf_buf_putc(&pb, '.');
-        rel_text(e, &pb, use->rec->path.v, use->rec->path.n);
-        z = find_cell(e, phen, pb.s ? pb.s : "", NULL);
-        if (z == QI_NONE) {
-            err(e, l.loc, "%s.%s has the value %s, and it is not a cell: give the field a kind", e->phens.v[phen].name,
-                pb.s ? pb.s : "", text);
-            ok = false;
-        }
-        qf_buf_free(&pb);
-        rhs = x;
-    } else {
-        unsupported(&l);
-        ok = false;
-    }
-    if (ok && rhs->k == X_TAG) {
-        ok = (a = operand(&l, rhs)) != QI_NONE;
-    } else if (ok && rhs->k == X_ARITH && rhs->u.ar.a->k == X_TAG && rhs->u.ar.b->k == X_TAG) {
-        op = rhs->u.ar.op == '+' ? QI_SUM : rhs->u.ar.op == '-' ? QI_DIFFERENCE : rhs->u.ar.op == '*' ? QI_PRODUCT
-                                                                                                      : QI_QUOTIENT;
-        a = operand(&l, rhs->u.ar.a);
-        b = operand(&l, rhs->u.ar.b);
-        ok = a != QI_NONE && b != QI_NONE;
-    } else if (ok) {
-        unsupported(&l);
-        ok = false;
-    }
-    if (ok) {
-        uint32_t cs[3] = { z, a, b };
-        for (int i = 0; i < 3 && ok; i++)
-            if (cs[i] != QI_NONE && e->cells.v[cs[i]].domain == QI_SET) {
-                err(e, l.loc, "the law %s uses %s, which is a set of atoms: arithmetic needs quantities", text,
-                    e->cells.v[cs[i]].path);
-                ok = false;
+    Buf nb = { 0 }, rel = { 0 };
+    rel_text(e, &rel, use->prefix.v, use->prefix.n);
+    if (rel.len && use->rec->path.n) qf_buf_putc(&rel, '.');
+    rel_text(e, &rel, use->rec->path.v, use->rec->path.n);
+    qf_buf_printf(&nb, "%s%s%s", e->phens.v[phen].name, rel.len ? "." : "", rel.s ? rel.s : "");
+    Law l = { e, phen, use, text, nb.s, x->loc };
+    /* one law that two declarations state is one law */
+    Buf key = { 0 };
+    qf_buf_printf(&key, "%s\n%s", nb.s, text);
+    uint64_t done = (uint64_t) (uintptr_t) qf_sym(e->f, key.s);
+    qf_buf_free(&key);
+    if (!u64map_get(&e->lawsdone, done, NULL)) {
+        u64map_put(&e->lawsdone, done, 1);
+        if (x->k == X_CMP && x->u.ar.op == 'e') {
+            const X *lhs = x->u.ar.a, *rhs = x->u.ar.b;
+            if (lhs->k != X_TAG && rhs->k == X_TAG) { const X *t = lhs; lhs = rhs; rhs = t; }
+            if (lhs->k == X_TAG && rhs->k == X_ARITH) {
+                /* a reference and one operation: the operation writes the cell of the reference */
+                uint32_t z = operand(&l, lhs);
+                if (z != QI_NONE) lower_arith(&l, rhs, z);
+            } else {
+                uint32_t a = cell_of(&l, lhs), b = a == QI_NONE ? QI_NONE : cell_of(&l, rhs);
+                if (b != QI_NONE) {
+                    QType ta = e->ctypes.v[a], tb = e->ctypes.v[b];
+                    QStatus why = Q_OK;
+                    if (!fits(&ta, &tb, NULL, QI_EQUAL, &why)) misfit(&l, why);
+                    else emit(&l, QI_EQUAL, a, b, QI_NONE);
+                }
             }
-    }
-    if (ok) {
-        QStatus why = Q_OK;
-        if (!fits(&e->ctypes.v[z], &e->ctypes.v[a], b == QI_NONE ? NULL : &e->ctypes.v[b], op, &why)) {
-            err(e, l.loc, "the law %s does not fit the kinds of its quantities: %s", text, q_status_str(why));
-            ok = false;
+        } else if (x->k == X_CMP && (x->u.ar.op == 'l' || x->u.ar.op == '<' || x->u.ar.op == 'g' || x->u.ar.op == '>')) {
+            bool greater = x->u.ar.op == 'g' || x->u.ar.op == '>', strict = x->u.ar.op == '<' || x->u.ar.op == '>';
+            uint32_t a = cell_of(&l, x->u.ar.a), b = a == QI_NONE ? QI_NONE : cell_of(&l, x->u.ar.b);
+            if (b != QI_NONE) {
+                QType ta = e->ctypes.v[a], tb = e->ctypes.v[b];
+                QStatus why = Q_OK;
+                if (!fits(&ta, &tb, NULL, QI_LESS_EQUAL, &why)) misfit(&l, why);
+                else emit(&l, strict ? QI_LESS : QI_LESS_EQUAL, greater ? b : a, greater ? a : b, QI_NONE);
+            }
+        } else if (x->k == X_ARITH) {
+            /* a value that an expression gives: the field where it stands is the result */
+            uint32_t z = find_cell(e, phen, rel.s ? rel.s : "", NULL);
+            if (z == QI_NONE)
+                err(e, l.loc, "%s has the value %s, and it is not a cell: give the field a kind", nb.s, text);
+            else lower_arith(&l, x, z);
+        } else {
+            unsupported(&l);
         }
     }
-    if (ok) {
-        Buf nb = { 0 };
-        qf_buf_puts(&nb, e->phens.v[phen].name);
-        for (size_t i = 0; i < use->prefix.n + use->rec->path.n; i++)
-            qf_buf_printf(&nb, ".%s", e->f->feats.v[i < use->prefix.n ? use->prefix.v[i] : use->rec->path.v[i - use->prefix.n]].label);
-        QiProp p = { phen, op, { z, a, b }, keep(e, nb.s), keep(e, text), x->loc.file ? keep(e, x->loc.file) : NULL,
-                     x->loc.line, x->loc.col };
-        qf_buf_free(&nb);
-        VEC_PUSH(e->props, p);
-    }
+    qf_buf_free(&nb);
+    qf_buf_free(&rel);
     free(text);
 }
 
@@ -792,19 +922,15 @@ static QIr *finish(Elab *e)
     free(newix);
 
     /* kinds and enumerations in the order of their names */
-    uint32_t nk = (uint32_t) e->usedkinds.n, ne = (uint32_t) e->usedenums.n;
+    uint32_t nk = (uint32_t) e->kinds.n, ne = (uint32_t) e->usedenums.n;
     Named *kord = qf_xcalloc(nk ? nk : 1, sizeof *kord), *eord = qf_xcalloc(ne ? ne : 1, sizeof *eord);
     uint32_t *kmap = qf_xcalloc(nk ? nk : 1, sizeof *kmap), *emap = qf_xcalloc(ne ? ne : 1, sizeof *emap);
-    for (uint32_t i = 0; i < nk; i++) kord[i] = (Named) { f->kinds.v[e->usedkinds.v[i]].name, i };
+    for (uint32_t i = 0; i < nk; i++) kord[i] = (Named) { e->kinds.v[i].name, i };
     if (nk) qsort(kord, nk, sizeof *kord, cmp_named);
     ir->kinds = qf_alloc(e->mem, (nk ? nk : 1) * sizeof(QiKind));
     ir->nkinds = nk;
     for (uint32_t i = 0; i < nk; i++) {
-        const KindInfo *k = &f->kinds.v[e->usedkinds.v[kord[i].ix]];
-        Buf dim = { 0 };
-        qf_dim_format(f, &dim, &f->dims.v[k->dimix].dim);
-        ir->kinds[i] = (QiKind) { keep(e, k->name), keep(e, dim.s), k->scale, k->conserved, k->rounding };
-        qf_buf_free(&dim);
+        ir->kinds[i] = e->kinds.v[kord[i].ix];
         kmap[kord[i].ix] = i;
     }
     for (uint32_t i = 0; i < ne; i++) eord[i] = (Named) { e->enums.v[i].name, i };
@@ -938,7 +1064,9 @@ QIr *qf_elaborate(Front *f, const QiOptions *opt)
     VEC_FREE(e.ports);
     VEC_FREE(e.props);
     VEC_FREE(e.kernels);
-    VEC_FREE(e.usedkinds);
+    VEC_FREE(e.kinds);
+    u64map_free(&e.lawcount);
+    u64map_free(&e.lawsdone);
     VEC_FREE(e.usedenums);
     VEC_FREE(e.enums);
     u64map_free(&e.phenidx);

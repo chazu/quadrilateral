@@ -31,13 +31,16 @@
 
 #define QI_NONE UINT32_MAX
 
-/* A quantity kind that a cell uses. */
+/* A quantity kind that a cell uses. An anonymous kind has a dimension and a
+ * scale, and no name in source (ADR 0001, ADR 0018): a field with a dimension
+ * and no kind has one, and so does the value of an inner expression of a law. */
 typedef struct {
-    const char *name;        /* as in source: %energy, shop.%coin */
+    const char *name;        /* as in source: %energy, shop.%coin. Anonymous: dim[K]@-6 */
     const char *dimension;   /* in the grammar of ADR 0009 section 10 */
     int8_t      scale;
     bool        conserved;
     uint8_t     rounding;    /* QRound */
+    bool        anonymous;
 } QiKind;
 
 /* An enumeration that a set cell uses (ADR 0012): the atoms that the field
@@ -63,6 +66,7 @@ typedef struct {
     QInterval   base;        /* an interval cell: quanta of its kind */
     uint64_t    mask;        /* a set cell: the possible atoms, atom i is bit i */
     bool        stock;       /* a cell of a conserved kind: only transfers change it */
+    bool        derived;     /* a law gives its value, or it is a constant of a law: not state (ADR 0018) */
 } QiCell;
 
 /* A second path for a cell of the same phenomenon. A port that is a view of
@@ -87,14 +91,16 @@ typedef struct {
     uint32_t    target_phen; /* connected: index into phens */
 } QiPort;
 
-typedef enum { QI_EQUAL, QI_SUM, QI_DIFFERENCE, QI_PRODUCT, QI_QUOTIENT } QiOp;
+typedef enum { QI_EQUAL, QI_SUM, QI_DIFFERENCE, QI_PRODUCT, QI_QUOTIENT, QI_LESS_EQUAL, QI_LESS } QiOp;
 
-/* A propagator: cell[0] = cell[1] op cell[2], or cell[0] = cell[1] for
- * QI_EQUAL. It narrows every cell that it names, in every direction. */
+/* A propagator: cell[0] = cell[1] op cell[2]. For QI_EQUAL, cell[0] =
+ * cell[1]. For QI_LESS_EQUAL and QI_LESS, cell[0] <= cell[1] or cell[0] <
+ * cell[1]. It narrows every cell that it names, in every direction. One law
+ * can give several propagators, with derived cells between them. */
 typedef struct {
     uint32_t    phen;        /* the phenomenon that states the law */
     QiOp        op;
-    uint32_t    cell[3];     /* indices into cells; cell[2] is QI_NONE for QI_EQUAL */
+    uint32_t    cell[3];     /* indices into cells; cell[2] is QI_NONE where the propagator has two cells */
     const char *name;        /* the path of the law in source: roomA.storage */
     const char *law;         /* the text of the law */
     const char *file;

@@ -344,7 +344,8 @@ static char *shuffled(const char *name, const char *src, uint64_t *rng)
 
 static const char *const HOUSE =
     "#Material: \"brick\" | \"wood\" | \"stone\"\n"
-    "#Room: #LumpedRoom & { door: \"open\" | \"closed\", of: #Material, lit: bool }\n"
+    "#Room: #LumpedRoom & { door: \"open\" | \"closed\", of: #Material, lit: bool, celsius: %temperature,\n"
+    "    warm: .celsius == .temperature - 273.15K, loss: %energy / %time, leak: .loss == 2W/K * (.temperature - 280K) }\n"
     "kitchen: #Room & { energy: 3031500J, capacity: 10000J/K, door: \"open\", of: \"brick\" }\n"
     "kitchen: { lit: true }\n"
     "hall: #Room & { energy: 2931500J, capacity: 10000J/K, of: \"wood\" | \"stone\" }\n"
@@ -514,6 +515,172 @@ void test_elab_laws(void)
         qw_free(w);
     }
     qi_free(ir);
+}
+
+/* A law can have inner expressions, numbers and inequalities (ADR 0018). An
+ * inner value and a number are derived cells. */
+void test_elab_expressions(void)
+{
+    /* the wall law of the stage 2 fixture: a nested expression, and a power with a dimension and no kind */
+    char *physics = read_file("tests/data/resolve/physics.quad");
+    CHECK(physics != NULL);
+    if (physics) {
+        const char *names[2] = { "physics.quad", "world.quad" };
+        const char *src[2] = { physics, "roomA: #LumpedRoom & { energy: 303150J, capacity: 1000J/K }\n"
+                                        "roomB: #LumpedRoom & { energy: 293150J, capacity: 1000J/K }\n"
+                                        "wall: #Wall & { conductance: 20W/K, hot: roomA.west, cold: roomB.west }\n" };
+        char *diag = NULL;
+        QIr *ir = qi_compile(names, src, 2, NULL, &diag);
+        CHECK(ir != NULL);
+        if (!ir) fprintf(stderr, "%s", diag);
+        free(diag);
+        if (ir) {
+            char *text = qi_text(ir);
+            HAS(text, "kind dim[m^2 kg s^-3]@-3: m^2 kg s^-3, scale -3, anonymous\n");
+            HAS(text, "phenomenon wall: #Wall\n"
+                      "  cell wall.conductance: %conductance = 20\n"
+                      "  derived wall.laws.first.1: %temperature = any\n"
+                      "  cell wall.power: dim[m^2 kg s^-3]@-3 = any\n"
+                      "  port cold: #ThermalPort, connected to roomB.west\n"
+                      "  port hot: #ThermalPort, connected to roomA.west\n"
+                      "  propagator P2, in an epoch: wall.laws.first.1 = roomA.temperature - roomB.temperature\n"
+                      "    law wall.laws.first: .power == (.conductance * (.hot.temperature - .cold.temperature))\n"
+                      "  propagator P3, in an epoch: wall.power = wall.conductance * wall.laws.first.1\n"
+                      "    law wall.laws.first: .power == (.conductance * (.hot.temperature - .cold.temperature))\n");
+            HAS(text, "  wall.laws.first.1: narrowed by P2, P3\n");
+            free(text);
+            QWorld *w = build(ir, 1);
+            if (w) {
+                OK(qw_run(w, 0));
+                CHECK_I64(qw_get(w, "wall.laws.first.1").lo, 10000000);     /* 10 K */
+                CHECK_I64(qw_get(w, "wall.power").lo, 200000);              /* 20 W/K × 10 K = 200 W, in mW */
+                CHECK_I64(qw_get(w, "wall.power").hi, 200000);
+            }
+            qw_free(w);
+        }
+        qi_free(ir);
+        free(physics);
+    }
+
+    /* numbers, inequalities, and expressions on both sides */
+    const char *forms = "#T: #Phenomenon & {\n"
+                        "    kelvin: %temperature, celsius: %temperature, a: %temperature, b: %temperature,\n"
+                        "    twice: %temperature, half: %temperature, low: %temperature, high: %temperature\n"
+                        "    c: .celsius == .kelvin - 273.15K\n"
+                        "    d: .a + 1K <= .b\n"
+                        "    e: .twice == 2 * (.a + .b)\n"
+                        "    f: .a > 2K\n"
+                        "    g: .half * 2 == .kelvin - 100K\n"
+                        "    h: .low < .high, i: .high >= .kelvin\n"
+                        "}\n";
+    char src[2048];
+    snprintf(src, sizeof src, "%st: #T & { kelvin: 300K, b: <=5K, low: >=310K }\n", forms);
+    QIr *ir = compile(src, NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        /* a number has the scale that makes it exact: 273.15 K is 27315 × 10^-2, and 100 K is 1 × 10^2 */
+        HAS(text, "kind dim[1]@0: 1, scale 0, anonymous\n");
+        HAS(text, "kind dim[K]@-2: K, scale -2, anonymous\n");
+        HAS(text, "kind dim[K]@0: K, scale 0, anonymous\n");
+        HAS(text, "kind dim[K]@2: K, scale 2, anonymous\n");
+        HAS(text, "  derived t.g.3: dim[K]@2 = 100\n");
+        HAS(text, "  derived t.c.1: dim[K]@-2 = 273.15\n");
+        HAS(text, "  propagator P0, in an epoch: t.celsius = t.kelvin - t.c.1\n    law t.c: .celsius == (.kelvin - 273.15K)\n");
+        HAS(text, "  propagator P1, in an epoch: t.d.2 = t.a + t.d.1\n    law t.d: (.a + 1K) <= .b\n"
+                  "  propagator P2, in an epoch: t.d.2 <= t.b\n    law t.d: (.a + 1K) <= .b\n");
+        HAS(text, "  propagator P5, in an epoch: t.f.1 < t.a\n    law t.f: .a > 2K\n");
+        /* expressions on both sides: a derived cell for each side, and an equality */
+        HAS(text, "  propagator P6, in an epoch: t.g.2 = t.g.4\n");
+        HAS(text, "  propagator P7, in an epoch: t.g.4 = t.kelvin - t.g.3\n");
+        HAS(text, "  propagator P8, in an epoch: t.g.2 = t.half * t.g.1\n");
+        HAS(text, "  propagator P9, in an epoch: t.low < t.high\n    law t.h: .low < .high\n"
+                  "  propagator P10, in an epoch: t.kelvin <= t.high\n    law t.i: .high >= .kelvin\n");
+        free(text);
+        int nderived = 0;
+        for (uint32_t i = 0; i < ir->ncells; i++) nderived += ir->cells[i].derived;
+        CHECK(nderived == 10 && ir->nprops == 11);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 0));
+            CHECK_I64(qw_get(w, "t.celsius").lo, 26850000);             /* 26.85, in the kind's quanta of 10^-6 K */
+            CHECK_I64(qw_get(w, "t.celsius").hi, 26850000);
+            CHECK_I64(qw_get(w, "t.a").lo, 2000001);                    /* more than 2 K: one quantum more */
+            CHECK_I64(qw_get(w, "t.a").hi, 4000000);                    /* a + 1 K <= b, and b <= 5 K */
+            CHECK_I64(qw_get(w, "t.b").lo, 3000001);
+            CHECK_I64(qw_get(w, "t.twice").lo, 2 * (2000001 + 3000001));
+            CHECK_I64(qw_get(w, "t.twice").hi, 2 * (4000000 + 5000000));
+            CHECK_I64(qw_get(w, "t.half").lo, 100000000);               /* (300 - 100) / 2 = 100 K */
+            CHECK_I64(qw_get(w, "t.half").hi, 100000000);
+            CHECK_I64(qw_get(w, "t.high").lo, 310000001);               /* above low, which is at least 310 K */
+            CHECK(qw_get(w, "t.low").hi == Q_INF);
+            /* a derived cell is not state: it takes no input */
+            CHECK(qw_input(w, "t.c.1", qi_point(5)) == QW_EOWNER);
+            OK(qw_input(w, "t.kelvin", qi_point(400000000)));
+            CHECK_I64(qw_get(w, "t.celsius").lo, 126850000);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* a law that the values contradict */
+    snprintf(src, sizeof src, "%st: #T & { kelvin: 300K, a: 7K, b: 5K }\n", forms);
+    ir = compile(src, NULL);
+    QWorld *w = ir ? build(ir, 1) : NULL;
+    if (w) CHECK(qw_run(w, 0) == QW_ECONTRADICTION);
+    qw_free(w);
+    qi_free(ir);
+
+    /* the value of a field: an expression with an inner expression */
+    ir = compile("#V: #Phenomenon & { a: %temperature, b: %temperature, mean: %temperature, mean: (.a + .b) / 2 }\n"
+                 "v: #V & { a: 280K, b: 300K }\n",
+                 NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  propagator P0, in an epoch: v.mean.1 = v.a + v.b\n    law v.mean: (.a + .b) / 2\n"
+                  "  propagator P1, in an epoch: v.mean = v.mean.1 / v.mean.2\n");
+        free(text);
+        w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 0));
+            CHECK_I64(qw_get(w, "v.mean").lo, 290000000);
+            CHECK_I64(qw_get(w, "v.mean").hi, 290000000);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* one law that two declarations state is one law, with one set of derived cells */
+    ir = compile("#D: #Phenomenon & { a: %temperature, b: %temperature, up: .b == (.a + 1K) * 2 }\n"
+                 "d: #D & { a: 2K }\nd: #D & { up: .b == (.a + 1K) * 2 }\n",
+                 NULL);
+    if (ir) CHECK(ir->nprops == 2 && ir->ncells == 5);
+    qi_free(ir);
+
+    /* a field with a dimension and no kind is a cell, with the default scale of the dimension (ADR 0001) */
+    ir = compile("#R: #Phenomenon & { rate: %energy / %time, gain: %temperature / %time, flux: %energy / %time }\n"
+                 "r: #R & { rate: 5W, gain: >=0.5K/s, flux: 1.5kW }\n",
+                 NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "kind dim[s^-1 K]@-3: s^-1 K, scale -3, anonymous\n");
+        HAS(text, "  cell r.flux: dim[m^2 kg s^-3]@-3 = 1500\n  cell r.gain: dim[s^-1 K]@-3 = 0.5 .. inf\n"
+                  "  cell r.rate: dim[m^2 kg s^-3]@-3 = 5\n");
+        free(text);
+        CHECK(ir->nkinds == 2);                          /* the two powers have one anonymous kind */
+        w = build(ir, 1);
+        if (w) {
+            CHECK_I64(qw_get(w, "r.rate").lo, 5000);
+            OK(qw_input(w, "r.rate", qi_point(7000)));  /* such a cell is state, and it takes an input */
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+    STR_EQ(compile_error("#R: #Phenomenon & { rate: %energy / %time }\nr: #R & { rate: 0.00001W }\n"),
+           "world.quad:2:1: error: r.rate has no kind, so it has the scale -3 of its dimension, and its value does not "
+           "fit: the value is not a whole number of quanta of the kind. Give the field a kind with another scale\n");
+    STR_EQ(compile_error("#R: #Phenomenon & { rate: %energi / %time }\nr: #R\n"),
+           "world.quad:1:27: error: unknown kind %energi. Declare it: %energi: { dimension: \"J\" }\n"
+           "world.quad:2:4: error: cannot expand #R\n");
 }
 
 /* A law is a field with a name, so a subtype adds a law by unification, and
@@ -1058,9 +1225,10 @@ void test_elab_kernels(void)
 
 void test_elab_errors(void)
 {
-    /* a number needs a kind */
-    STR_EQ(compile_error("#P: #Phenomenon & { power: %energy / %time }\np: #P\n"),
-           "world.quad:2:1: error: p.power is a number with no kind: a cell needs a kind, as in `power: %energy`\n");
+    /* a number needs a kind or a dimension */
+    STR_EQ(compile_error("#P: #Phenomenon & { size: number }\np: #P\n"),
+           "world.quad:2:1: error: p.size is a number with no kind and no dimension: a cell needs one, as in "
+           "`size: %energy`\n");
     /* a stock needs an exact value */
     STR_EQ(compile_error("r: #LumpedRoom & { capacity: 10000J/K }\n"),
            "world.quad:1:1: error: the stock r.energy needs an exact value: only transfers change a stock, so its first "
@@ -1112,20 +1280,23 @@ void test_elab_errors(void)
            "world.quad:2:1: error: h.room is a phenomenon inside a phenomenon, which is not in this stage\n");
 
     /* laws */
-#define NEEDS                                                                                                         \
-    " needs an intermediate cell or another propagator, which this stage does not make (quad-ijx.12). A law can be "  \
-    "a == b or a == b op c, where a, b and c are references and op is + - * or /. Give an intermediate value a "      \
-    "field with a kind\n"
-    STR_EQ(compile_error("#W: #Phenomenon & { power: %conductance, g: %conductance, a: %ratio, b: %ratio,\n"
-                         "    rule: .power == .g * (.a - .b) }\nw: #W\n"),
-           "world.quad:2:18: error: the law .power == (.g * (.a - .b))" NEEDS);
-    STR_EQ(compile_error("#W: #Phenomenon & { a: %temperature, b: %temperature, rule: .a == .b - 273.15K }\nw: #W\n"),
-           "world.quad:1:64: error: the law .a == (.b - 273.15K)" NEEDS);
-    STR_EQ(compile_error("#W: #Phenomenon & { a: %temperature, b: %temperature, rule: .a <= .b }\nw: #W\n"),
-           "world.quad:1:64: error: the law .a <= .b" NEEDS);
-    STR_EQ(compile_error("#W: #Phenomenon & { a: %temperature, b: %temperature, c: %temperature,\n"
-                         "    rule: .a + .b == .b + .c }\nw: #W\n"),
-           "world.quad:2:19: error: the law (.a + .b) == (.b + .c)" NEEDS);
+#define FORM                                                                                               \
+    " has a form that the elaborator cannot lower. A law is an equation or an inequality (< <= > >=) of "  \
+    "references, numbers, and + - * /\n"
+    STR_EQ(compile_error("#W: #Phenomenon & { a: %temperature, b: %temperature, rule: .a != .b }\nw: #W\n"),
+           "world.quad:1:64: error: the law .a != .b" FORM);
+    STR_EQ(compile_error("#W: #Phenomenon & { a: %temperature, b: %temperature, rule: .a == .b + (.a != .b) }\nw: #W\n"),
+           "world.quad:1:64: error: the law .a == (.b + (.a != .b))" FORM);
+    /* an inner expression has the same checks as a whole law */
+    STR_EQ(compile_error("#W: #Phenomenon & { e: %energy, c: %capacity, t: %temperature, rule: .e == .c * (.t + .c) }\n"
+                         "w: #W & { e: 1J }\n"),
+           "world.quad:1:73: error: the law .e == (.c * (.t + .c)) does not fit the kinds of its quantities: dimension "
+           "mismatch\n");
+    STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, rule: .t == 2 * .t + 5m }\nw: #W\n"),
+           "world.quad:1:47: error: the law .t == ((2 * .t) + 5m) does not fit the kinds of its quantities: dimension "
+           "mismatch\n");
+    STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, rule: .t <= 5furlong }\nw: #W\n"),
+           "world.quad:1:50: error: unknown unit 'furlong'\nworld.quad:2:4: error: cannot expand #W\n");
     STR_EQ(compile_error("#W: #Phenomenon & { e: %energy, c: %capacity, t: %temperature, rule: .e == .c + .t }\n"
                          "w: #W & { e: 1J }\n"),
            "world.quad:1:73: error: the law .e == (.c + .t) does not fit the kinds of its quantities: dimension "
@@ -1179,8 +1350,9 @@ void test_elab_errors(void)
 
     /* an error of an earlier stage stops the compile, and the diagnostics are sorted by location */
     HAS(compile_error("r: #LumpedRoom & { energy: 1.00001J, capacity: 1J/K }\n"), "world.quad:1:");
-    STR_EQ(compile_error("b: #LumpedRoom & { capacity: 1J/K }\n#P: #Phenomenon & { power: %energy / %time }\na: #P\n"),
+    STR_EQ(compile_error("b: #LumpedRoom & { capacity: 1J/K }\n#P: #Phenomenon & { size: number }\na: #P\n"),
            "world.quad:1:1: error: the stock b.energy needs an exact value: only transfers change a stock, so its first "
            "value is a point\n"
-           "world.quad:3:1: error: a.power is a number with no kind: a cell needs a kind, as in `power: %energy`\n");
+           "world.quad:3:1: error: a.size is a number with no kind and no dimension: a cell needs one, as in "
+           "`size: %energy`\n");
 }

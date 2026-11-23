@@ -358,6 +358,7 @@ void qf_free(Front *f)
     u64map_free(&f->plainidx);
     u64map_free(&f->instidx);
     u64map_free(&f->disjidx);
+    u64map_free(&f->cmpidx);
     qf_arena_free(f->store.arena);
     for (size_t i = 0; i < f->syms.cap; i++) free((void *) f->syms.slots[i]);
     free(f->syms.slots);
