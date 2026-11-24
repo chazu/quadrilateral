@@ -176,6 +176,7 @@ const char *qw_status_str(QwStatus s)
     case QW_ESTOCK:         return "stock changed other than by a transfer";
     case QW_ETIME:          return "invalid time";
     case QW_ELIFE:          return "instance in the wrong state";
+    case QW_ESNAPSHOT:      return "snapshot does not fit";
     case QW_ENOMEM:         return "out of memory";
     }
     return "unknown status";
@@ -2060,6 +2061,276 @@ static uint64_t fnv(uint64_t h, uint64_t v)
         h *= 0x100000001b3ULL;
     }
     return h;
+}
+
+/* --- snapshot and restore (ADR 0004 rule 8) -------------------------------------------- */
+
+typedef struct { uint8_t *p; size_t n, cap; bool oom; } Out;
+typedef struct { const uint8_t *p; size_t n, at; bool bad; } In;
+
+static void put_bytes(Out *o, const void *v, size_t n)
+{
+    if (o->oom || !grow((void **) &o->p, &o->cap, o->n + n, 1)) { o->oom = true; return; }
+    if (n) memcpy(o->p + o->n, v, n);
+    o->n += n;
+}
+
+static void put(Out *o, uint64_t v)
+{
+    uint8_t b[8];
+    for (int i = 0; i < 8; i++) b[i] = (uint8_t) (v >> (8 * i));       /* the same bytes on each platform */
+    put_bytes(o, b, 8);
+}
+
+static uint64_t get(In *in)
+{
+    if (in->bad || in->n - in->at < 8) { in->bad = true; return 0; }
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t) in->p[in->at + (size_t) i] << (8 * i);
+    in->at += 8;
+    return v;
+}
+
+#define SNAP_MAGIC 0x3130504e53575151ULL       /* "QQWSNP01" */
+
+/* A hash of the structure of the world: a snapshot fits only a world with the same one. */
+static uint64_t structure_hash(const QWorld *w)
+{
+    uint64_t h = fnv(0xcbf29ce484222325ULL, (uint64_t) w->nphens);
+    h = fnv(h, (uint64_t) w->ncells);
+    h = fnv(h, (uint64_t) qn_group_count(w->net));
+    for (size_t i = 0; i < w->nphens; i++) {
+        const Phen *p = &w->phens[i];
+        h = fnv(fnv(h, p->ident), (uint64_t) p->nmodels);
+        for (int m = NO_MODEL; m < (int) p->nmodels; m++) {
+            const Att *a = m == NO_MODEL ? &p->base : &p->models[m].att;
+            h = fnv(h, a->k ? qr_name_hash(a->k->name, strlen(a->k->name)) : 0);
+        }
+    }
+    for (size_t c = 0; c < w->ncells; c++) h = fnv(fnv(h, w->cells[c].hash), (uint64_t) w->cells[c].derived);
+    return h;
+}
+
+QwStatus qw_snapshot(QWorld *w, void **bytes, size_t *len)
+{
+    Out o = { 0 };
+    put(&o, SNAP_MAGIC);
+    put(&o, structure_hash(w));
+    const uint64_t head[] = { (uint64_t) w->now, qn_epoch(w->net), w->boundaries, w->advances, w->switches, w->starts,
+                              w->ends, w->life_step, w->life_round };
+    for (size_t i = 0; i < sizeof head / sizeof head[0]; i++) put(&o, head[i]);
+    for (size_t c = 0; c < w->ncells; c++) {
+        QInterval b = qn_base(w->net, (QnCell) c);
+        put(&o, (uint64_t) b.lo);
+        put(&o, (uint64_t) b.hi);
+    }
+    for (size_t g = 0; g < qn_group_count(w->net); g++) put(&o, qn_group_enabled(w->net, (QnGroup) g));
+    for (size_t i = 0; i < w->nphens; i++) {
+        Phen *p = &w->phens[i];
+        put(&o, (uint64_t) (int64_t) p->active);
+        put(&o, p->alive);
+        put(&o, p->flipped);
+        put(&o, p->predicts);
+        for (int m = NO_MODEL; m < (int) p->nmodels; m++) {
+            Att *a = att_of(w, (QwPhen) i, m);
+            if (!a->k) continue;
+            put(&o, a->predicted);
+            put(&o, (uint64_t) a->pred.horizon);
+            put(&o, (uint64_t) a->pred.event_lo);
+            put(&o, (uint64_t) a->pred.event_hi);
+            put(&o, a->events);
+            put(&o, a->nas);
+            for (size_t j = 0; j < a->nas; j++) {
+                put(&o, a->as[j].slot);
+                put(&o, a->as[j].cell);
+                put(&o, (uint64_t) a->as[j].range.lo);
+                put(&o, (uint64_t) a->as[j].range.hi);
+                put(&o, a->as[j].explicit_);
+            }
+            /* the private state of the kernel */
+            size_t need = 0;
+            if (a->inst && !(a->k->flags & QK_STATELESS)) {
+                if (!a->k->save) {
+                    free(o.p);
+                    return fail(w, QW_EKERNEL, "%s: kernel '%s' has private state and no save function: no snapshot",
+                                p->name, a->k->name);
+                }
+                need = a->k->save(a->inst, NULL, 0);
+            }
+            put(&o, need);
+            if (need) {
+                void *buf = malloc(need);
+                if (!buf) o.oom = true;
+                else {
+                    a->k->save(a->inst, buf, need);
+                    put_bytes(&o, buf, need);
+                    free(buf);
+                }
+            }
+        }
+    }
+    if (o.oom) {
+        free(o.p);
+        return fail(w, QW_ENOMEM, "out of memory");
+    }
+    *bytes = o.p;
+    *len = o.n;
+    return QW_OK;
+}
+
+/* Binds each kernel again, after the active models changed. */
+static QwStatus rebind_all(QWorld *w)
+{
+    for (size_t i = 0; i < w->nphens; i++)
+        for (int m = NO_MODEL; m < (int) w->phens[i].nmodels; m++) {
+            Att *a = att_of(w, (QwPhen) i, m);
+            if (!a->k) continue;
+            QnCell *bind = NULL;
+            QConv *ts = NULL, *tc = NULL;
+            bool via = false;
+            QwStatus st = bind_kernel(w, (QwPhen) i, m, a->k, NULL, 0, &bind, &ts, &tc, &via);
+            if (st) return st;
+            free(a->bind);
+            free(a->to_slot);
+            free(a->to_cell);
+            a->bind = bind;
+            a->to_slot = ts;
+            a->to_cell = tc;
+            a->via_model = via;
+        }
+    return QW_OK;
+}
+
+/* Reads a whole snapshot and changes nothing. False if the bytes end too soon, have bytes after the end, or
+ * have a value that the world cannot take. The caller checked the magic number and the structure. */
+static bool snapshot_whole(const QWorld *w, const void *bytes, size_t len)
+{
+    In in = { bytes, len, 16, false };
+    for (int i = 0; i < 9; i++) get(&in);
+    for (size_t c = 0; c < w->ncells; c++) {
+        QInterval b = { (int64_t) get(&in), (int64_t) get(&in) };
+        if (!in.bad && !w->cells[c].derived && !set_cell(w, (QnCell) c) && !qi_valid(b)) return false;
+    }
+    for (size_t g = 0; g < qn_group_count(w->net); g++) get(&in);
+    for (size_t i = 0; i < w->nphens && !in.bad; i++) {
+        const Phen *p = &w->phens[i];
+        int64_t active = (int64_t) get(&in);
+        for (int k = 0; k < 3; k++) get(&in);
+        if (active < NO_MODEL || active >= (int64_t) p->nmodels || (p->nmodels && active == NO_MODEL)) return false;
+        for (int m = NO_MODEL; m < (int) p->nmodels && !in.bad; m++) {
+            const Att *a = m == NO_MODEL ? &p->base : &p->models[m].att;
+            if (!a->k) continue;
+            for (int k = 0; k < 5; k++) get(&in);
+            uint64_t nas = get(&in);
+            if (in.bad || nas > (in.n - in.at) / 40) return false;
+            for (uint64_t j = 0; j < nas; j++) {
+                get(&in);
+                if (get(&in) >= w->ncells) return false;
+                for (int k = 0; k < 3; k++) get(&in);
+            }
+            uint64_t need = get(&in);
+            if (in.bad || need > in.n - in.at) return false;
+            in.at += (size_t) need;
+        }
+    }
+    return !in.bad && in.at == in.n;
+}
+
+QwStatus qw_restore(QWorld *w, const void *bytes, size_t len)
+{
+    In in = { bytes, len, 0, false };
+    if (get(&in) != SNAP_MAGIC || in.bad) return fail(w, QW_ESNAPSHOT, "the bytes are not a snapshot of a world");
+    if (get(&in) != structure_hash(w))
+        return fail(w, QW_ESNAPSHOT, "the snapshot is of a world with another structure: the phenomena, the cells, the models "
+                                  "and the kernels must be the same");
+    if (!snapshot_whole(w, bytes, len)) return fail(w, QW_ESNAPSHOT, "the snapshot is cut or damaged");
+    uint64_t head[9];
+    for (size_t i = 0; i < 9; i++) head[i] = get(&in);
+    clear_staging(w);
+    /* the base of each cell that is state */
+    for (size_t c = 0; c < w->ncells; c++) {
+        QInterval b = { (int64_t) get(&in), (int64_t) get(&in) };
+        if (in.bad) break;
+        if (w->cells[c].derived) continue;
+        QnStatus s = set_cell(w, (QnCell) c) ? qn_stage_set(w->net, (QnCell) c, (uint64_t) b.lo) : qn_stage(w->net, (QnCell) c, b);
+        if (s != QN_OK) return fail(w, QW_ESNAPSHOT, "the snapshot has a value that the cell '%s' cannot take", w->cells[c].path);
+    }
+    for (size_t g = 0; g < qn_group_count(w->net); g++) {
+        bool on = get(&in) != 0;
+        if (!in.bad) qn_group_enable(w->net, (QnGroup) g, on);
+    }
+    /* the active model and the life of each phenomenon, before the kernels bind again */
+    size_t phens_at = in.at;
+    for (size_t i = 0; i < w->nphens && !in.bad; i++) {
+        Phen *p = &w->phens[i];
+        int active = (int) (int64_t) get(&in);
+        bool alive = get(&in) != 0;
+        uint64_t flipped = get(&in), predicts = get(&in);
+        p->active = active;
+        if (alive != p->alive) {
+            p->alive = alive;
+            if (alive) {
+                QwStatus st = create_kernels(w, (QwPhen) i);
+                if (st) return st;
+            } else {
+                destroy_kernels(w, (QwPhen) i);
+            }
+        }
+        p->flipped = flipped;
+        p->predicts = predicts;
+        /* skip the kernels of this phenomenon: the second pass reads them */
+        for (int m = NO_MODEL; m < (int) p->nmodels && !in.bad; m++) {
+            if (!att_of(w, (QwPhen) i, m)->k) continue;
+            for (int k = 0; k < 5; k++) get(&in);
+            in.at += (size_t) get(&in) * 40;
+            in.at += (size_t) get(&in);
+        }
+    }
+    QwStatus st = rebind_all(w);
+    if (st) return st;
+    if (qn_restore_epoch(w->net, head[1]) != QN_OK) return fail(w, QW_ESNAPSHOT, "the network cannot open the epoch of the snapshot");
+    w->now = (int64_t) head[0];
+    w->boundaries = head[2];
+    w->advances = head[3];
+    w->switches = head[4];
+    w->starts = head[5];
+    w->ends = head[6];
+    w->life_step = head[7];
+    w->life_round = head[8];
+    w->nlog = 0;
+    if ((st = settle(w))) return st;
+    /* the prediction, the assumptions, the event count and the private state of each kernel */
+    in.at = phens_at;
+    for (size_t i = 0; i < w->nphens; i++) {
+        Phen *p = &w->phens[i];
+        for (int k = 0; k < 4; k++) get(&in);
+        for (int m = NO_MODEL; m < (int) p->nmodels; m++) {
+            Att *a = att_of(w, (QwPhen) i, m);
+            if (!a->k) continue;
+            a->predicted = get(&in) != 0;
+            a->pred.horizon = (int64_t) get(&in);
+            a->pred.event_lo = (int64_t) get(&in);
+            a->pred.event_hi = (int64_t) get(&in);
+            a->events = get(&in);
+            size_t nas = (size_t) get(&in);
+            if (!grow((void **) &a->as, &a->capas, nas, sizeof *a->as)) return fail(w, QW_ENOMEM, "out of memory");
+            a->nas = nas;
+            for (size_t j = 0; j < nas; j++) {
+                a->as[j].slot = (uint32_t) get(&in);
+                a->as[j].cell = (QnCell) get(&in);
+                a->as[j].range.lo = (int64_t) get(&in);
+                a->as[j].range.hi = (int64_t) get(&in);
+                a->as[j].explicit_ = get(&in) != 0;
+            }
+            size_t need = (size_t) get(&in);
+            if (need) {
+                if (!a->inst || !a->k->restore || a->k->restore(a->inst, in.p + in.at, need) != QK_OK)
+                    return fail(w, QW_EKERNEL, "%s: kernel '%s' cannot take its state from the snapshot", p->name, a->k->name);
+                in.at += need;
+            }
+        }
+    }
+    return QW_OK;
 }
 
 uint64_t qw_hash(const QWorld *w)

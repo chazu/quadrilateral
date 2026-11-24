@@ -19,5 +19,6 @@ Seeded refinement, replay, debugging by evaluation time, and comparison of two r
 
 ## Consequences
 
+- A world can save its state and take it back (`qw_snapshot`, `qw_restore`, since `quad-5xe.1`). The test of rule 8 uses it. A run that a restore continues at 500 s gives the same hashes as a run with no stop. The snapshot holds more than the state hash covers. It has the prediction, the assumptions and the event count of each kernel, and the private state of a kernel. These decide the next boundary. A restore needs a world with the same structure: the snapshot has no cells or kernels, only their state.
 - Phenomenon identities must be stable for the same inputs. The runtime assigns them in a defined order, not from allocation addresses.
 - A budget that stops propagation early gives a result that depends on the agenda order. Rule 6 makes that result reproducible (ADR 0008).

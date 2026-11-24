@@ -684,6 +684,17 @@ QnStatus qn_stage(QNet *net, QnCell c, QInterval v)
     return QN_OK;
 }
 
+QnStatus qn_begin_epoch(QNet *net);
+
+QnStatus qn_restore_epoch(QNet *net, uint64_t epoch)
+{
+    QnStatus s = qn_begin_epoch(net);
+    if (s == QN_OK) net->epoch = epoch;
+    return s;
+}
+
+size_t qn_group_count(const QNet *net) { return net->ngroups; }
+
 QnStatus qn_begin_epoch(QNet *net)
 {
     if (net->propagating) return QN_EPROPAGATING;
