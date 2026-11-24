@@ -257,8 +257,8 @@ static X *data_of(Exp *e, X *x, int depth)
         X *v = data_at(e, e->root, x->u.name, depth + 1);
         if (!v) {
             char msg[300];
-            snprintf(msg, sizeof msg, "%s is not written in this declaration, so a comprehension or a function cannot "
-                     "read it", x->u.name);
+            snprintf(msg, sizeof msg, "%s is not written in this declaration: a comprehension, a function or an "
+                     "interpolation reads only values that the content writes", x->u.name);
             exp_error(e, x->loc, msg);
             return x;
         }
@@ -430,15 +430,50 @@ static int cond_eval(Exp *e, X *x, bool loud)
     }
 }
 
+/* The string of an interpolation, "Nails-\(.count)": each part is a value
+ * that is known when content loads. A number has its text as the content
+ * writes it. x has its parts expanded. NULL with a diagnostic. */
+static X *interp_eval(Exp *e, X *x)
+{
+    Buf b = { 0 };
+    for (int i = 0; i <= x->u.in.n && e->ok; i++) {
+        qf_buf_puts(&b, x->u.in.lits[i]);
+        if (i == x->u.in.n) break;
+        X *v = data_of(e, x->u.in.parts[i], 0);
+        if (!e->ok) break;
+        Num n;
+        if (v->k == X_ATOM && v->u.name[0] == '"') {
+            Buf s = { 0 };
+            qf_string_decode(v->u.name, &s);
+            qf_buf_puts(&b, s.s ? s.s : "");
+            qf_buf_free(&s);
+        } else if (v->k == X_ATOM && (!strcmp(v->u.name, "true") || !strcmp(v->u.name, "false"))) {
+            qf_buf_puts(&b, v->u.name);
+        } else if (num_of(e->f, v, &n)) {
+            qf_print(&b, v);
+        } else {
+            char *t = x_text(x->u.in.parts[i]);
+            char msg[400];
+            snprintf(msg, sizeof msg, "an interpolation takes a number, a string, or true or false that is known when "
+                     "content loads: not %s", t);
+            free(t);
+            exp_error(e, x->u.in.parts[i]->loc, msg);
+        }
+    }
+    X *r = e->ok ? atom_x(e->f, b.s ? b.s : "", b.len, x->loc) : NULL;
+    qf_buf_free(&b);
+    return r;
+}
+
 /* A computed label: a name, from a string. */
 static Sym label_of(Exp *e, X *x, Loc loc)
 {
     Buf b = { 0 };
-    X *v = x->k == X_INTERP ? x : data_of(e, x, 0);
+    X *v = data_of(e, x, 0);
     const char *err = NULL;
     char why[300];
-    if (v->k == X_INTERP) err = "a label with an interpolation is not in this stage (quad-ijx.11)";
-    else if (v->k == X_ATOM && v->u.name[0] == '"') qf_string_decode(v->u.name, &b);
+    if (!e->ok) return NULL;
+    if (v->k == X_ATOM && v->u.name[0] == '"') qf_string_decode(v->u.name, &b);
     else {
         char *t = x_text(v);
         snprintf(why, sizeof why, "a computed label is a string: not %s", t);
@@ -1002,7 +1037,8 @@ static X *expand(Exp *e, X *x, const Env *env)
         X *n = x_copy(e, x);
         n->u.in.parts = qf_alloc(f->arena, (size_t) (x->u.in.n ? x->u.in.n : 1) * sizeof(X *));
         for (int i = 0; i < x->u.in.n; i++) n->u.in.parts[i] = expand(e, x->u.in.parts[i], env);
-        return n;
+        X *text = e->ok ? interp_eval(e, n) : NULL;
+        return text ? text : x;
     }
     case X_BOUND: {                                /* a bound by a named value: the number now */
         if (!x->u.bound.of) return x;

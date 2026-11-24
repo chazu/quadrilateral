@@ -416,6 +416,10 @@ typedef struct Front {
     size_t    nerrors;
     VEC(LetName) lets;
     bool      parsed_comp;  /* the last qf_parse_expr had comprehensions, conditions or calls */
+    VEC(struct RxSet *) rxsets;     /* the interned sets of text constraints */
+    U64Map    rxsetidx;     /* hash of a set → its index + 1 */
+    U64Map    rxcache;      /* Sym of a pattern → its compiled Regex */
+    VEC(struct Regex *) regexes;    /* each compiled Regex, for the end of the Front */
     U64Map    declidx;      /* the label of a declaration → its first index + 1, for the expansion */
     bool      declidx_built;
 
@@ -489,6 +493,31 @@ X   *qf_parse_expr(Front *f, const char *file, const char *src);
 void qf_print(Buf *b, const X *x);
 /* The declarations of one file, with their docstrings and the package line. */
 void qf_print_decls(Buf *b, const Decl *d, size_t n);
+
+/* --- text constraints (regex.c, text.c; quad-ijx.11) ------------------------------------------ */
+
+/* A regular expression for =~ and !~, in the syntax of RE2. Matching takes
+ * time linear in the text. Triangle's regex.c (ADR 0003). */
+typedef struct Regex Regex;
+Regex *regex_compile(const char *pat, size_t len, char *err, size_t errlen);   /* NULL with err */
+bool   regex_match(const Regex *re, const char *s, size_t n);
+void   regex_free(Regex *re);
+
+/* The constraints of a text value that is not one string yet: each is a
+ * pattern that the text must match (=~) or must not match (!~). The sets are
+ * interned in the Front, so two equal sets are one pointer. A text node with
+ * constraints has lo == Q_NINF and the set in hi. */
+typedef struct { Sym pat; bool neg; Regex *re; } RxItem;
+typedef struct RxSet { uint32_t n; RxItem *v; uint64_t hash; } RxSet;
+const RxSet *text_rx(int64_t lo, int64_t hi);                                 /* NULL if the value has no constraint */
+const RxSet *rx_single(Front *f, Sym pat, bool neg, char *err, size_t errlen);    /* NULL with err for a bad pattern */
+const RxSet *rx_union(Front *f, const RxSet *a, const RxSet *b);
+const RxSet *rx_common(Front *f, const RxSet *a, const RxSet *b);             /* NULL if they share none */
+const RxSet *rx_satisfied(Front *f, const RxSet *s, Sym text);                /* the ones that the text meets */
+bool         rx_accepts(const RxSet *s, Sym text);                            /* text: a canonical string */
+bool         rx_subset(const RxSet *a, const RxSet *b);
+void         rx_print(Buf *b, const RxSet *s);                                /* =~"..." & !~"..." */
+void         rx_free_all(Front *f);
 
 /* Expands the comprehensions, the computed labels and the function calls of
  * each declaration, and gives an expression of numbers its value (expand.c).
