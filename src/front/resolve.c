@@ -2038,20 +2038,51 @@ static QfNode *resolve_defaults(QfOp *c, QfNode *root, const InstInfo *in, size_
     return root;
 }
 
-/* An error for each default that can never apply: a default of a type that
- * does not fit the field in that type, and a default of an instance that is
- * not a value of its other alternative. */
-static void check_defaults(Front *f)
+/* Builds the value of a default, and for `*d | rest` checks that d is a value
+ * of rest. False with a diagnostic if the value has an error or does not fit. */
+static bool default_probe(Front *f, const DefaultRec *d, const char *who)
 {
     QfOp *c = f->op;
+    QfMark m = qf_arena_mark(c->scratch.arena);
+    uint32_t mn = c->scratch.n;
+    uint64_t saved = op_begin(c);
+    Build b = { 0 };
+    b.c = c; b.ok = true; b.owner = QF_BOTTOM;
+    path_set(c, NULL, 0);
+    QfNode *v = build_raw(&b, d->value), *r = v && d->rest ? build_raw(&b, d->rest) : NULL;
+    bool ok = v && (!d->rest || r);
+    reset_failure(c);
+    if (r && !unify1(c, r, v)) {
+        Buf pth = { 0 };
+        path_format(f, &pth, d->path.v, d->path.n);
+        qf_diag(f, true, d->value->loc, "%s: the default for %s is not a value of its other alternative: %s. In "
+                "*d | rest, the default d must be one of the values of rest", who, pth.s, fail_info(c)->text);
+        qf_buf_free(&pth);
+        ok = false;
+    }
+    build_free(&b);
+    op_end(c, saved);
+    qf_arena_release(c->scratch.arena, m);
+    c->scratch.n = mn;
+    c->depth = 0;
+    c->failed = false;
+    c->failfmt = false;
+    return ok;
+}
+
+/* An error for each default that can never apply: a default that is not a
+ * value of its other alternative, and a default of a type that does not fit
+ * the field in that type. A default of an instance can lose to a value of the
+ * instance, and that is not an error. */
+static void check_defaults(Front *f)
+{
     QfStore *tmp = qf_store_new();
     for (uint32_t t = 0; t < f->types.n; t++) {
         for (size_t i = 0; i < f->types.v[t].defaults.n; i++) {
             DefaultRec *d = &f->types.v[t].defaults.v[i];
             if (d->contributor != t || !f->types.v[t].expansion) continue;
             Buf why = { 0 }, pth = { 0 };
-            size_t errors = f->nerrors;
-            if (!try_defaults(c, f->types.v[t].expansion, &d, 1, tmp, &why) && f->nerrors == errors) {
+            if (default_probe(f, d, f->types.v[t].name) && !try_defaults(f->op, f->types.v[t].expansion, &d, 1, tmp, &why)) {
                 path_format(f, &pth, d->path.v, d->path.n);
                 qf_diag(f, true, d->value->loc, "%s: the default for %s can never apply: %s", f->types.v[t].name, pth.s,
                         why.s ? why.s : "its type does not allow the value");
@@ -2060,36 +2091,10 @@ static void check_defaults(Front *f)
             qf_buf_free(&pth);
         }
     }
-    for (uint32_t i = 0; i < f->insts.n; i++) {
-        for (size_t k = 0; k < f->insts.v[i].defaults.n; k++) {
-            DefaultRec *d = &f->insts.v[i].defaults.v[k];
-            if (d->contributor != QF_CONTRIB_INSTANCE) continue;
-            /* against its other alternative only: a value of the instance can
-             * make the default lose, and that is not an error */
-            QfMark m = qf_arena_mark(c->scratch.arena);
-            uint32_t mn = c->scratch.n;
-            uint64_t saved = op_begin(c);
-            Build b = { 0 };
-            b.c = c; b.ok = true; b.owner = QF_BOTTOM;
-            path_set(c, NULL, 0);
-            QfNode *v = build_raw(&b, d->value), *r = v && d->rest ? build_raw(&b, d->rest) : NULL;
-            reset_failure(c);
-            if (r && !unify1(c, r, v)) {
-                Buf pth = { 0 };
-                path_format(f, &pth, d->path.v, d->path.n);
-                qf_diag(f, true, d->value->loc, "%s: the default for %s can never apply: %s", f->insts.v[i].name, pth.s,
-                        fail_info(c)->text);
-                qf_buf_free(&pth);
-            }
-            build_free(&b);
-            op_end(c, saved);
-            qf_arena_release(c->scratch.arena, m);
-            c->scratch.n = mn;
-            c->depth = 0;
-            c->failed = false;
-            c->failfmt = false;
-        }
-    }
+    for (uint32_t i = 0; i < f->insts.n; i++)
+        for (size_t k = 0; k < f->insts.v[i].defaults.n; k++)
+            if (f->insts.v[i].defaults.v[k].contributor == QF_CONTRIB_INSTANCE)
+                default_probe(f, &f->insts.v[i].defaults.v[k], f->insts.v[i].name);
     qf_store_free(tmp);
 }
 

@@ -1721,11 +1721,19 @@ void test_defaults(void)
            "a.quad:1:17: error: a disjunction of numbers is not a type; use a range, or an enum of atoms");
     /* a default that can never apply: in a type, against the field; in an instance, against its other alternative */
     STR_EQ(load_error("#T: { x: *1 | 2 }\n"),
-           "a.quad:1:11: error: #T: the default for x can never apply: x: 2 and 1 are different values");
+           "a.quad:1:11: error: #T: the default for x is not a value of its other alternative: 2 and 1 are different "
+           "values. In *d | rest, the default d must be one of the values of rest");
+    STR_EQ(load_error("#T: { x: *0 | >=1 & <=10 }\n"),
+           "a.quad:1:11: error: #T: the default for x is not a value of its other alternative: the range 1 .. 10 and 0 "
+           "have no value in common. In *d | rest, the default d must be one of the values of rest");
+    /* the default is a value of its other alternative, and the field of the supertype refuses it */
+    STR_EQ(load_error("#F: { f: >=5 }\n#P: #F & { f: *0 | number }\n"),
+           "a.quad:2:16: error: #P: the default for f can never apply: f: >= 5 and 0 have no value in common");
     STR_EQ(load_error("#F: { f: \"a\" | \"b\" | \"c\" }\n#P: #F & { f: *\"z\" }\n"),
            "a.quad:2:16: error: #P: the default for f can never apply: f: \"z\" is not one of \"a\" | \"b\" | \"c\"");
     STR_EQ(load_error("#H: { h: number }\nx: #H & { h: *\"q\" | number }\n"),
-           "a.quad:2:15: error: x: the default for h can never apply: \"q\" is not a number");
+           "a.quad:2:15: error: x: the default for h is not a value of its other alternative: \"q\" is not a number. "
+           "In *d | rest, the default d must be one of the values of rest");
     /* an error in the value of a default comes once, and not for each instance */
     static const char *const nope[] = { "#T: { x: *nope | number }\na: #T\nb: #T\n" };
     STR_EQ(all_diags(nope, 1), "a.quad:1:11: error: unknown name nope\n");
