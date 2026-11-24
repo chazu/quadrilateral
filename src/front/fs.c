@@ -1,4 +1,5 @@
 #include "front/front.h"
+#include "quad/ir.h"
 
 #include <stdio.h>
 
@@ -464,6 +465,215 @@ static void fail_at(QfOp *c, QfNode *a, QfNode *b, const char *why)
     }
 }
 
+/* --- a failure in the words of the author ------------------------------------------------- */
+
+static bool is_quantity(const Front *f, uint32_t t)
+{
+    TypeKind k = f->types.v[t].kind;
+    return k == TK_KIND || k == TK_DIMT;
+}
+
+/* The unit of a quantity type: V, K, m^2. Empty for a plain number. */
+static void unit_text(const Front *f, Buf *b, uint32_t type)
+{
+    Buf d = { 0 };
+    qf_dim_format(f, &d, &f->dims.v[f->types.v[type].dimix].dim);
+    qf_buf_puts(b, qi_unit(d.s));
+    qf_buf_free(&d);
+    if (!b->s) qf_buf_puts(b, "");
+}
+
+static void say_num(Buf *b, const char *op, int64_t v, int exp, const char *unit)
+{
+    qf_buf_puts(b, op);
+    qf_dec_format(b, v, exp);
+    if (*unit) qf_buf_printf(b, " %s", unit);
+}
+
+/* A side of a failure: 12 A, >= 20 V, %voltage, a quantity in W, "text", #Lamp. */
+static void say_value(const Front *f, Buf *b, uint32_t type, QfVal v)
+{
+    const TypeInfo *ti = &f->types.v[type];
+    if (ti->kind == TK_NUMBER) { qf_buf_puts(b, "a number"); return; }
+    if (!is_quantity(f, type)) { describe_value(f, b, type, v); return; }
+    Buf u = { 0 };
+    unit_text(f, &u, type);
+    if (open_val(v)) {
+        if (ti->kind == TK_KIND) qf_buf_puts(b, ti->name);
+        else qf_buf_printf(b, u.len ? "a quantity in %s" : "a number%s", u.s);
+    } else {
+        QfDec d = as_dec(f, type, v);
+        bool lo = d.lo != Q_NINF, hi = d.hi != Q_INF;
+        if (d.lo == d.hi) {
+            say_num(b, "", d.lo, d.exp, u.s);
+        } else if (lo && hi && !d.lo_open && !d.hi_open) {
+            say_num(b, "the range ", d.lo, d.exp, u.s);
+            say_num(b, " .. ", d.hi, d.exp, u.s);
+        } else {
+            if (lo && hi) qf_buf_puts(b, "the range ");
+            if (lo) say_num(b, d.lo_open ? "> " : ">= ", d.lo, d.exp, u.s);
+            if (lo && hi) qf_buf_puts(b, " and ");
+            if (hi) say_num(b, d.hi_open ? "< " : "<= ", d.hi, d.exp, u.s);
+        }
+    }
+    qf_buf_free(&u);
+}
+
+/* The side has one value, and is not only a type. */
+static bool concrete(const Front *f, uint32_t type, QfVal v)
+{
+    TypeKind k = f->types.v[type].kind;
+    if (k == TK_ATOM) return true;
+    if (!is_value(f, type)) return false;
+    return k == TK_TEXT || k == TK_CONSTRAINT ? v.lo == v.hi : !open_val(v);
+}
+
+/* "<value> is not ...": of the kind %voltage, a quantity in W, text, one of "p" | "q". */
+static void say_is_not(const Front *f, Buf *b, const char *value, uint32_t type, const char *text)
+{
+    TypeKind k = f->types.v[type].kind;
+    qf_buf_printf(b, "%s is not %s%s", value,
+                  k == TK_KIND ? "of the kind " : k == TK_DIMT || k == TK_NUMBER || k == TK_TEXT ? ""
+                  : strstr(text, " | ") ? "one of " : "of the type ", text);
+}
+
+/* v + 273.15, as text: the kelvin value for a number of degrees Celsius. False if it does not fit. */
+static bool kelvin_text(Buf *b, QfDec d)
+{
+    int64_t v = d.lo, k = 27315;
+    int e = d.exp, ke = -2;
+    for (; e > ke; e--)
+        if (__builtin_mul_overflow(v, (int64_t) 10, &v)) return false;
+    for (; ke > e; ke--)
+        if (__builtin_mul_overflow(k, (int64_t) 10, &k)) return false;
+    if (__builtin_add_overflow(v, k, &v)) return false;
+    qf_dec_format(b, v, e);
+    return true;
+}
+
+/* Two quantities with different dimensions. */
+static void explain_units(const Front *f, Buf *b, const char *l, const char *r, uint32_t lt, uint32_t rt, QfVal lv,
+                          QfVal rv, const char *lu, const char *ru)
+{
+    bool lc = concrete(f, lt, lv), rc = concrete(f, rt, rv);
+    if (lc == rc) {
+        if (lc) qf_buf_printf(b, "%s and %s have different units", l, r);
+        else qf_buf_printf(b, "%s and %s are different: the unit of the first is %s, and the unit of the second is %s", l, r,
+                           *lu ? lu : "1", *ru ? ru : "1");
+        return;
+    }
+    /* a value and a type */
+    const char *val = lc ? l : r, *type = lc ? r : l, *vu = lc ? lu : ru, *tu = lc ? ru : lu;
+    uint32_t tt = lc ? rt : lt;
+    bool kind = f->types.v[tt].kind == TK_KIND;
+    if (!*vu) {
+        qf_buf_printf(b, "%s has no unit, and %s%s", val, kind ? type : "the field is ", kind ? "" : type);
+        if (kind) qf_buf_printf(b, " has the unit %s", tu);
+    } else if (!*tu) {
+        qf_buf_printf(b, "%s has a unit, and %s%s", val, kind ? type : "the field is a number with no unit",
+                      kind ? " is a number with no unit" : "");
+    } else {
+        say_is_not(f, b, val, tt, type);
+        if (kind) qf_buf_printf(b, ". The unit of %s is %s", type, tu);
+    }
+    if (!strcmp(vu, "C") && !strcmp(tu, "K")) {
+        QfDec d = as_dec(f, lc ? lt : rt, lc ? lv : rv);
+        Buf k = { 0 }, c = { 0 };
+        qf_buf_puts(b, ". The unit C is the coulomb. Write a temperature in kelvin");
+        if (d.lo == d.hi && kelvin_text(&k, d)) {
+            qf_dec_format(&c, d.lo, d.exp);
+            qf_buf_printf(b, ": %s degrees Celsius is %sK", c.s, k.s);
+        }
+        qf_buf_free(&k);
+        qf_buf_free(&c);
+    }
+}
+
+/* A value that does not fit the steps of a kind. `why` is a reason of qf_dec_to_quanta. */
+static bool explain_steps(const Front *f, Buf *b, const char *why, const char *val, QfDec d, uint32_t kt, const char *unit)
+{
+    const KindInfo *k = &f->kinds.v[f->types.v[kt].kindix];
+    const char *name = f->types.v[kt].name;
+    Buf step = { 0 };
+    say_num(&step, "", 1, k->scale, unit);
+    bool known = true;
+    if (!strcmp(why, "the value is not a multiple of the smallest step of the kind")) {
+        qf_buf_printf(b, "%s is not a multiple of the smallest step of %s, which is %s", val, name, step.s);
+        if (!k->fixed) qf_buf_printf(b, ". For a smaller step, declare %s with scale: %d", name, qf_dec_norm(d).exp);
+    } else if (!strcmp(why, "the range holds no multiple of the smallest step of the kind")) {
+        qf_buf_printf(b, "no multiple of the smallest step of %s, which is %s, is in %s", name, step.s, val);
+        if (!k->fixed) qf_buf_printf(b, ". For a smaller step, declare %s with a smaller scale than %d", name, k->scale);
+    } else if (!strcmp(why, "the value does not fit in the range of the kind")) {
+        qf_buf_printf(b, "%s is too large for %s, which has the smallest step %s", val, name, step.s);
+        if (!k->fixed) qf_buf_printf(b, ". For larger values, declare %s with a larger scale than %d", name, k->scale);
+    } else {
+        known = false;
+    }
+    qf_buf_free(&step);
+    return known;
+}
+
+void qf_say_fields(const Front *f, Buf *b, uint32_t type)
+{
+    const TypeInfo *ti = &f->types.v[type];
+    if (!ti->feats.n) return;
+    qf_buf_printf(b, ". The fields of %s are: ", ti->kind == TK_DEF ? ti->name : "this type");
+    enum { MOST = 12 };
+    for (size_t i = 0; i < ti->feats.n && i < MOST; i++)
+        qf_buf_printf(b, "%s%s", i ? ", " : "", f->feats.v[ti->feats.v[i]].name);
+    if (ti->feats.n > MOST) qf_buf_printf(b, ", and %zu more", ti->feats.n - MOST);
+}
+
+/* The failure as one sentence, with no path: "12 A is not of the kind
+ * %voltage. The unit of %voltage is V". */
+static void explain(QfOp *c, Buf *b)
+{
+    const Front *f = c->f;
+    uint32_t lt = c->failraw.ltype, rt = c->failraw.rtype;
+    QfVal lv = c->failraw.l, rv = c->failraw.r;
+    const char *why = c->failraw.why;
+    Buf l = { 0 }, r = { 0 }, lu = { 0 }, ru = { 0 };
+    say_value(f, &l, lt, lv);
+    if (!c->failraw.hasr) {
+        qf_buf_printf(b, "%s %s", l.s, why ? why : "has no value");
+        if (why && !strcmp(why, "has no field with this name")) qf_say_fields(f, b, lt);
+        qf_buf_free(&l);
+        return;
+    }
+    say_value(f, &r, rt, rv);
+    bool lq = is_quantity(f, lt), rq = is_quantity(f, rt);
+    bool lc = concrete(f, lt, lv), rc = concrete(f, rt, rv);
+    bool lk = f->types.v[lt].kind == TK_KIND, rk = f->types.v[rt].kind == TK_KIND;
+    if (lq) unit_text(f, &lu, lt);
+    if (rq) unit_text(f, &ru, rt);
+    bool far = why && !strcmp(why, "the number is out of range");
+    if (lk && rk && lt != rt && (!lc || !rc || f->types.v[lt].dimix == f->types.v[rt].dimix)) {
+        qf_buf_printf(b, "%s and %s are different kinds", f->types.v[lt].name, f->types.v[rt].name);
+    } else if (lq && rq && f->types.v[lt].dimix != f->types.v[rt].dimix) {
+        explain_units(f, b, l.s, r.s, lt, rt, lv, rv, lu.s, ru.s);
+    } else if (far) {
+        qf_buf_printf(b, "%s and %s are too far apart for a comparison", l.s, r.s);
+    } else if (lq && rq && why && lk != rk &&
+               explain_steps(f, b, why, lk ? r.s : l.s, val_dec(lk ? rv : lv), lk ? lt : rt, lk ? lu.s : ru.s)) {
+        /* done */
+    } else if (lc != rc && !(lq && rq)) {
+        say_is_not(f, b, lc ? l.s : r.s, lc ? rt : lt, lc ? r.s : l.s);
+    } else if (f->types.v[lt].kind == TK_CONSTRAINT && f->types.v[rt].kind == TK_CONSTRAINT && lc && rc) {
+        qf_buf_printf(b, "the law has two texts: %s, and %s", l.s, r.s);
+    } else if (lc && rc && (!lq || (lv.lo == lv.hi && rv.lo == rv.hi))) {
+        qf_buf_printf(b, "%s and %s are different values", l.s, r.s);
+    } else if (lq && rq) {
+        qf_buf_printf(b, "%s and %s have no value in common", l.s, r.s);
+    } else {
+        qf_buf_printf(b, "a value cannot be both %s and %s", l.s, r.s);
+    }
+    if (why && !far && !(lq && rq && lk != rk)) qf_buf_printf(b, " (%s)", why);
+    qf_buf_free(&l);
+    qf_buf_free(&r);
+    qf_buf_free(&lu);
+    qf_buf_free(&ru);
+}
+
 QfFailure *fail_info(QfOp *c)
 {
     if (c->failfmt) return &c->fail_;
@@ -478,6 +688,10 @@ QfFailure *fail_info(QfOp *c)
     snprintf(c->fail_.left, sizeof c->fail_.left, "%s", l.s ? l.s : "");
     snprintf(c->fail_.right, sizeof c->fail_.right, "%s", r.s ? r.s : "");
     snprintf(c->fail_.why, sizeof c->fail_.why, "%s", c->failraw.why ? c->failraw.why : "");
+    Buf t = { 0 };
+    explain(c, &t);
+    snprintf(c->fail_.text, sizeof c->fail_.text, "%s", t.s ? t.s : "");
+    qf_buf_free(&t);
     qf_buf_free(&p);
     qf_buf_free(&l);
     qf_buf_free(&r);
@@ -588,7 +802,7 @@ bool unify1(QfOp *c, QfNode *a, QfNode *b)
         if (tv) {
             if (!unify1(c, tv, arc->val)) return false;
         } else if (!approp(f, t, ft)) {
-            fail_at(c, target, NULL, "the type does not allow this feature");
+            fail_at(c, target, NULL, "has no field with this name");
             return false;
         } else {
             carc_add(c, target, ft, arc->val);

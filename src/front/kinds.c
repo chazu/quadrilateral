@@ -357,7 +357,7 @@ const char *qf_dec_to_quanta(QfDec d, int scale, int64_t *lo, int64_t *hi)
         bool exact;
         if (finite(d.lo)) {
             int64_t f = div_floor(d.lo, -k, &exact);
-            if (point && !exact) return "the value is not a whole number of quanta of the kind";
+            if (point && !exact) return "the value is not a multiple of the smallest step of the kind";
             *lo = exact && !d.lo_open ? f : f + 1;          /* inward: the next quantum above */
         }
         if (finite(d.hi)) {
@@ -366,7 +366,7 @@ const char *qf_dec_to_quanta(QfDec d, int scale, int64_t *lo, int64_t *hi)
         }
     }
     if (*lo == Q_INF || *hi == Q_NINF || *lo == Q_NINF + 1) return range;
-    if (*lo > *hi) return "the range holds no whole number of quanta of the kind";
+    if (*lo > *hi) return "the range holds no multiple of the smallest step of the kind";
     return NULL;
 }
 

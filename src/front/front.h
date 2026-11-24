@@ -343,6 +343,7 @@ typedef struct {
     char left[160];
     char right[160];
     char why[160];               /* a reason beyond "these two do not meet", or empty */
+    char text[480];              /* the failure as one sentence, in the words of the author */
 } QfFailure;
 
 /* The context of operations (ADR 0015 section 7). It owns everything that
@@ -597,6 +598,7 @@ void     carc_add(QfOp *c, QfNode *n, uint32_t f, QfNode *v);
 QfNode  *deref(QfOp *c, QfNode *n);
 QfVal    node_val(QfOp *c, const QfNode *n);
 bool     unify1(QfOp *c, QfNode *a, QfNode *b);
+void     qf_say_fields(const Front *f, Buf *b, uint32_t type);   /* ". The fields of #T are: a, b", or nothing */
 QfFailure *fail_info(QfOp *c);                           /* the last failure, formatted */
 QfNode  *copy_raw(QfOp *c, QfStore *a, QfNode *n);
 QfNode  *copy_out(QfOp *c, QfStore *a, QfNode *n, bool *closed_ok);

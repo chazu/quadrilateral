@@ -724,7 +724,7 @@ void test_elab_expressions(void)
     qi_free(ir);
     STR_EQ(compile_error("#R: #Phenomenon & { rate: %energy / %time }\nr: #R & { rate: 0.00001W }\n"),
            "world.quad:2:1: error: r.rate has no kind, so it has the scale -3 of its dimension, and its value does not "
-           "fit: the value is not a whole number of quanta of the kind. Give the field a kind with another scale\n");
+           "fit: the value is not a multiple of the smallest step of the kind. Give the field a kind with another scale\n");
     STR_EQ(compile_error("#R: #Phenomenon & { rate: %energi / %time }\nr: #R\n"),
            "world.quad:1:27: error: unknown kind %energi. Declare it: %energi: { dimension: \"J\" }\n"
            "world.quad:2:4: error: cannot expand #R\n");
@@ -758,7 +758,7 @@ void test_elab_named_laws(void)
 
     /* two declarations of one law must agree */
     HAS(compile_error("#Odd: #LumpedRoom & { storage: .energy == .capacity + .temperature }\no: #Odd & { energy: 1J, capacity: 1J/K }\n"),
-        "conflict at storage");
+        "storage: the law has two texts");
 
     /* The labels of the prelude are in its package. A type of the content
      * can have a field `evaluator` or `laws` of its own, and a list of laws
@@ -1644,7 +1644,7 @@ void test_elab_errors(void)
            "world.quad:4:1: error: wall.hot has two connections: a port connects to one port\n");
     HAS(compile_error(ROOMS "wall: #ConductiveWall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 0.01 }\n"
                             "wall: { hot: roomB.west }\n"),
-        "wall: conflict at hot.energy");
+        "wall: hot.energy: 3031500 J and 2931500 J are different values");
 
     /* a phenomenon inside a phenomenon */
     STR_EQ(compile_error("#House: #Phenomenon & { room: #LumpedRoom }\nh: #House & { room: { energy: 1J, capacity: 1J/K } }\n"),
