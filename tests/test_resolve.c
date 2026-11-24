@@ -25,6 +25,16 @@ static const char *const KINDS =
     "%energy: { dimension: \"J\", scale: -3, conserved: true }\n";
 
 /* Loads sources. The result is valid until qf_free. */
+#define HAS_TEXT(text, part)                                                           \
+    do {                                                                               \
+        const char *t_ = (text), *p_ = (part);                                         \
+        t_checks++;                                                                    \
+        if (!strstr(t_, p_)) {                                                         \
+            t_failures++;                                                              \
+            fprintf(stderr, "%s:%d:\n  got    %s\n  wanted a text with %s\n", __FILE__, __LINE__, t_, p_); \
+        }                                                                              \
+    } while (0)
+
 static Front *load(const char *const *sources, size_t n, bool *ok)
 {
     static const char *const names[] = { "a.quad", "b.quad", "c.quad", "d.quad", "e.quad", "f.quad", "g.quad", "h.quad" };
@@ -977,13 +987,6 @@ void test_resolve_fixture(void)
 void test_resolve_errors(void)
 {
     /* what a later stage brings: each error names its issue */
-    STR_EQ(load_error("#T: { xs: [for x in [1] { x }] }\n"),
-           "a.quad:1:12: error: a comprehension or a function is not in this stage (quad-ijx.9)");
-    STR_EQ(load_error("#T: { for x in [1] { a: x } }\n"),
-           "a.quad:1:7: error: a comprehension or a function is not in this stage (quad-ijx.9)");
-    STR_EQ(load_error("#T: { x: len([1]) }\n"),
-           "a.quad:1:10: error: a comprehension or a function is not in this stage (quad-ijx.9)");
-    STR_EQ(load_error("#T: { (\"a\"): 1 }\n"), "a.quad:1:7: error: a computed label is not in this stage (quad-ijx.9)");
     STR_EQ(load_error("#T: { x: =~\"^a\" }\n"),
            "a.quad:1:10: error: a regular-expression constraint is not in this stage (quad-ijx.11)");
     STR_EQ(load_error("#T: { x: \"a \\(1)\" }\n"), "a.quad:1:10: error: string interpolation is not in this stage (quad-ijx.11)");
@@ -1539,6 +1542,155 @@ static size_t generated_types(const Front *f)
     size_t n = 0;
     for (uint32_t t = 0; t < f->types.n; t++) n += f->types.v[t].kind == TK_GLB;
     return n;
+}
+
+/* --- comprehensions and built-in functions (quad-ijx.9) ---------------------------------------- */
+
+/* A comprehension, a computed label and a function call are expanded when
+ * content loads. The data of the workshop example (tests/data/workshop/data.tri)
+ * gives the values that Triangle gives. */
+void test_comprehensions(void)
+{
+    /* the workshop data. Its variables m and s have other names here: m and s are unit symbols */
+    static const char shop[] =
+        "let ratios = [1, 2, 4]\n"
+        "#Gearbox: { teeth: [...number] }\n"
+        "gearbox: #Gearbox & { teeth: [for r in ratios if r > 1 { r * 12 }] }\n"
+        "let sizes = [10mm, 13mm, 17mm, 19mm, 24mm]\n"
+        "#Material: \"steel\" | \"brass\" | \"oak\" | \"ash\"\n"
+        "#Stock: { for mat in #Material { (mat): number & >=0 & <=50 } }\n"
+        "#Rack: { slots: [...%length], stock: #Stock }\n"
+        "rack: #Rack & {\n"
+        "    _spare: 2\n"
+        "    slots:  [for size in sizes if size > 12mm { size }]\n"
+        "    stock:  { steel: len(.slots) + _spare, brass: 0, oak: 0, ash: list.Sum([1, 2]) }\n"
+        "}\n";
+    STR_EQ(inst_text(shop, "gearbox"), "#Gearbox & { teeth: [number, ...number] & { first: 24, rest: [number, ...number] & "
+                                       "{ first: 48, rest: #Null } } }");
+    HAS_TEXT(inst_text(shop, "rack"), "stock: #Stock & { ash: 3, brass: 0, oak: 0, steel: 6 }");
+    HAS_TEXT(inst_text(shop, "rack"), "slots: [%length, ...%length] & { first: %length & 0.013, rest: [%length, ...%length] & "
+                                      "{ first: %length & 0.017, rest: [%length, ...%length] & { first: %length & 0.019, rest: "
+                                      "[%length, ...%length] & { first: %length & 0.024, rest: #Null } } } }");
+    /* the fields of #Stock come from the enum: another field is an error */
+    char src[2048];
+    snprintf(src, sizeof src, "%sbad: #Stock & { elm: 1 }\n", shop);
+    STR_EQ(load_error(src), "a.quad:13:17: error: unknown field 'elm'. The fields of #Stock are: ash, brass, oak, steel");
+
+#define ONE(body, want) STR_EQ(inst_text("#T: { a: _, b: _ }\nt: #T & { " body " }\n", "t"), "#T & { " want " }")
+#define LIST2(x, y) "#Cons & { first: " x ", rest: #Cons & { first: " y ", rest: #Null } }"
+    /* the clauses of a comprehension: a key, two sources, a field of this declaration */
+    ONE("a: [for i, x in [10, 20] { i + x }]", "a: " LIST2("10", "21") ", b: _");
+    ONE("a: [for x in [1, 2] for y in [10] { x + y }]", "a: " LIST2("11", "12") ", b: _");
+    ONE("a: [1, 2, 3], b: [for x in .a if x >= 2 { x * 10 }]",
+        "a: #Cons & { first: 1, rest: " LIST2("2", "3") " }, b: " LIST2("20", "30"));
+    ONE("a: [for k, v in { p: 1, q: 2 } { v }]", "a: " LIST2("1", "2") ", b: _");
+    ONE("a: [for k, v in { p: 1, q: 2 } { k }]", "a: " LIST2("\"p\"", "\"q\"") ", b: _");
+    ONE("a: [for x in [] { x }], b: 1", "a: #Null, b: 1");
+    /* a part of the value of a variable: an item of a list, a field of a struct */
+    ONE("a: [for p in [[1, 2], [3, 4]] { p[0] * 10 + p[1] }]", "a: " LIST2("12", "34") ", b: _");
+    ONE("a: [for p in [{ x: 1, y: 2 }, { x: 3, y: 4 }] { p.y - p.x }]", "a: " LIST2("1", "1") ", b: _");
+    /* the atoms of an enum, also if the first one is its default */
+    STR_EQ(inst_text("#E: *\"p\" | \"q\"\n#T: { a: _ }\nt: #T & { a: [for x in #E { x }] }\n", "t"),
+           "#T & { a: " LIST2("\"p\"", "\"q\"") " }");
+    /* the fields of a struct from a comprehension, with a computed label */
+    STR_EQ(inst_text("let keys = [\"p\", \"q\"]\n#T: { for k in keys { (k): number } }\nt: #T & { p: 1, q: 2 }\n", "t"),
+           "#T & { p: 1, q: 2 }");
+    /* a declaration reads the data of another declaration, with its comprehensions expanded */
+    STR_EQ(inst_text("#T: { a: _ }\nu: #T & { a: [for x in [1, 2] { x * 2 }] }\nt: #T & { a: [for x in u.a { x + 1 }] }\n", "t"),
+           "#T & { a: " LIST2("3", "5") " }");
+
+    /* an expression of numbers has its value when content loads, if the value is exact */
+    ONE("a: 2 * 12mm, b: 7 / 2", "a: dim[m] & 0.024, b: 3.5");
+    ONE("a: 10J / 4s, b: 3 - 5", "a: dim[m^2 kg s^-3] & 2.5, b: -2");
+    ONE("a: 1 / 3, b: 1", "a: _, b: 1");                           /* not exact: it stays an expression */
+    ONE("a: 1m + 1s, b: 1", "a: _, b: 1");                         /* no value: the units do not fit */
+    /* a comparison of known values is true or false. With a reference it is a law */
+    ONE("a: 2 > 1 && !(3 == 4), b: \"x\" != \"y\"", "a: true, b: true");
+    ONE("a: 1mm >= 1m, b: 1 < 2 || 5 < 4", "a: false, b: true");
+    ONE("a: [1 <= 1, 2 <= 1], b: [1 >= 1, 1 > 1]", "a: " LIST2("true", "false") ", b: " LIST2("true", "false"));
+    HAS_TEXT(inst_text("#T: { a: number, b: number, ok: .a <= .b }\nt: #T & { a: 1, b: 2 }\n", "t"), "ok: .a <= .b");
+    /* a bound with a named value */
+    STR_EQ(inst_text("let top = 5\n#T: { n: number }\nt: #T & { n: <=top & >=5 }\n", "t"), "#T & { n: 5 }");
+
+    /* the functions */
+    ONE("a: len([1, 2, 3]) * 10, b: len(\"abc\") + len({ p: 1, q: 2 })", "a: 30, b: 5");
+    ONE("a: [div(-7, 2), mod(-7, 2)], b: [quo(-7, 2), rem(-7, 2)]", "a: " LIST2("-4", "1") ", b: " LIST2("-3", "-1"));
+    ONE("a: [math.Abs(-2.5mm), math.Floor(-2.5)], b: [math.Ceil(-2.5), math.Round(-2.5)]",
+        "a: " LIST2("dim[m] & 0.0025", "-3") ", b: " LIST2("-2", "-3"));
+    ONE("a: [math.Trunc(-2.5), math.Round(2.4)], b: [math.Floor(7), math.Round(2.5)]",
+        "a: " LIST2("-2", "2") ", b: " LIST2("7", "3"));
+    ONE("a: [math.Min(3mm, 2cm), math.Max(3mm, 2cm)], b: [math.Clamp(7, 1, 5), math.Clamp(-7, 1, 5)]",
+        "a: " LIST2("dim[m] & 0.003", "dim[m] & 0.02") ", b: " LIST2("5", "1"));
+    ONE("a: strings.Join([for x in [\"oak\", \"Ash \"] { strings.ToUpper(strings.TrimSpace(x)) }], \"-\"), "
+        "b: strings.ToLower(\"OAK\")", "a: \"OAK-ASH\", b: \"oak\"");
+    ONE("a: [strings.Contains(\"wrench\", \"en\"), strings.HasPrefix(\"wrench\", \"wr\")], "
+        "b: [strings.HasSuffix(\"wrench\", \"ch\"), strings.HasSuffix(\"wrench\", \"x\")]",
+        "a: " LIST2("true", "true") ", b: " LIST2("true", "false"));
+    ONE("a: [strings.Index(\"wrench\", \"en\"), strings.Index(\"wrench\", \"zz\")], b: strings.Split(\"a,b\", \",\")",
+        "a: " LIST2("2", "-1") ", b: " LIST2("\"a\"", "\"b\""));
+    ONE("a: [strings.Replace(\"aaa\", \"a\", \"b\", 2), strings.Replace(\"aaa\", \"a\", \"b\", -1)], "
+        "b: [strings.Repeat(\"ab\", 2), strings.Repeat(\"ab\", 0)]",
+        "a: " LIST2("\"bba\"", "\"bbb\"") ", b: " LIST2("\"abab\"", "\"\""));
+    ONE("a: [list.Sum([1mm, 2cm]), list.Product([2, 3, 4])], b: [list.Max([1, 5, 3]), list.Min([4, 2, 8])]",
+        "a: " LIST2("dim[m] & 0.021", "24") ", b: " LIST2("5", "2"));
+    ONE("a: [list.Contains([1, 2], 2), list.Contains([\"p\"], \"q\")], b: list.Concat([[1], [2]])",
+        "a: " LIST2("true", "false") ", b: " LIST2("1", "2"));
+    ONE("a: list.Range(5, 0, -3), b: list.Slice([1, 2, 3, 4], 1, 3)", "a: " LIST2("5", "2") ", b: " LIST2("2", "3"));
+    ONE("a: list.Take([1, 2, 3], 2), b: list.Drop([1, 2, 3], 1)", "a: " LIST2("1", "2") ", b: " LIST2("2", "3"));
+    ONE("a: list.Repeat([7], 2), b: list.SortStrings([\"q\", \"p\"])", "a: " LIST2("7", "7") ", b: " LIST2("\"p\"", "\"q\""));
+    /* the limits: an end that a range leaves out, a start at 0, a count of 0, a text of the same length */
+    ONE("a: list.Range(0, 6, 3), b: list.Range(5, -1, -3)", "a: " LIST2("0", "3") ", b: " LIST2("5", "2"));
+    ONE("a: list.Slice([1, 2, 3], 0, 2), b: list.Repeat([7], 0)", "a: " LIST2("1", "2") ", b: #Null");
+    ONE("a: strings.HasPrefix(\"ab\", \"ab\"), b: strings.HasSuffix(\"ab\", \"ab\")", "a: true, b: true");
+#undef ONE
+#undef LIST2
+
+    /* errors */
+#define ERR(body, want) STR_EQ(load_error("#T: { a: _, b: _ }\nt: #T & { " body " }\n"), "a.quad:2:" want)
+    ERR("a: nope(1)", "14: error: unknown function nope: the built-in functions are len, div, mod, quo, rem, and the functions "
+                      "of math, strings and list");
+    ERR("a: len(1, 2)", "14: error: len takes 1 argument: len(list | struct | string)");
+    ERR("a: len(5)", "14: error: len: takes a closed list, a struct or a string that is known when content loads");
+    ERR("a: div(1, 0)", "14: error: div: division by zero");
+    ERR("a: div(1.5, 2)", "14: error: div: takes two whole numbers that are known when content loads");
+    ERR("a: math.Min(1mm, 1s)", "14: error: math.Min: takes two numbers with one unit");
+    ERR("a: math.Clamp(1, 5, 2)", "14: error: math.Clamp: the lowest value is above the highest");
+    ERR("a: list.Sum([1mm, 1s])", "14: error: list.Sum: the numbers have different units");
+    ERR("a: list.Max([])", "14: error: list.Max: the list is empty");
+    ERR("a: list.Range(0, 5, 0)", "14: error: list.Range: the step is zero");
+    ERR("a: list.Slice([1, 2], 1, 5)", "14: error: list.Slice: the range is not inside the list");
+    ERR("a: strings.Join([1], \"-\")", "14: error: strings.Join: takes a closed list of strings and a string");
+    ERR("a: list.SortStrings([1, \"a\"])", "14: error: list.SortStrings: takes a list of strings");
+    ERR("a: [for p in [[1]] { p[1] }]", "32: error: p[1]: its value has no such field or item");
+    ERR("a: strings.Replace(\"a\", \"\", \"b\", 1)", "14: error: strings.Replace: the text to replace is empty");
+    ERR("a: [for x in 5 { x }]", "15: error: a comprehension goes through a list, a struct or an enum that the content writes: "
+                                 "not 5");
+    ERR("a: [for x in [...] { x }]", "15: error: a comprehension cannot go through an open list: not all of its items are "
+                                     "written");
+    ERR("a: [for x in [1mm, 2] if x > 1 { x }]", "38: error: a comparison of numbers with different units");
+    ERR("a: [for x in [1] if x { x }]", "25: error: a condition is true or false, known when content loads: not 1");
+    ERR("a: [for x in .zzz { x }]", "24: error: .zzz is not written in this declaration, so a comprehension or a function "
+                                    "cannot read it");
+    ERR("a: len(.b)", "18: error: .b is not written in this declaration, so a comprehension or a function cannot read it");
+#undef ERR
+    STR_EQ(load_error("#T: { for k in [\"1x\"] { (k): number } }\n"),
+           "a.quad:1:25: error: a computed label must be the name of a field: not \"1x\"");
+    STR_EQ(load_error("#T: { for k in [5] { (k): number } }\n"), "a.quad:1:22: error: a computed label is a string: not 5");
+    STR_EQ(load_error("#T: { a: _ }\na: #T & { a: [for x in b.a { x }] }\nb: #T & { a: [for x in a.a { x }] }\n"),
+           "a.quad:3:24: error: the comprehensions of a read a declaration whose comprehensions read a back");
+    STR_EQ(load_error("#T: { a: _, b: _ }\nu: #T & { a: [.b], b: 1 }\nt: #T & { a: [for x in u.a { x }] }\n"),
+           "a.quad:3:24: error: u.a holds .b, which belongs to u: a comprehension reads values as written, so the values of "
+           "another declaration must be plain values");
+
+    /* the order of the files does not count */
+    static const char *const two[] = { "#T: { a: _ }\nu: #T & { a: [for x in [1, 2] { x * 2 }] }\n",
+                                       "t: #T & { a: [for x in u.a { x + 1 }] }\n" };
+    const char *const owt[] = { two[1], two[0] };
+    bool ok, ok2;
+    Front *f = load(two, 2, &ok), *g = load(owt, 2, &ok2);
+    CHECK(ok && ok2 && f->hash == g->hash);
+    qf_free(f);
+    qf_free(g);
 }
 
 /* --- defaults (quad-ijx.10) ------------------------------------------------------------------- */

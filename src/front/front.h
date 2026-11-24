@@ -159,6 +159,7 @@ typedef struct {
     const char *doc;     /* the comment lines directly above, or NULL */
     Sym   pkg;           /* the package that its file declares, or NULL */
     bool  comp;          /* has comprehensions, computed labels, conditions or calls */
+    uint8_t expstate;    /* the expansion of its comprehensions: 0 none, 1 in progress, 2 done */
 } Decl;
 
 typedef VEC(Decl) DeclVec;
@@ -415,6 +416,8 @@ typedef struct Front {
     size_t    nerrors;
     VEC(LetName) lets;
     bool      parsed_comp;  /* the last qf_parse_expr had comprehensions, conditions or calls */
+    U64Map    declidx;      /* the label of a declaration → its first index + 1, for the expansion */
+    bool      declidx_built;
 
     /* stage 2: the result of qf_resolve */
     int8_t    tick_scale;   /* the scale of %time: the world's tick */
@@ -486,6 +489,12 @@ X   *qf_parse_expr(Front *f, const char *file, const char *src);
 void qf_print(Buf *b, const X *x);
 /* The declarations of one file, with their docstrings and the package line. */
 void qf_print_decls(Buf *b, const Decl *d, size_t n);
+
+/* Expands the comprehensions, the computed labels and the function calls of
+ * each declaration, and gives an expression of numbers its value (expand.c).
+ * It runs after the kinds are built, because a number has a unit, and before
+ * the type hierarchy. False with diagnostics. */
+bool qf_expand_all(Front *f);
 
 /* --- syntax tree helpers (xtree.c) ------------------------------------------------------- */
 

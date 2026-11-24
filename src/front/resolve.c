@@ -16,9 +16,9 @@
  *     constraint record, and stage 3 makes propagators from the records.
  *   - An instance has one structure, so alternatives of structures in an
  *     instance are an error. Defaults apply after unification, as in
- *     Triangle. Comprehensions and functions (quad-ijx.9), and text
- *     constraints and interpolation (quad-ijx.11) are errors that name their
- *     issue. */
+ *     Triangle. expand.c expands comprehensions and functions before the
+ *     type hierarchy. Text constraints and interpolation (quad-ijx.11) are
+ *     errors that name their issue. */
 
 /* The prelude: the types that the front end knows (ADR 0011 section 2).
  * The list types are in the root. #Phenomenon, #Port and #Interaction, which
@@ -76,7 +76,7 @@ static uint32_t field_feat(Build *b, X *x, XField *fl, uint32_t ctx)
     Front *f = b->c->f;
     bool ambiguous;
     if (!fl->label) {
-        build_error(b, fl->loc, "%s", "a comprehension or a computed label is not in this stage (quad-ijx.9)");
+        build_error(b, fl->loc, "%s", "a comprehension or a computed label was not expanded");
         return QF_BOTTOM;
     }
     uint32_t fid = feat_resolve(f, fl->label, ctx, x->u.st.pkg, &ambiguous);
@@ -690,7 +690,7 @@ static bool check_expr(Build *b, const X *x, const X *parent)
         }
         return false;
     case X_CALL:
-        build_error(b, x->loc, "the function '%s' is not in this stage (quad-ijx.9)", x->u.call.name);
+        build_error(b, x->loc, "the function '%s' was not expanded", x->u.call.name);
         return false;
     default:
         build_error(b, x->loc, "%s", "an expression can hold numbers, references and operators");
@@ -883,7 +883,7 @@ static QfNode *build_raw(Build *b, X *x)
         return leaf_new(c, &c->scratch, f->tconstraint, q, q);
     }
     case X_CALL: case X_COMP: case X_VAR:
-        build_error(b, x->loc, "%s", "a comprehension or a function is not in this stage (quad-ijx.9)");
+        build_error(b, x->loc, "%s", "a comprehension or a function was not expanded");
         return NULL;
     case X_LET:                              /* the parser replaces every use */
         build_error(b, x->loc, "%s", "a let's use was not resolved");
@@ -1561,9 +1561,6 @@ static void check_stage(Front *c, const X *x)
 {
     if (!x) return;
     switch (x->k) {
-    case X_COMP: case X_VAR: case X_CALL:
-        qf_diag(c, true, x->loc, "a comprehension or a function is not in this stage (quad-ijx.9)");
-        break;
     case X_INTERP:
         qf_diag(c, true, x->loc, "string interpolation is not in this stage (quad-ijx.11)");
         break;
@@ -1575,10 +1572,7 @@ static void check_stage(Front *c, const X *x)
         for (int i = 0; i < x->u.st.n; i++) {
             const XField *fl = &x->u.st.fields[i];
             check_attrs(c, fl->attrs, fl->nattrs, true, fl->loc);
-            if (!fl->label && !field_comp(fl)) {
-                qf_diag(c, true, fl->loc, "a computed label is not in this stage (quad-ijx.9)");
-                continue;
-            }
+            check_stage(c, fl->dlabel);
             check_stage(c, fl->value);
         }
         break;
@@ -2129,7 +2123,7 @@ static bool resolve(Front *c)
     }
     if (c->nerrors > errors0) return false;
     resolve_packages(c);
-    if (c->nerrors > errors0 || !qf_kinds_build(c) || !types_build(c) || !check_lets(c)) return false;
+    if (c->nerrors > errors0 || !qf_kinds_build(c) || !qf_expand_all(c) || !types_build(c) || !check_lets(c)) return false;
     name_plainly(c);
     c->op = qf_op_new(c);
     for (uint32_t t = 0; t < c->types.n; t++) type_expansion(c->op, t);
