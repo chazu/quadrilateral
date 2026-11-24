@@ -13,7 +13,8 @@
  *     on one content at the same time.
  *   - A number is a kind value in quanta, or an exact decimal with a
  *     dimension. A decimal converts when unification gives it a kind.
- *   - Text has no regular-expression constraints yet (quad-ijx.11). */
+ *   - A text value is one string, a set of constraints with regular
+ *     expressions (text.c), or any text. */
 
 /* --- contexts and stores ------------------------------------------------------------------ */
 
@@ -359,7 +360,20 @@ static bool val_meet(QfOp *c, uint32_t t, uint32_t ta, QfVal a, uint32_t tb, QfV
         *out = dec_val(d);
         return true;
     }
-    /* text, constraint: any value, or one value */
+    if (k == TK_TEXT) {
+        /* text: one string, a set of constraints (ADR 0015, quad-ijx.11), or any text */
+        bool sa = a.lo == a.hi, sb = b.lo == b.hi;
+        if (sa && sb) { *out = a; return a.lo == b.lo; }
+        if (sa || sb) {
+            *out = sa ? a : b;
+            return rx_accepts(text_rx(sa ? b.lo : a.lo, sa ? b.hi : a.hi), (Sym) (intptr_t) (sa ? a.lo : b.lo));
+        }
+        const RxSet *u = rx_union(c->f, text_rx(a.lo, a.hi), text_rx(b.lo, b.hi));
+        QfVal r = { Q_NINF, u ? (int64_t) (intptr_t) u : Q_INF, 0, 0 };
+        *out = r;
+        return true;
+    }
+    /* a constraint: any value, or one value */
     if (open_val(a)) *out = b;
     else if (open_val(b) || a.lo == b.lo) *out = a;
     else return false;
@@ -386,7 +400,8 @@ static void describe_value(const Front *f, Buf *b, uint32_t type, QfVal v)
     const TypeInfo *ti = &f->types.v[type];
     if (!is_value(f, type)) { qf_buf_puts(b, ti->name); return; }
     if (ti->kind == TK_TEXT || ti->kind == TK_CONSTRAINT) {
-        if (v.lo != v.hi) qf_buf_puts(b, ti->name);
+        if (ti->kind == TK_TEXT && text_rx(v.lo, v.hi)) rx_print(b, text_rx(v.lo, v.hi));
+        else if (v.lo != v.hi) qf_buf_puts(b, ti->name);
         else if (ti->kind == TK_TEXT) qf_buf_puts(b, (const char *) (intptr_t) v.lo);
         else qf_print(b, (const X *) (intptr_t) v.lo);
         return;
@@ -647,6 +662,11 @@ static void explain(QfOp *c, Buf *b)
     if (lq) unit_text(f, &lu, lt);
     if (rq) unit_text(f, &ru, rt);
     bool far = why && !strcmp(why, "the number is out of range");
+    bool ltext = f->types.v[lt].kind == TK_TEXT, rtext = f->types.v[rt].kind == TK_TEXT;
+    if (ltext && rtext && lc != rc && text_rx(lc ? rv.lo : lv.lo, lc ? rv.hi : lv.hi)) {
+        qf_buf_printf(b, "%s does not meet the constraint %s", lc ? l.s : r.s, lc ? r.s : l.s);
+        goto done;
+    }
     if (lk && rk && lt != rt && (!lc || !rc || f->types.v[lt].dimix == f->types.v[rt].dimix)) {
         qf_buf_printf(b, "%s and %s are different kinds", f->types.v[lt].name, f->types.v[rt].name);
     } else if (lq && rq && f->types.v[lt].dimix != f->types.v[rt].dimix) {
@@ -657,7 +677,9 @@ static void explain(QfOp *c, Buf *b)
                explain_steps(f, b, why, lk ? r.s : l.s, val_dec(lk ? rv : lv), lk ? lt : rt, lk ? lu.s : ru.s)) {
         /* done */
     } else if (lc != rc && !(lq && rq)) {
-        say_is_not(f, b, lc ? l.s : r.s, lc ? rt : lt, lc ? r.s : l.s);
+        /* a text with constraints is "text" here: the value is not a text at all */
+        bool text = f->types.v[lc ? rt : lt].kind == TK_TEXT;
+        say_is_not(f, b, lc ? l.s : r.s, lc ? rt : lt, text ? "text" : lc ? r.s : l.s);
     } else if (f->types.v[lt].kind == TK_CONSTRAINT && f->types.v[rt].kind == TK_CONSTRAINT && lc && rc) {
         qf_buf_printf(b, "the law has two texts: %s, and %s", l.s, r.s);
     } else if (lc && rc && (!lq || (lv.lo == lv.hi && rv.lo == rv.hi))) {
@@ -668,6 +690,7 @@ static void explain(QfOp *c, Buf *b)
         qf_buf_printf(b, "a value cannot be both %s and %s", l.s, r.s);
     }
     if (why && !far && !(lq && rq && lk != rk)) qf_buf_printf(b, " (%s)", why);
+done:
     qf_buf_free(&l);
     qf_buf_free(&r);
     qf_buf_free(&lu);
@@ -984,6 +1007,11 @@ static bool val_within(const Front *f, const QfNode *g, const QfNode *s)
 {
     QfVal gv = own_val(g), sv = own_val(s);
     TypeKind k = f->types.v[s->type].kind;
+    if (k == TK_TEXT && text_rx(gv.lo, gv.hi)) {
+        /* a set of constraints holds each string that it accepts, and each set that has all of its constraints */
+        if (sv.lo == sv.hi) return rx_accepts(text_rx(gv.lo, gv.hi), (Sym) (intptr_t) sv.lo);
+        return text_rx(sv.lo, sv.hi) && rx_subset(text_rx(gv.lo, gv.hi), text_rx(sv.lo, sv.hi));
+    }
     if (!is_num(k)) return open_val(gv) || (gv.lo == sv.lo && gv.hi == sv.hi);
     if (k == TK_KIND) {
         int64_t lo, hi;
@@ -1256,6 +1284,14 @@ static QfNode *gen_rec(QfOp *c, QfStore *out, QfNode *a, QfNode *b, uint32_t bou
             set_val(r, dec_val(dec_hull(as_dec(f, a->type, own_val(a)), as_dec(f, b->type, own_val(b)))));
         } else if (a->lo == a->hi && a->lo == b->lo && b->lo == b->hi) {
             r->lo = r->hi = a->lo;                             /* the same text, the same constraint */
+        } else if (tk == TK_TEXT) {
+            /* the constraints that both keep: those of a set that a string meets, or those that two sets share */
+            bool sa = a->lo == a->hi, sb = b->lo == b->hi;
+            const RxSet *j = NULL;
+            if (sa != sb) j = rx_satisfied(c->f, sa ? text_rx(b->lo, b->hi) : text_rx(a->lo, a->hi), (Sym) (intptr_t) (sa ? a->lo : b->lo));
+            else if (!sa) j = rx_common(c->f, text_rx(a->lo, a->hi), text_rx(b->lo, b->hi));
+            r->lo = Q_NINF;
+            r->hi = j ? (int64_t) (intptr_t) j : Q_INF;
         }
         return r;
     }

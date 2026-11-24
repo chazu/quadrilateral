@@ -987,9 +987,6 @@ void test_resolve_fixture(void)
 void test_resolve_errors(void)
 {
     /* what a later stage brings: each error names its issue */
-    STR_EQ(load_error("#T: { x: =~\"^a\" }\n"),
-           "a.quad:1:10: error: a regular-expression constraint is not in this stage (quad-ijx.11)");
-    STR_EQ(load_error("#T: { x: \"a \\(1)\" }\n"), "a.quad:1:10: error: string interpolation is not in this stage (quad-ijx.11)");
     STR_EQ(load_error("#A: { a: _ }\n#B: { b: _ }\nx: #C & { c: #A | #B }\n#C: { c: _ }\n"),
            "a.quad:3:17: error: a disjunction of structures stands in a type's body. An instance has one structure: "
            "give the alternatives to a type, and name the type here");
@@ -1669,9 +1666,10 @@ void test_comprehensions(void)
                                      "written");
     ERR("a: [for x in [1mm, 2] if x > 1 { x }]", "38: error: a comparison of numbers with different units");
     ERR("a: [for x in [1] if x { x }]", "25: error: a condition is true or false, known when content loads: not 1");
-    ERR("a: [for x in .zzz { x }]", "24: error: .zzz is not written in this declaration, so a comprehension or a function "
-                                    "cannot read it");
-    ERR("a: len(.b)", "18: error: .b is not written in this declaration, so a comprehension or a function cannot read it");
+    ERR("a: [for x in .zzz { x }]", "24: error: .zzz is not written in this declaration: a comprehension, a function or an "
+                                    "interpolation reads only values that the content writes");
+    ERR("a: len(.b)", "18: error: .b is not written in this declaration: a comprehension, a function or an interpolation "
+                      "reads only values that the content writes");
 #undef ERR
     STR_EQ(load_error("#T: { for k in [\"1x\"] { (k): number } }\n"),
            "a.quad:1:25: error: a computed label must be the name of a field: not \"1x\"");
@@ -1691,6 +1689,132 @@ void test_comprehensions(void)
     CHECK(ok && ok2 && f->hash == g->hash);
     qf_free(f);
     qf_free(g);
+}
+
+/* --- text constraints and interpolation (quad-ijx.11) ------------------------------------------- */
+
+/* A text value is one string, a set of constraints with regular expressions,
+ * or any text. An interpolation becomes its string when content loads. The
+ * text of the workshop example (tests/data/workshop/text.tri) loads. */
+void test_text(void)
+{
+    static const char shop[] =
+        "#Labelled: { label: text & =~#\"^[A-Z][a-z]+-\\d+$\"#, note: text }\n"
+        "#Tin: #Labelled & { count: number & >=1 & <=500 }\n"
+        "tin_of_nails: #Tin & { count: 120, label: \"Nails-\\(.count)\", note: \"for \\\"soft\\\" wood\\tonly\" }\n"
+        "open: #Tin & { count: 2 }\n";
+    STR_EQ(inst_text(shop, "tin_of_nails"), "#Tin & { count: 120, label: \"Nails-120\", note: \"for \\\"soft\\\" wood\\tonly\" }");
+    /* a text with a constraint and no string yet shows its constraint */
+    STR_EQ(inst_text(shop, "open"), "#Tin & { count: 2, label: =~\"^[A-Z][a-z]+-\\\\d+$\", note: text }");
+    char src[2048];
+    snprintf(src, sizeof src, "%sbad: #Tin & { count: 1, label: \"nails-1\" }\n", shop);
+    STR_EQ(load_error(src), "a.quad:5:13: error: label: \"nails-1\" does not meet the constraint =~\"^[A-Z][a-z]+-\\\\d+$\"");
+
+    /* =~ and !~ together, and the constraints of a type and of its supertype */
+    static const char both[] =
+        "#A: { a: =~\"^a\" }\n#B: #A & { a: !~\"z$\" }\n"
+        "x: #B\np: #B & { a: \"abc\" }\n";
+    STR_EQ(inst_text(both, "x"), "#B & { a: =~\"^a\" & !~\"z$\" }");
+    STR_EQ(inst_text(both, "p"), "#B & { a: \"abc\" }");
+    snprintf(src, sizeof src, "%sq: #B & { a: \"abz\" }\n", both);
+    STR_EQ(load_error(src), "a.quad:5:7: error: a: \"abz\" does not meet the constraint =~\"^a\" & !~\"z$\"");
+    snprintf(src, sizeof src, "%sq: #B & { a: \"xbc\" }\n", both);
+    STR_EQ(load_error(src), "a.quad:5:9: error: a: \"xbc\" does not meet the constraint =~\"^a\"");
+    /* a default among text and a pattern: text covers the pattern (Triangle: test_text_defaults) */
+    static const char rx[] = "#Rx: { r: *\"ab\" | =~\"^z\" | text }\nr1: #Rx\nr2: #Rx & { r: \"zz\" }\n";
+    STR_EQ(inst_text(rx, "r1"), "#Rx & { r: \"ab\" }");
+    STR_EQ(inst_text(rx, "r2"), "#Rx & { r: \"zz\" }");
+    /* a pattern that is not a regular expression is an error, in each place */
+    STR_EQ(load_error("#T: { a: =~\"(\" }\n"), "a.quad:1:10: error: the pattern \"(\" is not a regular expression: missing )");
+    STR_EQ(load_error("#T: { a: *\"x\" | =~\"[\" | text }\n"),
+           "a.quad:1:17: error: the pattern \"[\" is not a regular expression: missing ] in a class");
+    /* a constraint is for text: a number does not meet it */
+    STR_EQ(load_error("#T: { a: =~\"^a\" }\nt: #T & { a: 5 }\n"), "a.quad:2:9: error: a: 5 is not text");
+
+    /* interpolation: numbers as the content writes them, strings, true and false, and a value of an expression */
+    STR_EQ(inst_text("#T: { a: text }\nt: #T & { a: \"x \\(1 + 2) \\(true) \\(\"s\") \\(2.50mm)\" }\n", "t"),
+           "#T & { a: \"x 3 true s 2.50mm\" }");
+    STR_EQ(inst_text("#T: { a: text, n: number }\nt: #T & { n: 7, a: \"n is \\(.n), and \\(len([1, 2])) items\" }\n", "t"),
+           "#T & { a: \"n is 7, and 2 items\", n: 7 }");
+    /* in a comprehension, and as a computed label */
+    STR_EQ(inst_text("#T: { a: _ }\nt: #T & { a: [for x in [1, 2] { \"item \\(x)\" }] }\n", "t"),
+           "#T & { a: #Cons & { first: \"item 1\", rest: #Cons & { first: \"item 2\", rest: #Null } } }");
+    STR_EQ(inst_text("let keys = [\"p\", \"q\"]\n#T: { for k in keys { \"\\(k)_x\": number } }\nt: #T & { p_x: 1, q_x: 2 }\n", "t"),
+           "#T & { p_x: 1, q_x: 2 }");
+    /* a part that the content does not write in the declaration is an error */
+    STR_EQ(load_error("#T: { a: text, n: number }\nt: #T & { a: \"n is \\(.n)\" }\n"),
+           "a.quad:2:22: error: .n is not written in this declaration: a comprehension, a function or an interpolation "
+           "reads only values that the content writes");
+    STR_EQ(load_error("#T: { a: text }\nt: #T & { a: \"list \\([1])\" }\n"),
+           "a.quad:2:22: error: an interpolation takes a number, a string, or true or false that is known when content "
+           "loads: not [1]");
+
+    /* the unifier: a set of constraints with a string, with another set, and with any text */
+    bool ok;
+    Front *f = load1("#T: { a: text }\n"
+                     "any: #T\nca: #T & { a: =~\"^a\" }\ncb: #T & { a: =~\"b$\" }\ncab: #T & { a: =~\"^a\" & =~\"b$\" }\n"
+                     "sab: #T & { a: \"ab\" }\nsac: #T & { a: \"ac\" }\nsxx: #T & { a: \"xx\" }\n", &ok);
+    CHECK(ok);
+    if (ok) {
+        QfOp *op = qf_op_new(f);
+        QfStore *out = qf_store_new();
+        QfFailure fail;
+#define N(name) inst(f, name)
+        /* two sets: the union. It is the same set as the one that source writes */
+        const QfNode *u = qf_unify(op, N("ca"), N("cb"), out, &fail);
+        CHECK(u != NULL);
+        STR_EQ(node_text(f, u), "#T & { a: =~\"^a\" & =~\"b$\" }");
+        bool fwd, bwd;
+        qf_subsumes(op, u, N("cab"), &fwd, &bwd);
+        CHECK(fwd && bwd);
+        /* a set and a string: the string, if it meets each constraint */
+        STR_EQ(node_text(f, qf_unify(op, N("cab"), N("sab"), out, &fail)), "#T & { a: \"ab\" }");
+        CHECK(qf_unify(op, N("cab"), N("sac"), out, &fail) == NULL);
+        STR_EQ(fail.text, "\"ac\" does not meet the constraint =~\"^a\" & =~\"b$\"");
+        STR_EQ(node_text(f, qf_unify(op, N("any"), N("ca"), out, &fail)), "#T & { a: =~\"^a\" }");
+        /* subsumption: any text, then a set, then a larger set, then a string */
+        qf_subsumes(op, N("any"), N("ca"), &fwd, &bwd);
+        CHECK(fwd && !bwd);
+        qf_subsumes(op, N("ca"), N("cab"), &fwd, &bwd);
+        CHECK(fwd && !bwd);
+        qf_subsumes(op, N("ca"), N("cb"), &fwd, &bwd);
+        CHECK(!fwd && !bwd);
+        qf_subsumes(op, N("ca"), N("sab"), &fwd, &bwd);
+        CHECK(fwd && !bwd);
+        qf_subsumes(op, N("cb"), N("sac"), &fwd, &bwd);
+        CHECK(!fwd && !bwd);
+        /* generalization: the constraints that both keep */
+        STR_EQ(node_text(f, qf_generalize(op, N("sab"), N("sac"), out)), "#T & { a: text }");
+        STR_EQ(node_text(f, qf_generalize(op, N("cab"), N("ca"), out)), "#T & { a: =~\"^a\" }");
+        STR_EQ(node_text(f, qf_generalize(op, N("cab"), N("sac"), out)), "#T & { a: =~\"^a\" }");
+        STR_EQ(node_text(f, qf_generalize(op, N("ca"), N("sxx"), out)), "#T & { a: text }");
+        STR_EQ(node_text(f, qf_generalize(op, N("ca"), N("cb"), out)), "#T & { a: text }");
+        STR_EQ(node_text(f, qf_generalize(op, N("sab"), N("sab"), out)), "#T & { a: \"ab\" }");
+#undef N
+        qf_store_free(out);
+        qf_op_free(op);
+    }
+    qf_free(f);
+
+    /* the regular expressions: the syntax of RE2, with no backtracking */
+    static const struct { const char *pat, *text; bool match; } cases[] = {
+        { "^[A-Z][a-z]+-\\d+$", "Nails-120", true }, { "^[A-Z][a-z]+-\\d+$", "nails-120", false },
+        { "a|b", "xbx", true },                      { "^(ab)*$", "ababab", true },
+        { "^(ab)*$", "aba", false },                 { "^a.c$", "abc", true },
+        { "^a{2,3}$", "aaaa", false },               { "^a{2,3}$", "aaa", true },
+        { "^\\w+\\s\\w+$", "two words", true },      { "^[^0-9]+$", "abc1", false },
+        { "(?i)^nails$", "NAILS", true },            { "^(a+)+$", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", false },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char err[200];
+        Regex *re = regex_compile(cases[i].pat, strlen(cases[i].pat), err, sizeof err);
+        CHECK(re != NULL);
+        if (re) CHECK(regex_match(re, cases[i].text, strlen(cases[i].text)) == cases[i].match);
+        regex_free(re);
+    }
+    char err[200];
+    CHECK(regex_compile("a(", 2, err, sizeof err) == NULL && err[0]);
+    CHECK(regex_compile("\\1", 2, err, sizeof err) == NULL);        /* no backreference */
 }
 
 /* --- defaults (quad-ijx.10) ------------------------------------------------------------------- */

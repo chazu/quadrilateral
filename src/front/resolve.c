@@ -16,9 +16,8 @@
  *     constraint record, and stage 3 makes propagators from the records.
  *   - An instance has one structure, so alternatives of structures in an
  *     instance are an error. Defaults apply after unification, as in
- *     Triangle. expand.c expands comprehensions and functions before the
- *     type hierarchy. Text constraints and interpolation (quad-ijx.11) are
- *     errors that name their issue. */
+ *     Triangle. expand.c expands comprehensions, functions and
+ *     interpolations before the type hierarchy. */
 
 /* The prelude: the types that the front end knows (ADR 0011 section 2).
  * The list types are in the root. #Phenomenon, #Port and #Interaction, which
@@ -779,12 +778,20 @@ static QfNode *build_raw(Build *b, X *x)
         }
         return literal_node(b, x, of ? &of->u.num : &x->u.bound.n, x->u.bound.op);
     }
-    case X_INTERP:
-        build_error(b, x->loc, "%s", "string interpolation is not in this stage (quad-ijx.11)");
+    case X_INTERP:                           /* expand.c gives each one its string */
+        build_error(b, x->loc, "%s", "an interpolation was not expanded");
         return NULL;
-    case X_REGEX:
-        build_error(b, x->loc, "%s", "a regular-expression constraint is not in this stage (quad-ijx.11)");
-        return NULL;
+    case X_REGEX: {
+        char why[200] = "";
+        const RxSet *set = rx_single(f, x->u.rx.pat, x->u.rx.neg, why, sizeof why);
+        if (!set) {
+            char msg[400];
+            snprintf(msg, sizeof msg, "the pattern %s is not a regular expression: %s", x->u.rx.pat, why);
+            build_error(b, x->loc, "%s", msg);
+            return NULL;
+        }
+        return leaf_new(c, &c->scratch, f->ttext, Q_NINF, (int64_t) (intptr_t) set);
+    }
     case X_TAG: {
         for (size_t i = 0; i < b->tags.n; i++)
             if (b->tags.v[i].name == x->u.name) return b->tags.v[i].node;
@@ -942,10 +949,16 @@ static QfNode *build_raw(Build *b, X *x)
             x_flatten(x, X_OR, &ts);
             for (size_t i = 0; i < ts.n; i++) {
                 X *a = ts.v[i]->k == X_DEFAULT ? ts.v[i]->u.sub : ts.v[i];
-                if (a->k == X_REGEX) {
-                    build_error(b, a->loc, "%s", "a regular-expression constraint is not in this stage (quad-ijx.11)");
-                    VEC_FREE(ts);
-                    return NULL;
+                if (a->k == X_REGEX) {                 /* text covers it, and the pattern must still be good */
+                    char why[200] = "";
+                    if (!rx_single(f, a->u.rx.pat, a->u.rx.neg, why, sizeof why)) {
+                        char msg[400];
+                        snprintf(msg, sizeof msg, "the pattern %s is not a regular expression: %s", a->u.rx.pat, why);
+                        build_error(b, a->loc, "%s", msg);
+                        VEC_FREE(ts);
+                        return NULL;
+                    }
+                    continue;
                 }
                 uint32_t t = a->k == X_ATOM ? type_lookup(f, a->u.name) : QF_BOTTOM;
                 if (!free_text(f, t)) {
@@ -1561,12 +1574,6 @@ static void check_stage(Front *c, const X *x)
 {
     if (!x) return;
     switch (x->k) {
-    case X_INTERP:
-        qf_diag(c, true, x->loc, "string interpolation is not in this stage (quad-ijx.11)");
-        break;
-    case X_REGEX:
-        qf_diag(c, true, x->loc, "a regular-expression constraint is not in this stage (quad-ijx.11)");
-        break;
     case X_STRUCT:
         check_attrs(c, x->u.st.attrs, x->u.st.nattrs, false, x->loc);
         for (int i = 0; i < x->u.st.n; i++) {
