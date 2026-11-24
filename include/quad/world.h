@@ -55,6 +55,7 @@ typedef enum {
     QW_ESTOCK,          /* a stock changed other than by a transfer */
     QW_ETIME,           /* a time before now, or past the end of the clock */
     QW_ELIFE,           /* an instance in the wrong state, or existence conditions that do not settle */
+    QW_ESNAPSHOT,       /* bytes that are not a snapshot, or a snapshot of a world with another structure */
     QW_ENOMEM,
 } QwStatus;
 
@@ -197,6 +198,27 @@ int64_t   qw_total(const QWorld *w, QwKind kind);        /* the sum of every cel
  * order in which phenomena and cells were declared (ADR 0013). Two runs with
  * the same inputs must give the same hash (ADR 0004). */
 uint64_t qw_hash(const QWorld *w);
+
+/* --- snapshot and restore (ADR 0004 rule 8) ---------------------------------------- */
+
+/* A snapshot is the state of a world at a boundary, as bytes: the clock, the
+ * epoch, the base of each cell, the active model of each phenomenon, the
+ * instances that are alive, and for each kernel its prediction, its
+ * assumptions, its event count and its private state. A prediction decides
+ * the next boundary, so it is state.
+ *
+ * qw_snapshot gives the bytes, and the caller frees them. A kernel that is
+ * not stateless must give `save`, or the snapshot fails.
+ *
+ * qw_restore puts a snapshot back. The world must have the structure of the
+ * world of the snapshot: the same phenomena, cells, models and kernels,
+ * built in the same order. It can be the same world later in its run, or a
+ * new world from the same build code or the same IR. After a restore, a run
+ * gives the same state hash at each time as the run of the first world. The
+ * change log is empty after a restore. If a restore fails, the world can be
+ * in a state between the two: restore it again, or free it. */
+QwStatus qw_snapshot(QWorld *w, void **bytes, size_t *len);
+QwStatus qw_restore(QWorld *w, const void *bytes, size_t len);
 
 /* --- the change log (ADR 0011 section 6) ------------------------------------------ */
 

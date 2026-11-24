@@ -142,6 +142,10 @@ bool     qn_contradicted_by(const QNet *net, uint32_t *propagator);
 /* --- epoch boundaries (non-monotonic) ------------------------------------- */
 
 uint64_t qn_epoch(const QNet *net);
+/* For the restore of a snapshot: applies the staged values, as
+ * qn_begin_epoch does, and gives the new epoch the number `epoch`. */
+QnStatus qn_restore_epoch(QNet *net, uint64_t epoch);
+size_t   qn_group_count(const QNet *net);
 
 /* Replaces the cell's base at the next boundary. A cell has one writer, so a
  * second stage of the same cell before the boundary is QN_ESTAGED. */

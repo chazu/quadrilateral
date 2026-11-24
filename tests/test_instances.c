@@ -328,6 +328,57 @@ static void check_dormant(QWorld *w, const char *key)
     CHECK(qw_get_set(w, path(key, "alive")) == 1);
 }
 
+/* --- a snapshot of a world with an instance that is alive (quad-5xe.1) ------------------------ */
+
+void test_instance_snapshot(void)
+{
+    start_fail = end_leak = false;
+    burn_live = 0;
+    Town a = make_town(7), b = make_town(7), ref = make_town(7);
+    Town *all[3] = { &a, &b, &ref };
+    QwPhen fire = 0;
+    for (int i = 0; i < 3; i++) {
+        add_building(all[i], "b");
+        fire = add_fire(all[i], "b", true);
+    }
+    /* the first two run until the fire is alive, at the same stops */
+    int t = 0;
+    while (!qw_alive(a.w, fire) && t < 1000) {
+        t += 10;
+        OK(qw_run(a.w, t * SEC));
+        OK(qw_run(ref.w, t * SEC));
+    }
+    CHECK(qw_alive(a.w, fire) && t < 1000);
+    void *snap = NULL;
+    size_t len = 0;
+    OK(qw_snapshot(a.w, &snap, &len));
+    /* the third world is new: its fire is dormant, and the restore makes it alive with its kernel */
+    CHECK(!qw_alive(b.w, fire));
+    OK(qw_restore(b.w, snap, len));
+    CHECK(qw_alive(b.w, fire));
+    CHECK(qw_hash(b.w) == qw_hash(a.w));
+    CHECK_I64((int64_t) qw_starts(b.w), 1);
+    for (t += 10; t <= 1000; t += 10) {
+        OK(qw_run(ref.w, t * SEC));
+        OK(qw_run(b.w, t * SEC));
+        CHECK(qw_hash(ref.w) == qw_hash(b.w));
+    }
+    CHECK_I64((int64_t) qw_ends(b.w), (int64_t) qw_ends(ref.w));
+    CHECK(qw_alive(b.w, fire) == qw_alive(ref.w, fire));
+    /* the world that ran to the end goes back to the snapshot: the fire is alive again */
+    OK(qw_run(a.w, 1000 * SEC));
+    bool at_end = qw_alive(a.w, fire);
+    OK(qw_restore(a.w, snap, len));
+    CHECK(qw_alive(a.w, fire));
+    OK(qw_run(a.w, 1000 * SEC));
+    CHECK(qw_alive(a.w, fire) == at_end);
+    free(snap);
+    qw_free(a.w);
+    qw_free(b.w);
+    qw_free(ref.w);
+    CHECK_I64(burn_live, 0);               /* each kernel instance of a fire was destroyed */
+}
+
 /* --- a condition starts and ends an instance inside one run ---------------------------------- */
 
 void test_instance_condition(void)
