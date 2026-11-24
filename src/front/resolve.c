@@ -78,7 +78,13 @@ static uint32_t field_feat(Build *b, X *x, XField *fl, uint32_t ctx)
     uint32_t fid = feat_resolve(f, fl->label, ctx, x->u.st.pkg, &ambiguous);
     if (fid != QF_BOTTOM) return fid;
     if (!ambiguous) {
-        build_error(b, fl->loc, "unknown feature '%s': no type declares a field with this name", fl->label);
+        Buf m = { 0 };
+        qf_buf_printf(&m, "unknown field '%s'", fl->label);
+        size_t n = m.len;
+        if (ctx != QF_BOTTOM && ctx != f->top) qf_say_fields(f, &m, ctx);
+        if (m.len == n) qf_buf_puts(&m, ": no type declares a field with this name");
+        build_error(b, fl->loc, "%s", m.s);
+        qf_buf_free(&m);
         return QF_BOTTOM;
     }
     Buf w = { 0 };
@@ -158,11 +164,12 @@ static bool type_field_loc(const Front *f, uint32_t t, const uint32_t *path, siz
     return found;
 }
 
-/* A failure as one text: "conflict at a.b: X vs Y", with its reason. */
+/* A failure as one text, in the words of the author: "voltage: 12 A is not
+ * of the kind %voltage". At the root of a value, the text has no path. */
 static void failure_text(Buf *b, const QfFailure *fl)
 {
-    qf_buf_printf(b, "conflict at %s: %s vs %s", fl->path, fl->left, fl->right[0] ? fl->right : "(missing)");
-    if (fl->why[0]) qf_buf_printf(b, " (%s)", fl->why);
+    if (strcmp(fl->path, "(root)")) qf_buf_printf(b, "%s: ", fl->path);
+    qf_buf_puts(b, fl->text);
 }
 
 /* Reports a conflict at `loc`, naming where the other side was declared:
@@ -194,7 +201,8 @@ static bool unify_at_other(Build *b, QfNode *x, QfNode *y, Loc loc, const char *
             qf_diag(f, true, loc, "the reference %s: %s is %s, which has no field %.*s", what, fl->path, fl->left,
                     (int) strcspn(nx, ".["), nx);
         } else {
-            qf_diag(f, true, loc, "%s%s: %s%s", what[0] == '.' ? "the reference " : "", what, text.s,
+            /* `what` names a reference or an inheritance. A written value has no name */
+            qf_diag(f, true, loc, "%s%s%s%s%s", what[0] == '.' ? "the reference " : "", what, *what ? ": " : "", text.s,
                     where.s ? where.s : "");
         }
         qf_buf_free(&where);
@@ -742,7 +750,7 @@ static QfNode *build_raw(Build *b, X *x)
             if (f->feats.v[ft].intros.n != 1) continue;      /* a name of several types gives no type */
             uint32_t m = op_meet(c, t, f->feats.v[ft].intros.v[0]);
             if (m == QF_BOTTOM) {
-                build_error(b, x->u.st.fields[i].loc, "no type has all of these features (at '%s')", x->u.st.fields[i].label);
+                build_error(b, x->u.st.fields[i].loc, "no type has all of these fields (at '%s')", x->u.st.fields[i].label);
                 return NULL;
             }
             t = m;
@@ -752,7 +760,7 @@ static QfNode *build_raw(Build *b, X *x)
         QfNode *r = node_new(c, &c->scratch, t);
         build_struct_into(b, r, x);
         if (!b->ok) return NULL;
-        const char *what = "struct";
+        const char *what = "";
         if (x->u.st.refs) {                  /* a reference's place: name the reference */
             X *tag = x;
             while (tag->k == X_STRUCT) tag = tag->u.st.fields[0].value;
@@ -788,7 +796,7 @@ static QfNode *build_raw(Build *b, X *x)
             while (tag->k == X_STRUCT) tag = tag->u.st.fields[0].value;
             unify_at(b, l, r, tag->loc, tag->u.name);
         } else {
-            unify_at(b, l, r, x->loc, "conjunction");
+            unify_at(b, l, r, x->loc, "");
         }
         return b->ok ? l : NULL;
     }

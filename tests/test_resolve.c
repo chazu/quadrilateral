@@ -236,7 +236,7 @@ void test_decimals(void)
 
     /* a point value must be a whole number of quanta */
     QfDec p15 = { 15, 15, -5, false, false };                   /* 0.15 mm, in metres */
-    STR_EQ(quanta_text(p15, -4), "the value is not a whole number of quanta of the kind");
+    STR_EQ(quanta_text(p15, -4), "the value is not a multiple of the smallest step of the kind");
     STR_EQ(quanta_text(p15, -5), "15..15");
     STR_EQ(quanta_text(p15, -8), "15000..15000");
     /* a bound moves inward to the next quantum */
@@ -255,11 +255,11 @@ void test_decimals(void)
     QfDec negopen = { -2, 2, -4, true, true };
     STR_EQ(quanta_text(negopen, -4), "-1..1");
     QfDec none = { 11, 19, -5, true, true };                    /* between 0.11 mm and 0.19 mm */
-    STR_EQ(quanta_text(none, -4), "the range holds no whole number of quanta of the kind");
+    STR_EQ(quanta_text(none, -4), "the range holds no multiple of the smallest step of the kind");
     QfDec huge = { 1, 1, 30, false, false };
     STR_EQ(quanta_text(huge, -4), "the value does not fit in the range of the kind");
     QfDec tiny = { 1, 1, -40, false, false };
-    STR_EQ(quanta_text(tiny, -4), "the value is not a whole number of quanta of the kind");
+    STR_EQ(quanta_text(tiny, -4), "the value is not a multiple of the smallest step of the kind");
     QfDec tinyb = { 1, Q_INF, -40, false, false };              /* >= 1e-40: the next quantum is 1 */
     STR_EQ(quanta_text(tinyb, -4), "1..9223372036854775807");
     QfDec tinyn = { -1, Q_INF, -40, false, false };             /* >= -1e-40: 0 is allowed */
@@ -453,12 +453,12 @@ void test_builtin_kinds(void)
     snprintf(src, sizeof src, "%sx: #T & { a: 1rad }\n", T);
     STR_EQ(load_error(src), "a.quad:2:14: error: unknown unit 'rad'");
     snprintf(src, sizeof src, "%sx: #T & { a: 5 }\n", T);
-    STR_EQ(load_error(src), "a.quad:2:9: error: struct: conflict at a: %angle vs 5");
+    STR_EQ(load_error(src), "a.quad:2:9: error: a: 5 has no unit, and %angle has the unit deg");
     snprintf(src, sizeof src, "%sx: #T & { l: 90deg }\n", T);
-    STR_EQ(load_error(src), "a.quad:2:9: error: struct: conflict at l: %length vs dim[deg] & 90");
+    STR_EQ(load_error(src), "a.quad:2:9: error: l: 90 deg is not of the kind %length. The unit of %length is m");
     snprintf(src, sizeof src, "%sx: #T & { l: 0.01mm }\n", T);
-    STR_EQ(load_error(src), "a.quad:2:9: error: struct: conflict at l: %length vs dim[m] & 0.00001 "
-                            "(the value is not a whole number of quanta of the kind)");
+    STR_EQ(load_error(src), "a.quad:2:9: error: l: 0.00001 m is not a multiple of the smallest step of %length, which is "
+                            "0.0001 m. For a smaller step, declare %length with scale: -5");
     snprintf(src, sizeof src, "%sx: #T & { r: 5J/kg*K }\n", T);
     STR_EQ(load_error(src), "a.quad:2:14: error: in the unit 'J/kg*K', a '*' after a '/' has two readings. Give each "
                             "divisor its own '/': J/kg/K");
@@ -482,8 +482,8 @@ void test_builtin_kinds(void)
     }
     qf_free(f);
     snprintf(src, sizeof src, "%s%%mass: { scale: 0 }\nx: #T & { m: 350g }\n", T);
-    STR_EQ(load_error(src), "a.quad:3:9: error: struct: conflict at m: %mass vs dim[kg] & 0.35 "
-                            "(the value is not a whole number of quanta of the kind)");
+    STR_EQ(load_error(src), "a.quad:3:9: error: m: 0.35 kg is not a multiple of the smallest step of %mass, which is 1 kg. "
+                            "For a smaller step, declare %mass with scale: -2");
     /* a second declaration is an error, whatever it says */
     STR_EQ(load_error("%mass: { scale: 0 }\n%mass: { scale: 0 }\n"), "a.quad:2:1: error: the kind %mass is already declared at a.quad:1");
     STR_EQ(load_error("%mass: { conserved: true }\n%mass: { conserved: false }\n"),
@@ -632,24 +632,24 @@ void test_literal_conversion(void)
     INST("#T & { x: 3e-3m, e: 1e3J }", "#T & { any: _, c: %count, e: %energy & 1000, n: number, x: %length & 0.003 }");
 
     /* errors: each names the value and the reason */
-    INST("#T & { x: 0.15mm }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[m] & 0.00015 "
-                               "(the value is not a whole number of quanta of the kind)");
-    INST("#T & { c: 2.5 }", "a.quad:5:9: error: struct: conflict at c: %count vs 2.5 "
-                            "(the value is not a whole number of quanta of the kind)");
-    INST("#T & { x: >0.11mm & <0.19mm }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[m] & >0.00011 & <0.00019 "
-                                           "(the range holds no whole number of quanta of the kind)");
-    INST("#T & { x: 1e30m }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[m] & 1e30 "
-                              "(the value does not fit in the range of the kind)");
-    INST("#T & { x: 5kg }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[kg] & 5");
-    INST("#T & { x: 5 }", "a.quad:5:9: error: struct: conflict at x: %length vs 5");
-    INST("#T & { x: 3min }", "a.quad:5:9: error: struct: conflict at x: %length vs dim[s] & 180");
-    INST("#T & { x: %mass }", "a.quad:5:9: error: struct: conflict at x: %length vs %mass");
-    INST("#T & { x: 12mm } & { x: 13mm }", "a.quad:5:21: error: conjunction: conflict at x: %length & 0.012 vs %length & 0.013");
-    INST("#T & { any: 12mm & 13mm }", "a.quad:5:21: error: conjunction: conflict at any: dim[m] & 0.012 vs dim[m] & 0.013");
-    INST("#T & { any: 1e30m & 1e-30m }", "a.quad:5:22: error: conjunction: conflict at any: dim[m] & 1e30 vs dim[m] & 0.000000000000000000000000000001 "
-                                         "(the number is out of range)");
-    INST("#T & { x: >=10mm & <5mm }", "a.quad:5:21: error: conjunction: conflict at x: dim[m] & >=0.01 vs dim[m] & <0.005");
-    INST("#T & { n: \"text\" }", "a.quad:5:9: error: struct: conflict at n: number vs \"text\"");
+    INST("#T & { x: 0.15mm }", "a.quad:5:9: error: x: 0.00015 m is not a multiple of the smallest step of %length, which is "
+                               "0.0001 m. For a smaller step, declare %length with scale: -5");
+    INST("#T & { c: 2.5 }", "a.quad:5:9: error: c: 2.5 is not a multiple of the smallest step of %count, which is 1");
+    INST("#T & { x: >0.11mm & <0.19mm }", "a.quad:5:9: error: x: no multiple of the smallest step of %length, which is 0.0001 m, "
+                                           "is in the range > 0.00011 m and < 0.00019 m. For a smaller step, declare %length "
+                                           "with a smaller scale than -4");
+    INST("#T & { x: 1e30m }", "a.quad:5:9: error: x: 1e30 m is too large for %length, which has the smallest step 0.0001 m. "
+                              "For larger values, declare %length with a larger scale than -4");
+    INST("#T & { x: 5kg }", "a.quad:5:9: error: x: 5 kg is not of the kind %length. The unit of %length is m");
+    INST("#T & { x: 5 }", "a.quad:5:9: error: x: 5 has no unit, and %length has the unit m");
+    INST("#T & { x: 3min }", "a.quad:5:9: error: x: 180 s is not of the kind %length. The unit of %length is m");
+    INST("#T & { x: %mass }", "a.quad:5:9: error: x: %length and %mass are different kinds");
+    INST("#T & { x: 12mm } & { x: 13mm }", "a.quad:5:21: error: x: 0.012 m and 0.013 m are different values");
+    INST("#T & { any: 12mm & 13mm }", "a.quad:5:21: error: any: 0.012 m and 0.013 m are different values");
+    INST("#T & { any: 1e30m & 1e-30m }", "a.quad:5:22: error: any: 1e30 m and 0.000000000000000000000000000001 m are too far apart "
+                                         "for a comparison");
+    INST("#T & { x: >=10mm & <5mm }", "a.quad:5:21: error: x: >= 0.01 m and < 0.005 m have no value in common");
+    INST("#T & { n: \"text\" }", "a.quad:5:9: error: n: \"text\" is not a number");
     /* the checks that ADR 0014 gave to this stage */
     INST("#T & { n: 0x10 }", "a.quad:5:14: error: unknown unit 'x10'");
     INST("#T & { n: 10m/x }", "a.quad:5:14: error: unknown unit 'x' in 'm/x'. If 'x' is a name, put spaces around the "
@@ -996,15 +996,15 @@ void test_resolve_errors(void)
     STR_EQ(load_error("#A: { x: _ }\n#B: { x: _ }\n"), "loaded");            /* two types, one field name (ADR 0017) */
     STR_EQ(load_error("#A: #B\n#B: #A\n"), "a.quad:1:1: error: the type hierarchy has a cycle through #A");
     STR_EQ(load_error("#A: #Nope & { x: _ }\n"), "a.quad:1:5: error: #Nope is not a type that #A can inherit from");
-    STR_EQ(load_error("a: { x: 1 }\n"), "a.quad:1:6: error: unknown feature 'x': no type declares a field with this name");
+    STR_EQ(load_error("a: { x: 1 }\n"), "a.quad:1:6: error: unknown field 'x': no type declares a field with this name");
     STR_EQ(load_error("#A: { x: _ }\na: #A & { x: nope }\n"), "a.quad:2:14: error: unknown name nope");
     STR_EQ(load_error("#A: { x: _ }\n#B: { y: _ }\na: #A & { y: 1 }\n"),
            "a.quad:3:9: error: this struct has fields of #B, but it stands where the type is #A: write #B & { ... }");
     STR_EQ(load_error("#A: { x: _ }\na: #A & { x: a.x }\n"), "a.quad:2:1: error: instance a refers to itself");
     STR_EQ(load_error("#A: { x: \"p\" | \"q\" }\na: #A & { x: \"r\" }\n"),
-           "a.quad:2:9: error: struct: conflict at x: \"r\" vs \"p\" | \"q\"");
+           "a.quad:2:9: error: x: \"r\" is not one of \"p\" | \"q\"");
     STR_EQ(load_error("#A: { x: text }\na: #A & { x: \"r\" }\na: { x: \"s\" }\n"),
-           "a.quad:3:1: error: a: conflict at x: \"r\" vs \"s\", with its other declarations");
+           "a.quad:3:1: error: a: x: \"r\" and \"s\" are different values, with its other declarations");
     STR_EQ(load_error("#A: { x: #B, w: _ }\n#B: { y: #C, z: _ }\n#C: { v: _ }\na: #A & { w: .x.y.z }\n"),
            "a.quad:4:14: error: the reference .x.y.z: x.y is #C, which has no field z");
     /* a field with no type is open: the reference gives it the fields of its path */
@@ -1031,7 +1031,7 @@ void test_resolve_errors(void)
     CHECK(!ok && f->diags.n == 2);
     if (f->diags.n == 2) {
         STR_EQ(f->diags.v[0].msg, "a.quad:2:14: error: unknown name nope");
-        STR_EQ(f->diags.v[1].msg, "b.quad:1:12: error: #B inheriting from #A: conflict at x: \"r\" vs \"p\" | \"q\", with #A at a.quad:1");
+        STR_EQ(f->diags.v[1].msg, "b.quad:1:12: error: #B inheriting from #A: x: \"r\" is not one of \"p\" | \"q\", with #A at a.quad:1");
     }
     const char *more = "x: 1\n", *name = "z.quad";
     CHECK(!qf_load(f, &name, &more, 1));                         /* a front end loads once */
@@ -1445,7 +1445,7 @@ void test_prop_load_order(void)
         CHECK(f->nerrors == 2 && f->diags.n == 2);
         int conflict = 0, unknown = 0;
         for (size_t i = 0; i < f->diags.n; i++) {
-            conflict += strstr(f->diags.v[i].msg, "struct: conflict at x: \"p\" | \"q\" vs \"r\"") != NULL;
+            conflict += strstr(f->diags.v[i].msg, "x: \"r\" is not one of \"p\" | \"q\"") != NULL;
             unknown += strstr(f->diags.v[i].msg, "unknown name nope") != NULL;
         }
         CHECK(conflict == 1 && unknown == 1);
@@ -1542,6 +1542,78 @@ static size_t generated_types(const Front *f)
     return n;
 }
 
+/* A message of the unifier uses the words of the author: the field, the
+ * value with its unit, and the kind. It has no word of the implementation
+ * (quad-fjp). */
+void test_messages(void)
+{
+    static const char K[] =
+        "%voltage: { dimension: \"V\" }\n"
+        "%temperature: { scale: -6 }\n"
+        "%width: { dimension: \"m\" }\n"
+        "%energy: { dimension: \"J\" }\n"
+        "#T: { v: %voltage, t: %temperature, on: bool, c: %count, p: %energy / %time, n: number, w: %width, "
+        "l: %length, any: _ }\n";
+    char src[1024];
+#define MSG(inst, want)                                                    \
+    do {                                                                   \
+        snprintf(src, sizeof src, "%sx: %s\n", K, inst);                   \
+        STR_EQ(load_error(src), "a.quad:6:" want);                         \
+    } while (0)
+
+    /* a value with the unit of another dimension */
+    MSG("#T & { v: 12A }", "9: error: v: 12 A is not of the kind %voltage. The unit of %voltage is V");
+    MSG("#T & { p: 5m }", "9: error: p: 5 m is not a quantity in W");
+    MSG("#T & { any: 12mm & 5kg }", "21: error: any: 0.012 m and 5 kg have different units");
+    MSG("#T & { any: (%energy / %time) & (%length / %time) }",
+        "34: error: any: a quantity in W and a quantity in m s^-1 are different: the unit of the first is W, and the "
+        "unit of the second is m s^-1");
+
+    /* C is the coulomb: the message gives the value in kelvin, if the value is one number that fits */
+    MSG("#T & { t: 25C }", "9: error: t: 25 C is not of the kind %temperature. The unit of %temperature is K. The unit C "
+                           "is the coulomb. Write a temperature in kelvin: 25 degrees Celsius is 298.15K");
+    MSG("#T & { t: 25.5C }", "9: error: t: 25.5 C is not of the kind %temperature. The unit of %temperature is K. The "
+                             "unit C is the coulomb. Write a temperature in kelvin: 25.5 degrees Celsius is 298.65K");
+    MSG("#T & { t: -40C }", "9: error: t: -40 C is not of the kind %temperature. The unit of %temperature is K. The "
+                            "unit C is the coulomb. Write a temperature in kelvin: -40 degrees Celsius is 233.15K");
+    MSG("#T & { t: 0.001C }", "9: error: t: 0.001 C is not of the kind %temperature. The unit of %temperature is K. The "
+                              "unit C is the coulomb. Write a temperature in kelvin: 0.001 degrees Celsius is 273.151K");
+    MSG("#T & { t: >=25C }", "9: error: t: >= 25 C is not of the kind %temperature. The unit of %temperature is K. The "
+                             "unit C is the coulomb. Write a temperature in kelvin");
+    MSG("#T & { t: 1e30C }", "9: error: t: 1e30 C is not of the kind %temperature. The unit of %temperature is K. The "
+                             "unit C is the coulomb. Write a temperature in kelvin");
+    /* the hint is for a temperature only */
+    MSG("#T & { v: 25C }", "9: error: v: 25 C is not of the kind %voltage. The unit of %voltage is V");
+
+    /* a number with no unit, and a unit where the field has none */
+    MSG("#T & { p: 5 }", "9: error: p: 5 has no unit, and the field is a quantity in W");
+    MSG("#T & { v: 5 }", "9: error: v: 5 has no unit, and %voltage has the unit V");
+    MSG("#T & { c: 5m }", "9: error: c: 5 m has a unit, and %count is a number with no unit");
+
+    /* two kinds with one dimension */
+    MSG("#T & { w: %length }", "9: error: w: %width and %length are different kinds");
+    MSG("#T & { l: 5m } & { w: .l }", "26: error: the reference .l: l: %length and %width are different kinds");
+
+    /* a value of another type */
+    MSG("#T & { on: 3 }", "9: error: on: 3 is not of the type bool");
+    MSG("#T & { on: \"yes\" }", "9: error: on: \"yes\" is not of the type bool");
+    MSG("#T & { t: \"warm\" }", "9: error: t: \"warm\" is not of the kind %temperature");
+
+    /* an unknown field: the message lists the fields of the type, 12 at most */
+    MSG("#T & { volts: 12V }", "11: error: unknown field 'volts'. The fields of #T are: any, c, l, n, on, p, t, v, w");
+    STR_EQ(load_error("#Big: { a: _, b: _, c: _, d: _, e: _, f: _, g: _, h: _, i: _, j: _, k: _, l: _, m: _, n: _ }\n"
+                      "x: #Big & { z: 1 }\n"),
+           "a.quad:2:13: error: unknown field 'z'. The fields of #Big are: a, b, c, d, e, f, g, h, i, j, k, l, and 2 more");
+    STR_EQ(load_error("#Twelve: { a: _, b: _, c: _, d: _, e: _, f: _, g: _, h: _, i: _, j: _, k: _, l: _ }\n"
+                      "x: #Twelve & { z: 1 }\n"),
+           "a.quad:2:16: error: unknown field 'z'. The fields of #Twelve are: a, b, c, d, e, f, g, h, i, j, k, l");
+    STR_EQ(load_error("x: { z: 1 }\n"), "a.quad:1:6: error: unknown field 'z': no type declares a field with this name");
+    /* two types together have no name of their own */
+    STR_EQ(load_error("#A: { a: _ }\n#B: { b: _ }\nx: #A & #B & { z: 1 }\n"),
+           "a.quad:3:16: error: unknown field 'z'. The fields of this type are: a, b");
+#undef MSG
+}
+
 /* Unrelated types can each have a field with the same name (ADR 0017). The
  * name is one feature, and each of the types introduces it. */
 void test_shared_fields(void)
@@ -1578,7 +1650,7 @@ void test_shared_fields(void)
 
     /* each type keeps its own declaration of the field */
     STR_EQ(load_error(with_kinds("#A: { x: %length }\n#B: { x: text }\na: #A & { x: \"no\" }\n")),
-           "a.quad:6:7: error: conjunction: conflict at x: %length vs \"no\"");
+           "a.quad:6:7: error: x: \"no\" is not of the kind %length");
     /* a structure still cannot have a field that its type does not declare */
     STR_EQ(load_error("#A: { x: _ }\n#B: { x: _, y: _ }\na: #A & { y: 1 }\n"),
            "a.quad:3:9: error: this struct has fields of #B, but it stands where the type is #A: write #B & { ... }");
@@ -1596,9 +1668,9 @@ void test_shared_fields(void)
     STR_EQ(inst_text(with_kinds("#A: { x: %length & >=1m }\n#B: { x: %length & <=5m }\n#C: #A & #B\nc: #C & { x: 2m }\n"), "c"),
            "#C & { x: %length & 2 }");
     STR_EQ(load_error(with_kinds("#A: { x: %length & >=1m }\n#B: { x: %length & <=5m }\n#C: #A & #B\nc: #C & { x: 6m }\n")),
-           "a.quad:7:7: error: conjunction: conflict at x: %length & >=1 & <=5 vs dim[m] & 6");
+           "a.quad:7:7: error: x: the range 1 m .. 5 m and 6 m have no value in common");
     STR_EQ(load_error(with_kinds("#A: { x: %length }\n#B: { x: text }\n#C: #A & #B\n")),
-           "a.quad:6:1: error: #C inheriting from #B: conflict at x: %length vs text, with #B at a.quad:5");
+           "a.quad:6:1: error: #C inheriting from #B: x: a value cannot be both %length and text, with #B at a.quad:5");
 
     /* many shared names give no generated type */
     f = load1(with_kinds("#Port: { side: text }\n"
@@ -1668,7 +1740,7 @@ void test_shared_fields(void)
            "#S & { form: ({ side: %length } | { x: text, r: %length })/{ x: text, r: %length } & { r: %length, x: \"a\" } }");
     STR_EQ(inst_text(with_kinds(alts), "a"), "#A & { x: %length & 3 }");
     STR_EQ(load_error(with_kinds("#S: { form: { x: text, r: %length } | { side: %length } }\ns: #S & { form: { side: 1m, r: 2m } }\n")),
-           "a.quad:5:29: error: no type has all of these features (at 'r')");
+           "a.quad:5:29: error: no type has all of these fields (at 'r')");
 
     /* a field that the alternatives of one disjunction share, and no named type has, is the disjunction's */
     const char *alts2 = "#S: { form: { x: text, r: %length } | { x: text, side: %length } }\n"
