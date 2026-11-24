@@ -117,6 +117,10 @@ struct QWorld {
     size_t     nchanged;
     size_t     capstage;
 
+    /* generated kernels that the world frees */
+    struct { QkKernel *k; void (*free_kernel)(QkKernel *); } *adopted;
+    size_t     nadopted, capadopted;
+
     /* the change log */
     bool       logging;
     QwChange  *log_entries;
@@ -487,7 +491,18 @@ void qw_free(QWorld *w)
     free(w->changed);
     free(w->log_entries);
     qn_free(w->net);
+    for (size_t i = 0; i < w->nadopted; i++) w->adopted[i].free_kernel(w->adopted[i].k);
+    free(w->adopted);
     free(w);
+}
+
+QwStatus qw_adopt_kernel(QWorld *w, QkKernel *k, void (*free_kernel)(QkKernel *))
+{
+    if (!k || !free_kernel) return fail(w, QW_EKERNEL, "qw_adopt_kernel needs a kernel and its free function");
+    if (!grow((void **) &w->adopted, &w->capadopted, w->nadopted + 1, sizeof *w->adopted)) return fail(w, QW_ENOMEM, "out of memory");
+    w->adopted[w->nadopted].k = k;
+    w->adopted[w->nadopted++].free_kernel = free_kernel;
+    return QW_OK;
 }
 
 static bool valid_name(const char *s)
@@ -1205,8 +1220,10 @@ static QwStatus kernel_failed(QWorld *w, const Phen *p, const Att *a, const char
 {
     if (r == QK_INAPPLICABLE)
         return fail(w, QW_EINAPPLICABLE, "%s: kernel '%s' is not applicable (%s)", p->name, a->k->name, what);
+    /* the reason: an error of a host function, or else the last message that the kernel logged */
+    const char *said = strstr(w->log, ": ");
     return fail(w, QW_EKERNEL, "%s: kernel '%s' failed in %s: %s", p->name, a->k->name, what,
-                call->err ? call->msg : "kernel error");
+                call->err ? call->msg : said ? said + 2 : "kernel error");
 }
 
 static QwStatus predict(QWorld *w, QwPhen id, Att *a)
@@ -1217,6 +1234,7 @@ static QwStatus predict(QWorld *w, QwPhen id, Att *a)
     a->nas = 0;
     QkCall call = { w, id, a, M_PREDICT, 0, { 0 } };
     QkPrediction pr = { QK_NO_TIME, QK_NO_TIME, QK_NO_TIME };
+    w->log[0] = 0;
     QkResult r = a->k->predict(a->inst, &call, &pr);
     p->predicts++;
     if (r != QK_OK || call.err) return kernel_failed(w, p, a, "predict", &call, r);
@@ -1383,6 +1401,7 @@ QwStatus qw_run(QWorld *w, int64_t until)
                     return st;
                 }
                 QkCall call = { w, (QwPhen) i, a, M_ADVANCE, 0, { 0 } };
+                w->log[0] = 0;
                 QkResult r = a->k->advance(a->inst, &call, b);
                 a->events++;
                 w->advances++;

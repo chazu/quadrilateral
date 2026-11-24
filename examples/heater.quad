@@ -1,0 +1,19 @@
+// A heater in a room, and a wall to the air outside. Use this file with
+// thermal.quad:
+//
+//   build/quad run examples/thermal.quad examples/heater.quad --until 6h --every 1h
+//
+// The heater has no kernel in C. Its interaction moves energy into the room
+// at the rate `power`. The energy comes from outside the world, so the
+// interaction says `conserved: false`.
+#Heater: #Phenomenon & {
+    room:  #ThermalPort
+    power: %energy / %time
+    heat:  #Interaction & { sink: .room.energy, rate: .power, conserved: false }
+}
+
+living:  #Room & { temperature: 283.15K, capacity: 100000J/K }
+outside: #Room & { temperature: 273.15K, capacity: 1000000000J/K }
+
+heater: #Heater & { room: living.west, power: 1500W }
+wall:   #Wall & { hot: living.west, cold: outside.west, conductance: 50W/K }

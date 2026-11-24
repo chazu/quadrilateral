@@ -21,10 +21,10 @@
  *     issue. */
 
 /* The prelude: the types that the front end knows (ADR 0011 section 2).
- * The list types are in the root. #Phenomenon and #Port, which the
- * elaborator of stage 3 recognizes, are in the package `quad` (ADR 0016), so
- * their labels stay free for the content. The other prelude types come with
- * their stages. */
+ * The list types are in the root. #Phenomenon, #Port and #Interaction, which
+ * the elaborator recognizes, are in the package `quad` (ADR 0016, ADR 0020),
+ * so their labels stay free for the content. The other prelude types come
+ * with their stages. */
 static const char *prelude =
     "#List: {}\n"
     "#Cons: #List & { first: _, rest: #List }\n"
@@ -32,7 +32,8 @@ static const char *prelude =
 static const char *prelude_quad =
     "package quad\n"
     "#Phenomenon: { evaluator: text }\n"
-    "#Port: {}\n";
+    "#Port: {}\n"
+    "#Interaction: { source: _, sink: _, rate: _, tolerance: *1pct | %ratio, conserved: *true | bool }\n";
 #define PRELUDE_FILE "<prelude>"
 #define PRELUDE_PKG  "quad"
 

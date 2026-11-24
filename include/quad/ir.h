@@ -116,10 +116,14 @@ typedef struct {
     uint32_t    cell;        /* index into cells */
 } QiBind;
 
+/* A transfer of a kernel. An interaction with a rate in source (ADR 0020)
+ * gives a transfer of the kernel native.rate: `rate` and `tolerance` are then
+ * the cells that give its rate and the accuracy of its steps. */
 typedef struct {
     const char *name;
     uint32_t    from, to;    /* indices into cells, or QI_NONE */
     bool        conserved;
+    uint32_t    rate, tolerance;   /* indices into cells; QI_NONE for a transfer of a kernel in C */
 } QiTransfer;
 
 /* A kernel of a phenomenon, with the cell that each slot binds to. */

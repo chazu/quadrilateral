@@ -7,12 +7,14 @@
 /* The elaborator: stage 3 of the front end (ADR 0011 section 3, ADR 0016).
  *
  * It reads the result of a load and makes the IR. Each instance of a type
- * below #Phenomenon is a phenomenon. The work has three passes:
+ * below #Phenomenon is a phenomenon. The work has four passes:
  *
  *   1. For each phenomenon: its connections, its cells, its aliases and its
  *      ports.
  *   2. A check of each connection against the port that it names.
- *   3. For each phenomenon: the propagators of its laws, and its kernel.
+ *   3. For each phenomenon: the propagators of its laws, and its kernel: the
+ *      one that it names, or native.rate for its interactions with a rate
+ *      (ADR 0020).
  *   4. The start: the first value of each stock, from the laws (ADR 0019).
  *
  * Then the kinds, the enumerations and the dependency graph, in orders that
@@ -28,6 +30,7 @@ typedef struct {
     const QiOptions  *opt;
     QfArena          *mem;
     uint32_t          tphen, tport, fevaluator;
+    uint32_t          tinter, fsource, fsink, frate, ftol, fcons;    /* #Interaction and its fields (ADR 0020) */
     U32Vec            insts;        /* for each phenomenon: its index in f->insts */
     U64Map            phenidx;      /* index in f->insts + 1 → phenomenon + 1 */
     VEC(QiPhen)       phens;
@@ -129,6 +132,7 @@ typedef struct {
     VEC(const QfNode *) stack;
     int             port;        /* the port that the walk is inside, or -1 */
     uint32_t        owner;       /* the type of the structure that the walk is in */
+    U64Map          rates;       /* a rate with a dimension and no kind → its scale + 1000 (ADR 0020) */
 } Walk;
 
 static uint32_t add_port(Elab *e, uint32_t phen, const uint32_t *path, size_t n, uint32_t type, QiPortState state)
@@ -257,8 +261,13 @@ static void walk(Walk *w, const QfNode *n)
             VEC_PUSH(w->stack, n);
             uint32_t outer = w->owner;
             w->owner = n->type;
+            /* The source and the sink of an interaction are paths to stocks,
+             * and its flag is a statement: none of them is a cell (ADR 0020). */
+            bool inter = e->tinter != QF_BOTTOM && is_subtype(f, n->type, e->tinter);
             for (uint32_t i = 0; i < n->narcs; i++) {
-                VEC_PUSH(w->path, n->arcs[i].feat);
+                uint32_t ft = n->arcs[i].feat;
+                if (inter && (ft == e->fsource || ft == e->fsink || ft == e->fcons)) continue;
+                VEC_PUSH(w->path, ft);
                 walk(w, n->arcs[i].val);
                 w->path.n--;
             }
@@ -419,6 +428,37 @@ static void type_range(const Walk *w, const Leaf *l, int8_t scale, QInterval *ra
     }
 }
 
+/* --- interactions: the structures (ADR 0020) --- */
+
+typedef VEC(const QfNode *) NodeStack;
+typedef struct { U32Vec path; const QfNode *node; Sym text; } Inter;
+typedef VEC(Inter) InterVec;
+
+/* The structures below #Interaction in a phenomenon, outside its connections. */
+static void find_inters(Elab *e, const char *phen, const QfNode *n, U32Vec *path, NodeStack *stack, size_t conn0, size_t conn1,
+                        InterVec *out)
+{
+    Front *f = e->f;
+    for (size_t c = conn0; c < conn1; c++)
+        if (e->conns.v[c].path.n == path->n && starts_with(path->v, path->n, &e->conns.v[c].path)) return;
+    if (n->flags & NF_VALUE) return;
+    if (path->n && is_subtype(f, n->type, e->tinter)) {
+        Inter in = { { 0 }, n, path_sym(e, phen, path->v, path->n) };
+        for (size_t i = 0; i < path->n; i++) VEC_PUSH(in.path, path->v[i]);
+        VEC_PUSH(*out, in);
+        return;
+    }
+    for (size_t i = 0; i < stack->n; i++)
+        if (stack->v[i] == n) return;
+    VEC_PUSH(*stack, n);
+    for (uint32_t i = 0; i < n->narcs; i++) {
+        VEC_PUSH(*path, n->arcs[i].feat);
+        find_inters(e, phen, n->arcs[i].val, path, stack, conn0, conn1, out);
+        path->n--;
+    }
+    stack->n--;
+}
+
 /* Makes the cell of a value. first: the first leaf of the value in
  * w->leaves; l: the leaf that gives the cell its path. */
 static void add_cell(Walk *w, size_t first, const Leaf *l)
@@ -449,6 +489,8 @@ static void add_cell(Walk *w, size_t first, const Leaf *l)
         /* a dimension and no kind: an anonymous kind with the default scale of the dimension */
         QDim dim = f->dims.v[f->types.v[l->node->type].dimix].dim;
         int8_t scale = qdim_default_scale(&dim, f->tick_scale);
+        uint64_t rs;
+        if (u64map_get(&w->rates, (uint64_t) (uintptr_t) l->node, &rs)) scale = (int8_t) ((int) rs - 1000);
         QfDec d = { l->node->lo, l->node->hi, l->node->exp, (l->node->flags & NF_LO_OPEN) != 0,
                     (l->node->flags & NF_HI_OPEN) != 0 };
         const char *why = qf_dec_to_quanta(d, scale, &c.base.lo, &c.base.hi);
@@ -488,6 +530,39 @@ static void add_cell(Walk *w, size_t first, const Leaf *l)
     u64map_put(&e->paths, (uint64_t) (uintptr_t) l->text, e->cells.n);
 }
 
+/* The rate of an interaction that has a dimension and no kind gets the scale
+ * of its stock with 6 more decimals: one quantum of the stock in 10^6
+ * seconds. The default scale of the dimension is too coarse for a slow flow:
+ * the rate then reads as zero and the flow stops (ADR 0020). An inner
+ * quotient of a law has 6 more decimals for the same reason (ADR 0018). */
+static void rate_scales(Walk *w)
+{
+    Elab *e = w->e;
+    Front *f = e->f;
+    if (e->tinter == QF_BOTTOM) return;
+    InterVec inters = { 0 };
+    U32Vec path = { 0 };
+    NodeStack stack = { 0 };
+    find_inters(e, w->in->name, w->in->node, &path, &stack, w->conn0, e->conns.n, &inters);
+    for (size_t i = 0; i < inters.n; i++) {
+        const QfNode *rn = node_arc(inters.v[i].node, e->frate);
+        const uint32_t ends[2] = { e->fsource, e->fsink };
+        for (int k = 0; k < 2 && rn; k++) {
+            const QfNode *sn = node_arc(inters.v[i].node, ends[k]);
+            if (!sn || !(sn->flags & NF_VALUE) || f->types.v[sn->type].kind != TK_KIND) continue;
+            if (!(rn->flags & NF_VALUE) || f->types.v[rn->type].kind != TK_DIMT) continue;
+            int scale = f->kinds.v[f->types.v[sn->type].kindix].scale - 6;
+            if (scale < -18) scale = -18;
+            u64map_put(&w->rates, (uint64_t) (uintptr_t) rn, (uint64_t) (scale + 1000));
+            break;
+        }
+        VEC_FREE(inters.v[i].path);
+    }
+    VEC_FREE(inters);
+    VEC_FREE(path);
+    VEC_FREE(stack);
+}
+
 static void phen_cells(Elab *e, uint32_t phen)
 {
     Front *f = e->f;
@@ -499,6 +574,7 @@ static void phen_cells(Elab *e, uint32_t phen)
     w.conn0 = e->conns.n;
     w.port = -1;
     find_conns(&w);
+    rate_scales(&w);
     walk(&w, w.in->node);
 
     /* A value is one node, and it can stand at several paths. Its cell has
@@ -532,6 +608,7 @@ static void phen_cells(Elab *e, uint32_t phen)
         }
     }
     free(done);
+    u64map_free(&w.rates);
     VEC_FREE(w.leaves);
     VEC_FREE(w.lpaths);
     VEC_FREE(w.path);
@@ -597,6 +674,57 @@ static uint32_t find_cell(Elab *e, uint32_t phen, const char *rel, const char **
     return found ? (uint32_t) v - 1 : QI_NONE;
 }
 
+/* A reference in source makes one node stand at several paths of a
+ * phenomenon. This looks at each path of the node `want`, outside the
+ * structure at `skip`, and takes the best one that is a cell: the shortest,
+ * and then the first by its text. *open: an open port that a path goes
+ * through, if no path is a cell. */
+static void node_cell_walk(Elab *e, uint32_t phen, const QfNode *n, const QfNode *want, U32Vec *path, NodeStack *stack,
+                           const U32Vec *skip, uint32_t *cell, size_t *len, Buf *rel, const char **open)
+{
+    if (skip && path->n == skip->n && starts_with(path->v, path->n, skip)) return;
+    if (n == want && path->n) {
+        Buf text = { 0 };
+        rel_text(e, &text, path->v, path->n);
+        const char *op = NULL;
+        uint32_t c = find_cell(e, phen, text.s, &op);
+        if (c == QI_NONE && op && !*open) *open = op;
+        if (c != QI_NONE && (*cell == QI_NONE || path->n < *len || (path->n == *len && strcmp(text.s, rel->s) < 0))) {
+            *cell = c;
+            *len = path->n;
+            rel->len = 0;
+            qf_buf_puts(rel, text.s);
+        }
+        qf_buf_free(&text);
+        return;
+    }
+    if (n->flags & NF_VALUE) return;
+    for (size_t i = 0; i < stack->n; i++)
+        if (stack->v[i] == n) return;
+    VEC_PUSH(*stack, n);
+    for (uint32_t i = 0; i < n->narcs; i++) {
+        VEC_PUSH(*path, n->arcs[i].feat);
+        node_cell_walk(e, phen, n->arcs[i].val, want, path, stack, skip, cell, len, rel, open);
+        path->n--;
+    }
+    stack->n--;
+}
+
+/* The cell of a node of a phenomenon, or QI_NONE. rel: gets the path that
+ * gave the cell. */
+static uint32_t node_cell(Elab *e, uint32_t phen, const QfNode *want, const U32Vec *skip, Buf *rel, const char **open)
+{
+    U32Vec path = { 0 };
+    NodeStack stack = { 0 };
+    uint32_t cell = QI_NONE;
+    size_t len = 0;
+    *open = NULL;
+    node_cell_walk(e, phen, e->f->insts.v[e->insts.v[phen]].node, want, &path, &stack, skip, &cell, &len, rel, open);
+    VEC_FREE(path);
+    VEC_FREE(stack);
+    return cell;
+}
+
 typedef struct {
     Elab           *e;
     uint32_t        phen;
@@ -619,6 +747,17 @@ static uint32_t operand(Law *l, const X *x)
         rel_text(e, &b, rec->tags.v[t].path.v, rec->tags.v[t].path.n);
         const char *open;
         uint32_t c = find_cell(e, l->phen, b.s ? b.s : "", &open);
+        if (c == QI_NONE && !open) {
+            /* the path of the reference is not the path of the cell: the same value stands at another path */
+            U32Vec full = { 0 };
+            for (size_t k = 0; k < l->use->prefix.n; k++) VEC_PUSH(full, l->use->prefix.v[k]);
+            for (size_t k = 0; k < rec->tags.v[t].path.n; k++) VEC_PUSH(full, rec->tags.v[t].path.v[k]);
+            const QfNode *n = node_at(e->f->insts.v[e->insts.v[l->phen]].node, full.v, full.n);
+            Buf rel = { 0 };
+            if (n) c = node_cell(e, l->phen, n, NULL, &rel, &open);
+            qf_buf_free(&rel);
+            VEC_FREE(full);
+        }
         if (c == QI_NONE) {
             if (open)
                 err(e, l->loc, "the law %s reads %s.%s, and the port %s.%s is not connected", l->law,
@@ -915,9 +1054,200 @@ static void phen_kernel(Elab *e, uint32_t phen)
     for (uint32_t t = 0; ok && t < k->ntransfers; t++) {
         const QkTransfer *kt = &k->transfers[t];
         ku.transfers[t] = (QiTransfer) { keep(e, kt->name), kt->from == QK_NONE ? QI_NONE : ku.binds[kt->from].cell,
-                                         kt->to == QK_NONE ? QI_NONE : ku.binds[kt->to].cell, kt->conserved };
+                                         kt->to == QK_NONE ? QI_NONE : ku.binds[kt->to].cell, kt->conserved, QI_NONE,
+                                         QI_NONE };
     }
     if (ok) VEC_PUSH(e->kernels, ku);
+}
+
+/* --- interactions with a rate (ADR 0020) ------------------------------------------------------------ */
+
+static int cmp_inter(const void *a, const void *b) { return strcmp(((const Inter *) a)->text, ((const Inter *) b)->text); }
+
+/* The unit of a dimension, for a message: m^3/s is "m^3 s^-1". */
+static void dim_unit(Elab *e, Buf *b, const QDim *d)
+{
+    Buf t = { 0 };
+    qf_dim_format(e->f, &t, d);
+    qf_buf_puts(b, qi_unit(t.s));
+    qf_buf_free(&t);
+}
+
+/* One end of an interaction: the stock that the field `feat` names. *cell is
+ * QI_NONE if the interaction does not state the end. False with a diagnostic. */
+static bool inter_end(Elab *e, uint32_t phen, const Inter *in, uint32_t feat, const char *what, Loc loc, uint32_t *cell,
+                      const char **slot)
+{
+    Front *f = e->f;
+    const InstInfo *ii = &f->insts.v[e->insts.v[phen]];
+    const QfNode *n = node_arc(in->node, feat);
+    *cell = QI_NONE;
+    *slot = NULL;
+    if (!n) return true;
+    Buf rel = { 0 };
+    const char *open;
+    uint32_t c = node_cell(e, phen, n, &in->path, &rel, &open);
+    bool ok = true;
+    if (c == QI_NONE) {
+        /* no cell: the end is not stated, or it is not a path to a cell */
+        if (open) {
+            err(e, loc, "the %s of %s goes through the port %s.%s, which is not connected", what, in->text, ii->name, open);
+            ok = false;
+        } else if (n->type != f->top || (n->flags & NF_VALUE) || n->narcs) {
+            err(e, loc, "the %s of %s must be a path to a stock, as in `%s: .energy`", what, in->text, what);
+            ok = false;
+        }
+    } else {
+        if (!e->cells.v[c].stock) {
+            err(e, loc, "the %s of %s is %s, which is not a stock: an interaction moves a quantity of a kind with "
+                "`conserved: true`", what, in->text, e->cells.v[c].path);
+            ok = false;
+        } else {
+            *cell = c;
+            /* the name of the slot: the path in its own phenomenon, or the path through the port */
+            *slot = e->cells.v[c].phen == phen ? keep(e, e->cells.v[c].path + strlen(ii->name) + 1) : keep(e, rel.s);
+        }
+    }
+    qf_buf_free(&rel);
+    return ok;
+}
+
+/* The bind of a cell in a kernel use: one slot for one cell. A stock of the
+ * phenomenon can also be the rate of another interaction, as a speed is for
+ * a position: the kernel reads a stock slot. */
+static void inter_bind(QiKernelUse *ku, size_t cap, uint32_t cell, QkRole role, const char *slot)
+{
+    for (uint32_t i = 0; i < ku->nbinds; i++) {
+        if (ku->binds[i].cell != cell) continue;
+        if (role == QK_STOCK) ku->binds[i].role = QK_STOCK;
+        return;
+    }
+    if (ku->nbinds < cap) ku->binds[ku->nbinds++] = (QiBind) { slot, role, cell };
+}
+
+/* Makes the kernel native.rate of a phenomenon from its interactions with
+ * a rate: each is one transfer (ADR 0020 section 6). */
+static void phen_interactions(Elab *e, uint32_t phen, size_t conn0, size_t conn1)
+{
+    Front *f = e->f;
+    if (e->tinter == QF_BOTTOM) return;
+    const InstInfo *ii = &f->insts.v[e->insts.v[phen]];
+    Loc loc = inst_loc(ii);
+    InterVec inters = { 0 };
+    U32Vec path = { 0 };
+    NodeStack stack = { 0 };
+    find_inters(e, ii->name, ii->node, &path, &stack, conn0, conn1, &inters);
+    VEC_FREE(path);
+    VEC_FREE(stack);
+    if (inters.n) qsort(inters.v, inters.n, sizeof(Inter), cmp_inter);
+    /* the evaluator that the phenomenon names, if it names one */
+    const QfNode *ev = e->fevaluator == QF_BOTTOM ? NULL : node_arc(ii->node, e->fevaluator);
+    Buf evname = { 0 };
+    if (ev && (ev->flags & NF_VALUE) && f->types.v[ev->type].kind == TK_TEXT && ev->lo == ev->hi)
+        qf_string_decode((Sym) (intptr_t) ev->lo, &evname);
+    const char *evaluator = evname.s;
+
+    QiKernelUse ku = { phen, "native.rate", qf_alloc(e->mem, (inters.n ? inters.n : 1) * 4 * sizeof(QiBind)), 0,
+                       qf_alloc(e->mem, (inters.n ? inters.n : 1) * sizeof(QiTransfer)), 0 };
+    bool ok = true;
+    for (size_t i = 0; i < inters.n; i++) {
+        const Inter *in = &inters.v[i];
+        const char *name = in->text + strlen(ii->name) + 1;
+        size_t errors = f->nerrors;                  /* each interaction reports its own errors */
+        const QfNode *rn = node_arc(in->node, e->frate), *cn = node_arc(in->node, e->fcons);
+        TypeKind rk = rn ? f->types.v[rn->type].kind : TK_TOP;
+        if (!rn || (!(rn->flags & NF_VALUE) && rn->type == f->top && !rn->narcs)) {
+            /* no rate: the interaction states a transfer of a native kernel (quad-ijx.4) */
+            if (!evaluator) {
+                err(e, loc, "%s has no rate, and %s names no evaluator: nothing moves the quantity. Give the interaction "
+                    "a rate, as in `rate: .power`", in->text, ii->name);
+                ok = false;
+            }
+            continue;
+        }
+        if (evaluator) {
+            err(e, loc, "%s has a rate, and %s names the evaluator \"%s\": a phenomenon moves its quantities with rates or "
+                "with a kernel, and not with both", in->text, ii->name, evaluator);
+            ok = false;
+            continue;
+        }
+        if (!(rn->flags & NF_VALUE) || (rk != TK_KIND && rk != TK_DIMT)) {
+            err(e, loc, "the rate of %s must be a quantity: the amount for each second", in->text);
+            ok = false;
+            continue;
+        }
+        Buf rate_path = { 0 }, tol_path = { 0 };
+        qf_buf_printf(&rate_path, "%s.rate", name);
+        qf_buf_printf(&tol_path, "%s.tolerance", name);
+        uint32_t rate = find_cell(e, phen, rate_path.s, NULL), tol = find_cell(e, phen, tol_path.s, NULL);
+        qf_buf_free(&rate_path);
+        qf_buf_free(&tol_path);
+        uint32_t from, to;
+        const char *from_slot, *to_slot;
+        bool ends = inter_end(e, phen, in, e->fsource, "source", loc, &from, &from_slot);
+        if (!inter_end(e, phen, in, e->fsink, "sink", loc, &to, &to_slot)) ends = false;
+        /* a rate that is a field of another phenomenon stands also behind a port: the walk gave it no cell there */
+        Buf other = { 0 };
+        const char *open;
+        uint32_t behind = node_cell(e, phen, rn, &in->path, &other, &open);
+        qf_buf_free(&other);
+        if (rate == QI_NONE || tol == QI_NONE || (behind != QI_NONE && e->cells.v[behind].phen != phen)) {
+            err(e, loc, "the rate and the tolerance of %s must be fields of %s: give %s a field with a law for the rate",
+                in->text, ii->name, ii->name);
+            ok = false;
+            continue;
+        }
+        if (!ends) { ok = false; continue; }
+        bool conserved = !cn || strcmp(f->types.v[cn->type].name, "false") != 0;
+        if (from == QI_NONE && to == QI_NONE) {
+            err(e, loc, "%s has no source and no sink: an interaction moves a stock, as in `sink: .energy`", in->text);
+            ok = false;
+        } else if (from == to) {
+            err(e, loc, "the source and the sink of %s are the same stock, %s", in->text, e->cells.v[from].path);
+            ok = false;
+        } else if (from != QI_NONE && to != QI_NONE && e->cells.v[from].kind != e->cells.v[to].kind) {
+            err(e, loc, "%s moves %s to %s, and they have different kinds, %s and %s: a quantity keeps its kind", in->text,
+                e->cells.v[from].path, e->cells.v[to].path, e->kinds.v[e->cells.v[from].kind].name,
+                e->kinds.v[e->cells.v[to].kind].name);
+            ok = false;
+        } else if (from != QI_NONE && to != QI_NONE && !conserved) {
+            err(e, loc, "%s has a source and a sink, so it conserves the quantity: remove `conserved: false`", in->text);
+            ok = false;
+        } else if ((from == QI_NONE || to == QI_NONE) && conserved) {
+            const char *has = from == QI_NONE ? "sink" : "source", *lacks = from == QI_NONE ? "source" : "sink";
+            err(e, loc, "%s has a %s and no %s: the quantity then comes from outside the world, or goes there. If that is "
+                "the intent, write `conserved: false`. If not, give the %s", in->text, has, lacks, lacks);
+            ok = false;
+        }
+        if (f->nerrors != errors) continue;
+        /* the rate is the quantity of the stock for each second */
+        uint32_t stock = from != QI_NONE ? from : to;
+        QDim second = qdim_base(Q_BASE_TIME), want;
+        if (qdim_div(&e->ctypes.v[stock].dim, &second, &want) != Q_OK || !qdim_eq(&want, &e->ctypes.v[rate].dim)) {
+            Buf has = { 0 }, needs = { 0 }, su = { 0 };
+            dim_unit(e, &has, &e->ctypes.v[rate].dim);
+            dim_unit(e, &su, &e->ctypes.v[stock].dim);
+            if (qdim_div(&e->ctypes.v[stock].dim, &second, &want) == Q_OK) dim_unit(e, &needs, &want);
+            err(e, loc, "the rate of %s is %s, in %s, and the stock %s is in %s: the rate must be the quantity for each "
+                "second, in %s", in->text, e->cells.v[rate].path, has.len ? has.s : "1", e->cells.v[stock].path,
+                su.len ? su.s : "1", needs.len ? needs.s : "s^-1");
+            qf_buf_free(&has);
+            qf_buf_free(&needs);
+            qf_buf_free(&su);
+            ok = false;
+            continue;
+        }
+        size_t cap = inters.n * 4;
+        inter_bind(&ku, cap, rate, QK_IN, keep(e, e->cells.v[rate].path + strlen(ii->name) + 1));
+        inter_bind(&ku, cap, tol, QK_IN, keep(e, e->cells.v[tol].path + strlen(ii->name) + 1));
+        if (from != QI_NONE) inter_bind(&ku, cap, from, e->cells.v[from].phen == phen ? QK_STOCK : QK_LINK, from_slot);
+        if (to != QI_NONE) inter_bind(&ku, cap, to, e->cells.v[to].phen == phen ? QK_STOCK : QK_LINK, to_slot);
+        ku.transfers[ku.ntransfers++] = (QiTransfer) { keep(e, name), from, to, from != QI_NONE && to != QI_NONE, rate, tol };
+    }
+    if (ok && ku.ntransfers) VEC_PUSH(e->kernels, ku);
+    qf_buf_free(&evname);
+    for (size_t i = 0; i < inters.n; i++) VEC_FREE(inters.v[i].path);
+    VEC_FREE(inters);
 }
 
 /* --- pass 4: the start ------------------------------------------------------------------------ */
@@ -1172,6 +1502,8 @@ static QIr *finish(Elab *e)
         for (uint32_t t = 0; t < e->kernels.v[i].ntransfers; t++) {
             REMAP(e->kernels.v[i].transfers[t].from);
             REMAP(e->kernels.v[i].transfers[t].to);
+            REMAP(e->kernels.v[i].transfers[t].rate);
+            REMAP(e->kernels.v[i].transfers[t].tolerance);
         }
     }
 #undef REMAP
@@ -1272,6 +1604,12 @@ QIr *qf_elaborate(Front *f, const QiOptions *opt)
     e.tphen = prelude_type(f, "#Phenomenon");
     e.tport = prelude_type(f, "#Port");
     e.fevaluator = feat_lookup(f, qf_sym(f, "quad.evaluator"));
+    e.tinter = prelude_type(f, "#Interaction");
+    e.fsource = feat_lookup(f, qf_sym(f, "quad.source"));
+    e.fsink = feat_lookup(f, qf_sym(f, "quad.sink"));
+    e.frate = feat_lookup(f, qf_sym(f, "quad.rate"));
+    e.ftol = feat_lookup(f, qf_sym(f, "quad.tolerance"));
+    e.fcons = feat_lookup(f, qf_sym(f, "quad.conserved"));
 
     /* the phenomena, in the order of their names */
     VEC(Named) named = { 0 };
@@ -1303,6 +1641,7 @@ QIr *qf_elaborate(Front *f, const QiOptions *opt)
         for (uint32_t p = 0; p < e.phens.n; p++) {
             phen_laws(&e, p, conn0.v[p], conn0.v[p + 1]);
             phen_kernel(&e, p);
+            phen_interactions(&e, p, conn0.v[p], conn0.v[p + 1]);
         }
     if (f->nerrors == errors0) solve_start(&e);
     QIr *ir = f->nerrors == errors0 ? finish(&e) : NULL;

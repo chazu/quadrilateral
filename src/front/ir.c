@@ -85,9 +85,14 @@ char *qi_text(const QIr *ir)
             for (uint32_t s = 0; s < k->nbinds; s++)
                 qf_buf_printf(&b, "    %s %s = %s\n", roles[k->binds[s].role], k->binds[s].slot,
                               cell_path(ir, k->binds[s].cell));
-            for (uint32_t t = 0; t < k->ntransfers; t++)
-                qf_buf_printf(&b, "    transfer %s: %s -> %s%s\n", k->transfers[t].name, cell_path(ir, k->transfers[t].from),
+            for (uint32_t t = 0; t < k->ntransfers; t++) {
+                qf_buf_printf(&b, "    transfer %s: %s -> %s%s", k->transfers[t].name, cell_path(ir, k->transfers[t].from),
                               cell_path(ir, k->transfers[t].to), k->transfers[t].conserved ? ", conserved" : "");
+                if (k->transfers[t].rate != QI_NONE)
+                    qf_buf_printf(&b, ", at the rate %s, with the tolerance %s", cell_path(ir, k->transfers[t].rate),
+                                  cell_path(ir, k->transfers[t].tolerance));
+                qf_buf_putc(&b, '\n');
+            }
         }
     }
     qf_buf_puts(&b, "dependencies\n");

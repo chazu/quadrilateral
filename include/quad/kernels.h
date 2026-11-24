@@ -45,4 +45,38 @@ QkKernel *qk_refine_new(unsigned n);
 QkKernel *qk_abstract_new(unsigned n);
 void      qk_free(QkKernel *k);
 
+/* native.rate: moves a stock at a rate that a slot gives (docs/adr/0020).
+ * The front end generates one for each phenomenon that has interactions
+ * with a rate, so source needs no kernel in C for a flow.
+ *
+ * The caller gives the slots. For each transfer it names the slot of the
+ * rate (IN, or a STOCK of the phenomenon: a speed is the rate of a position),
+ * the slot of the tolerance (IN), and the slots of the source
+ * and of the sink (STOCK or LINK, or QK_NONE for one of them). The rate has
+ * the dimension of the stock for each second. The tolerance has no dimension
+ * and the scale -9, in (0, 1]. A transfer with a source and a sink is
+ * conserved.
+ *
+ * Each step moves rate × step, from the rate at the start of the step
+ * (explicit coupling, ADR 0009 section 9). The part of the amount that is
+ * smaller than one quantum of the stock stays for the next step, so a small
+ * rate loses nothing to rounding. The horizon keeps the change of the rate in
+ * one step at about `tolerance` of the rate: the kernel measures how much the
+ * rate changed since its last change, and assumes the same slope. The first
+ * step is one tick, and a step is at most two times the time since the last
+ * change. The kernel keeps that history for each transfer, so it is not
+ * stateless: it gives save and restore. The arithmetic is integer only.
+ *
+ * qk_rate_new copies its arguments. NULL if a transfer names a slot that
+ * does not fit. Free the kernel with qk_rate_free after every world that
+ * uses it is freed, or give it to the world with qw_adopt_kernel. */
+typedef struct {
+    const char *name;
+    uint32_t    rate, tolerance;   /* slot indices */
+    uint32_t    from, to;          /* slot indices, or QK_NONE */
+} QkRateTransfer;
+
+QkKernel *qk_rate_new(const QkSlot *slots, uint32_t nslots, const QkRateTransfer *transfers, uint32_t ntransfers);
+void      qk_rate_free(QkKernel *k);
+
 #endif

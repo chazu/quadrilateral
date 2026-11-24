@@ -1,0 +1,24 @@
+// A tank with a tap and a leak. Run it with:
+//
+//   build/quad run examples/tank.quad --until 20min --every 2min --show tank.volume,tank.outflow
+//
+// The tank has no kernel in C. Each interaction moves the volume at a rate.
+// The tap has a constant rate. A law gives the rate of the leak: a fuller
+// tank leaks faster. The water comes from outside the world and goes back
+// there, so each interaction says `conserved: false`.
+
+%volume: { dimension: "m^3", scale: -9, conserved: true }
+
+#Tank: #Phenomenon & {
+    volume:  %volume & >=0m^3
+    empties: %time                  // the time constant of the leak
+    inflow:  %volume / %time
+    outflow: %volume / %time
+    speed:   .outflow == .volume / .empties
+
+    tap:  #Interaction & { sink: .volume, rate: .inflow, conserved: false }
+    leak: #Interaction & { source: .volume, rate: .outflow, conserved: false }
+}
+
+// The level comes to inflow × empties = 0.2 m^3.
+tank: #Tank & { volume: 0m^3, empties: 100s, inflow: 0.002m^3/s }
