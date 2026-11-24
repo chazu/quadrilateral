@@ -5,9 +5,10 @@
 %conductance: { dimension: "W/K", scale: -3 }
 
 // The port and the room have the same three fields, with the same kinds, so
-// one supertype declares them.
+// one supertype declares them. The energy is the state. The laws compute the
+// temperature from it, so the temperature is a derived field (ADR 0019).
 #Thermal: {
-    temperature: %temperature
+    temperature: %temperature @derived
     capacity:    %capacity
     energy:      %energy
 }

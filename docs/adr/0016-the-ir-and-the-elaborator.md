@@ -24,7 +24,7 @@ The design document gives the endpoint. Each phenomenon owns its state, exposes 
 - A number of a kind in a phenomenon is an interval cell. Its path is the name of the phenomenon and the path of the field: `roomA.energy`. Its base is the value of the structure, in quanta of the kind.
 - A field of atoms is a set cell (ADR 0012). Its enumeration is every atom that the field can have by its declaration, in the order of the names. The declaration is that of the most general supertype that gives the field an enumeration (ADR 0017 section 5). So the field has the same enumeration in every phenomenon of that type. `bool` is the boolean kind of the world.
 - A path has the labels of the fields, without their packages. Two packages can give one phenomenon two fields with one label. Then two cells would have one path, and that is an error.
-- A cell of a conserved kind is a stock. Its first value must be a point, because only transfers change a stock.
+- A cell of a conserved kind is a stock. Its first value must be a point, because only transfers change a stock. In the first version of this ADR, the author gave that point. Now the laws can give it at the start (ADR 0019).
 - A number with a dimension and no kind is a cell with the default scale of its dimension (ADR 0018 section 4). In the first version of this ADR it was an error. A number with no dimension is still an error.
 - A text and a constraint are not state. They give no cell.
 - One value can stand at several paths, because a reference shares one node (ADR 0011 section 1). The value is one cell. The cell has the shortest path outside a port, and each other path is an **alias**.

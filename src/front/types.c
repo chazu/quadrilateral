@@ -1573,29 +1573,6 @@ bool types_build(Front *c)
         for (uint32_t f = 0; f < c->feats.n; f++)
             if (below_intro(c, t, f)) VEC_PUSH(c->types.v[t].feats, f);
 
-    /* field attributes on each type's own fields */
-    for (uint32_t t = 0; t < c->types.n; t++) {
-        TypeInfo *ti = &c->types.v[t];
-        if (ti->kind != TK_DEF && ti->kind != TK_ALT) continue;
-        for (size_t k = 0; k < ti->decls.n; k++) {
-            XPtrVec cj = { 0 };
-            conjuncts(ti->decls.v[k]->value, &cj);
-            for (size_t j = 0; j < cj.n; j++) {
-                X *x = cj.v[j];
-                if (x->k != X_STRUCT) continue;
-                for (int f = 0; f < x->u.st.n; f++) {
-                    XField *fl = &x->u.st.fields[f];
-                    for (int a = 0; a < fl->nattrs; a++) {
-                        if (strcmp(fl->attrs[a].name, "field") != 0) continue;
-                        VEC_PUSH(ti->field_feats, feat_resolve(c, fl->label, t, type_pkg(c, t), NULL));
-                        VEC_PUSH(ti->field_attrs, &fl->attrs[a]);
-                    }
-                }
-            }
-            VEC_FREE(cj);
-        }
-    }
-
     /* the build log: every type the loader made, in ID order */
     for (uint32_t t = 0; t < c->types.n; t++) {
         TypeInfo *ti = &c->types.v[t];

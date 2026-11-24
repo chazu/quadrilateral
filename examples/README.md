@@ -43,20 +43,30 @@ van.crates        1 .. 78
 
 ## load-too-heavy.quad: a plan that cannot work
 
-The world reports the law that cannot hold, with its values. 90 crates of 12.5 kg are 1125 kg, and 975 kg is the limit.
+The compile runs the laws with the values of each instance. It reports the law that the values contradict, with its values. 90 crates of 12.5 kg and a pallet of 25 kg are 1150 kg, and 1000 kg is the limit.
 
 ```
-$ build/quad run examples/load-too-heavy.quad
-quad: a law cannot hold with these values: plan.total: .load == ((.crates * .crate_mass) + .pallet)
-  the law is at examples/load-too-heavy.quad:11
-  plan.total.1 (an inner value of the law) = <= 975 kg
-  plan.crates = 90
-  plan.crate_mass = 12.5 kg
+$ build/quad check examples/load-too-heavy.quad
+examples/load-too-heavy.quad:15:1: error: the values of plan at the start contradict the law plan.limit: .load <= .capacity (plan.load = 1150 kg, plan.capacity = 1000 kg)
 ```
 
 ## thermal.quad and two-rooms.quad: change over time
 
 Two rooms and a wall. A native kernel moves heat through the wall, and the energy of the two rooms together stays the same. The power through the wall is a law with an inner expression.
+
+The energy is the state of a room, and the laws compute its temperature. So the type marks the temperature with `@derived`. An instance gives the temperature at the start, and the compile finds the energy:
+
+```
+living: #Room & { temperature: 303.15K, capacity: 10000J/K }
+```
+
+```
+$ build/quad ir examples/thermal.quad examples/two-rooms.quad | grep -E "stock|derived"
+  stock cellar.energy: %energy = 2931500
+  derived cellar.temperature: %temperature = any
+  stock living.energy: %energy = 3031500
+  derived living.temperature: %temperature = any
+```
 
 ```
 $ build/quad run examples/thermal.quad examples/two-rooms.quad --until 30min --every 10min \
@@ -75,4 +85,9 @@ Three rooms in a row and the air outside, with three walls. The same types as th
 ```
 $ build/quad run examples/thermal.quad examples/house.quad --until 6h --every 2h \
       --show kitchen.temperature,hall.temperature,bedroom.temperature,outer.power
+time [s]    kitchen.temperature [K]  hall.temperature [K]  bedroom.temperature [K]  outer.power [W]
+0                            298.15                293.15                   289.65               66
+7200                    ~282.119285           ~281.336113               280.195559           ~28.18
+14400                   ~276.642967           ~276.338011              ~275.893888          ~10.973
+21600                   ~274.510498           ~274.391747              ~274.218804           ~4.273
 ```

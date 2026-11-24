@@ -13,12 +13,13 @@
  *      ports.
  *   2. A check of each connection against the port that it names.
  *   3. For each phenomenon: the propagators of its laws, and its kernel.
+ *   4. The start: the first value of each stock, from the laws (ADR 0019).
  *
  * Then the kinds, the enumerations and the dependency graph, in orders that
  * do not depend on the order of the source. */
 
 /* One path to a value. owner: the type of the structure that holds the field. */
-typedef struct { const QfNode *node; Sym text; uint32_t n; int port; bool set; uint32_t feat, owner; } Leaf;
+typedef struct { const QfNode *node; Sym text; uint32_t n; int port; bool set; uint32_t feat, owner; size_t p0; } Leaf;
 typedef struct { U32Vec path; uint32_t target; U32Vec sub; uint32_t port; } Conn;
 
 typedef struct {
@@ -32,6 +33,7 @@ typedef struct {
     VEC(QiPhen)       phens;
     VEC(QiCell)       cells;
     VEC(QType)        ctypes;       /* for each cell; no meaning for a set cell */
+    VEC(QInterval)    start;        /* for each cell: its value at the start, which a derived field does not keep */
     VEC(QiAlias)      aliases;
     VEC(QiPort)       ports;
     VEC(QiProp)       props;
@@ -39,7 +41,7 @@ typedef struct {
     VEC(Conn)         conns;        /* every connection, with its phenomenon in ports[port] */
     U64Map            paths;        /* Sym of a path → cell + 1 */
     VEC(QiKind)       kinds;        /* the kinds that cells use, named and anonymous */
-    U64Map            lawcount;     /* Sym of the name of a law → the derived cells that it has */
+    U64Map            lawcount;     /* Sym of the name of a law → the inner values that it has */
     U64Map            lawsdone;     /* Sym of the name and the text of a law → 1 */
     U32Vec            usedenums;    /* types */
     VEC(QiEnum)       enums;        /* parallel to usedenums */
@@ -122,6 +124,7 @@ typedef struct {
     Loc             loc;
     size_t          conn0;       /* the phenomenon's connections start here in e->conns */
     VEC(Leaf)       leaves;
+    U32Vec          lpaths;      /* the paths of the leaves: leaf l has l.n features from l.p0 */
     U32Vec          path;
     VEC(const QfNode *) stack;
     int             port;        /* the port that the walk is inside, or -1 */
@@ -209,7 +212,8 @@ static void leaf(Walk *w, const QfNode *n, bool set)
 {
     Elab *e = w->e;
     Leaf l = { n, path_sym(e, w->in->name, w->path.v, w->path.n), (uint32_t) w->path.n, w->port, set,
-               w->path.v[w->path.n - 1], w->owner };
+               w->path.v[w->path.n - 1], w->owner, w->lpaths.n };
+    for (size_t i = 0; i < w->path.n; i++) VEC_PUSH(w->lpaths, w->path.v[i]);
     VEC_PUSH(w->leaves, l);
 }
 
@@ -364,11 +368,64 @@ static uint32_t use_qtype(Elab *e, const QType *qt)
     return use_anonymous(e, &qt->dim, qt->scale);
 }
 
-static void add_cell(Walk *w, const Leaf *l)
+/* A type marks the field of a leaf with @derived (ADR 0019): a structure on
+ * the path has a type below the type of a mark, and the rest of the path is
+ * the path of that mark. */
+static bool leaf_derived(const Walk *w, const Leaf *l)
+{
+    const Front *f = w->e->f;
+    const uint32_t *path = w->lpaths.v + l->p0;
+    for (uint32_t k = 0; k < l->n; k++) {
+        const QfNode *at = node_at(w->in->node, path, k);
+        for (size_t m = 0; at && m < f->derived.n; m++) {
+            const DerivedMark *dm = &f->derived.v[m];
+            if (dm->path.n == l->n - k && !memcmp(dm->path.v, path + k, dm->path.n * sizeof(uint32_t)) &&
+                is_subtype(f, at->type, dm->type))
+                return true;
+        }
+    }
+    return false;
+}
+
+/* The range of a value node in quanta of `scale`. False if the node is not a
+ * quantity with that scale: it then says nothing about the range. */
+static bool node_range(const Front *f, const QfNode *n, int8_t scale, QInterval *out)
+{
+    const TypeInfo *tn = &f->types.v[n->type];
+    if (!(n->flags & NF_VALUE)) return false;
+    if (tn->kind == TK_KIND) {
+        if (f->kinds.v[tn->kindix].scale != scale) return false;
+        *out = (QInterval) { n->lo, n->hi };
+        return true;
+    }
+    if (tn->kind != TK_DIMT) return false;
+    QfDec d = { n->lo, n->hi, n->exp, (n->flags & NF_LO_OPEN) != 0, (n->flags & NF_HI_OPEN) != 0 };
+    return !qf_dec_to_quanta(d, scale, &out->lo, &out->hi);
+}
+
+/* The range that the types give the field of a leaf, without the value of
+ * the instance: the meet of what the type of each structure on the path
+ * declares for the rest of the path. */
+static void type_range(const Walk *w, const Leaf *l, int8_t scale, QInterval *range)
+{
+    const Front *f = w->e->f;
+    const uint32_t *path = w->lpaths.v + l->p0;
+    for (uint32_t k = 0; k < l->n; k++) {
+        const QfNode *at = node_at(w->in->node, path, k);
+        QfNode *x = at ? f->types.v[at->type].expansion : NULL;
+        const QfNode *decl = x && !(x->flags & NF_VALUE) ? node_at(x, path + k, l->n - k) : NULL;
+        QInterval r;
+        if (decl && node_range(f, decl, scale, &r)) qi_meet(*range, r, range);
+    }
+}
+
+/* Makes the cell of a value. first: the first leaf of the value in
+ * w->leaves; l: the leaf that gives the cell its path. */
+static void add_cell(Walk *w, size_t first, const Leaf *l)
 {
     Elab *e = w->e;
     Front *f = e->f;
-    QiCell c = { keep(e, l->text), w->phen, QI_INTERVAL, 0, { 0, 0 }, 0, false, false };
+    QiCell c = { keep(e, l->text), w->phen, QI_INTERVAL, 0, { 0, 0 }, 0, false, false, false };
     QType qt;
     memset(&qt, 0, sizeof qt);
     if (u64map_get(&e->paths, (uint64_t) (uintptr_t) l->text, NULL)) {
@@ -410,14 +467,24 @@ static void add_cell(Walk *w, const Leaf *l)
         c.stock = k->conserved;
         qt = qtype_make(ti->kindix + 1, f->dims.v[k->dimix].dim, k->scale);
         qt.rounding = k->rounding;
-        if (c.stock && (c.base.lo != c.base.hi || c.base.lo == Q_NINF || c.base.lo == Q_INF)) {
-            err(e, w->loc, "the stock %s needs an exact value: only transfers change a stock, so its first value is a point",
-                l->text);
-            return;
+    }
+    /* The value of the instance is the value at the start. A stock gets its
+     * exact value in pass 4. A derived field keeps only the range of its
+     * types: the laws give its value in each epoch (ADR 0019). */
+    QInterval start = c.base;
+    if (c.domain == QI_INTERVAL && !c.stock) {
+        QInterval typed = qi_top();
+        for (size_t j = first; j < w->leaves.n; j++) {
+            const Leaf *o = &w->leaves.v[j];
+            if (o->node != l->node) continue;
+            c.derived |= leaf_derived(w, o);
+            type_range(w, o, qt.scale, &typed);
         }
+        if (c.derived) c.base = typed;
     }
     VEC_PUSH(e->cells, c);
     VEC_PUSH(e->ctypes, qt);
+    VEC_PUSH(e->start, start);
     u64map_put(&e->paths, (uint64_t) (uintptr_t) l->text, e->cells.n);
 }
 
@@ -449,7 +516,7 @@ static void phen_cells(Elab *e, uint32_t phen)
             if (!best || l->n < best->n || (l->n == best->n && strcmp(l->text, best->text) < 0)) best = l;
         }
         size_t ncells = e->cells.n;
-        if (best) add_cell(&w, best);
+        if (best) add_cell(&w, i, best);
         bool made = e->cells.n > ncells;
         for (size_t j = i; j < w.leaves.n; j++) {
             const Leaf *l = &w.leaves.v[j];
@@ -466,6 +533,7 @@ static void phen_cells(Elab *e, uint32_t phen)
     }
     free(done);
     VEC_FREE(w.leaves);
+    VEC_FREE(w.lpaths);
     VEC_FREE(w.path);
     VEC_FREE(w.stack);
 }
@@ -605,7 +673,7 @@ static void misfit(Law *l, QStatus why, uint32_t z, uint32_t a, uint32_t b)
         if (cs[i] == QI_NONE) continue;
         const QiCell *c = &e->cells.v[cs[i]];
         const QiKind *k = &e->kinds.v[c->kind];
-        qf_buf_printf(&who, "%s%s is ", who.len ? ", " : "", c->derived ? "an inner value" : c->path);
+        qf_buf_printf(&who, "%s%s is ", who.len ? ", " : "", c->inner ? "an inner value" : c->path);
         if (k->anonymous) qf_buf_printf(&who, "in %s", k->dimension);
         else qf_buf_printf(&who, "a %s", k->name);
     }
@@ -613,10 +681,11 @@ static void misfit(Law *l, QStatus why, uint32_t z, uint32_t a, uint32_t b)
     qf_buf_free(&who);
 }
 
-/* A derived cell of a law (ADR 0018): the value of an inner expression, or
- * a constant. Its path is the name of the law and a number, in the order in
- * which the expression makes the cells. */
-static uint32_t derived(Law *l, const QType *qt, QInterval base)
+/* An inner value of a law (ADR 0018): the value of an inner expression, or
+ * a constant. It is a derived cell with no field in source. Its path is the
+ * name of the law and a number, in the order in which the expression makes
+ * the cells. */
+static uint32_t inner(Law *l, const QType *qt, QInterval base)
 {
     Elab *e = l->e;
     uint64_t key = (uint64_t) (uintptr_t) qf_sym(e->f, l->name), n = 0;
@@ -630,9 +699,10 @@ static uint32_t derived(Law *l, const QType *qt, QInterval base)
         err(e, l->loc, "the law %s needs the path %s for an inner value, and a field has that path", l->law, path);
         return QI_NONE;
     }
-    QiCell c = { keep(e, path), l->phen, QI_INTERVAL, use_qtype(e, qt), base, 0, false, true };
+    QiCell c = { keep(e, path), l->phen, QI_INTERVAL, use_qtype(e, qt), base, 0, false, true, true };
     VEC_PUSH(e->cells, c);
     VEC_PUSH(e->ctypes, *qt);
+    VEC_PUSH(e->start, base);
     u64map_put(&e->paths, (uint64_t) (uintptr_t) path, e->cells.n);
     return (uint32_t) e->cells.n - 1;
 }
@@ -653,7 +723,7 @@ static uint32_t cell_of(Law *l, const X *x);
 #define DERIVED_DIGITS 6
 
 /* z = a op b for an expression. z is the cell of the result, or QI_NONE:
- * then a new derived cell is the result. The result, or QI_NONE with a diagnostic. */
+ * then a new inner value is the result. The result, or QI_NONE with a diagnostic. */
 static uint32_t lower_arith(Law *l, const X *x, uint32_t z)
 {
     Elab *e = l->e;
@@ -679,7 +749,7 @@ static uint32_t lower_arith(Law *l, const X *x, uint32_t z)
             if (t.scale > fine) t.scale = (int8_t) fine;
             if (t.scale < DERIVED_FINEST) t.scale = DERIVED_FINEST;
         }
-        z = derived(l, &t, qi_top());
+        z = inner(l, &t, qi_top());
         if (z == QI_NONE) return QI_NONE;
     } else {
         QType tz = e->ctypes.v[z];
@@ -690,7 +760,7 @@ static uint32_t lower_arith(Law *l, const X *x, uint32_t z)
 }
 
 /* The cell that has the value of an expression: the cell of a reference, a
- * constant for a number, or a derived cell for an operation. */
+ * constant for a number, or an inner value for an operation. */
 static uint32_t cell_of(Law *l, const X *x)
 {
     Elab *e = l->e;
@@ -713,7 +783,7 @@ static uint32_t cell_of(Law *l, const X *x)
             return QI_NONE;
         }
         QType qt = qtype_make(0, dim, (int8_t) exp);
-        return derived(l, &qt, qi_point(value));
+        return inner(l, &qt, qi_point(value));
     }
     unsupported(l);
     return QI_NONE;
@@ -835,6 +905,10 @@ static void phen_kernel(Elab *e, uint32_t phen)
                 err(e, loc, "%s: the kernel %s needs %s.%s, which is not a cell", in->name, k->name, in->name,
                     k->slots[s].name);
             ok = false;
+        } else if (e->cells.v[c].derived && (k->slots[s].role == QK_OUT || k->slots[s].role == QK_STATE)) {
+            err(e, loc, "%s: the kernel %s writes its slot %s, and %s is a derived field: the laws compute it, so a "
+                "kernel cannot write it", in->name, k->name, k->slots[s].name, e->cells.v[c].path);
+            ok = false;
         }
         ku.binds[s] = (QiBind) { keep(e, k->slots[s].name), k->slots[s].role, c };
     }
@@ -844,6 +918,158 @@ static void phen_kernel(Elab *e, uint32_t phen)
                                          kt->to == QK_NONE ? QI_NONE : ku.binds[kt->to].cell, kt->conserved };
     }
     if (ok) VEC_PUSH(e->kernels, ku);
+}
+
+/* --- pass 4: the start ------------------------------------------------------------------------ */
+
+/* "303.15 K": a value of a cell, for a message. */
+static void put_value(Elab *e, Buf *b, uint32_t cell, QInterval v)
+{
+    const QiKind *k = &e->kinds.v[e->cells.v[cell].kind];
+    char text[160];
+    qi_format_interval(v, k->scale, text, sizeof text);
+    const char *unit = qi_unit(k->dimension);
+    qf_buf_printf(b, "%s%s%s", text, *unit ? " " : "", unit);
+}
+
+/* A network of the runtime with the cells and the propagators of the laws.
+ * values: the value of each cell. id: gets the cell of the network for each
+ * cell. NULL if the network refuses a part: the world then gives the reason,
+ * when it builds the same network. */
+static QNet *law_net(Elab *e, const QInterval *values, QnCell *id)
+{
+    QNet *net = qn_new();
+    bool ok = net != NULL;
+    for (size_t i = 0; ok && i < e->cells.n; i++)
+        if (e->cells.v[i].domain == QI_INTERVAL) ok = qn_cell(net, &e->ctypes.v[i], values[i], &id[i]) == QN_OK;
+    for (size_t i = 0; ok && i < e->props.n; i++) {
+        const QiProp *p = &e->props.v[i];
+        QnCell z = id[p->cell[0]], x = id[p->cell[1]], y = p->cell[2] == QI_NONE ? 0 : id[p->cell[2]];
+        QStatus q = Q_OK;
+        ok = (p->op == QI_EQUAL        ? qn_equal(net, z, x, &q)
+              : p->op == QI_SUM        ? qn_sum(net, z, x, y, &q)
+              : p->op == QI_DIFFERENCE ? qn_difference(net, z, x, y, &q)
+              : p->op == QI_PRODUCT    ? qn_product(net, z, x, y, &q)
+              : p->op == QI_QUOTIENT   ? qn_quotient(net, z, x, y, &q)
+                                       : qn_less_equal(net, z, x, p->op == QI_LESS, &q)) == QN_OK;
+    }
+    if (ok) return net;
+    qn_free(net);
+    return NULL;
+}
+
+/* Runs the laws. False with a diagnostic if the values contradict a law: the
+ * message names the law and shows its values. */
+static bool settle(Elab *e, QNet *net, const QnCell *id)
+{
+    Front *f = e->f;
+    if (qn_propagate(net) == QN_OK) return true;
+    uint32_t culprit;
+    if (qn_contradicted_by(net, &culprit) && culprit < e->props.n) {
+        const QiProp *p = &e->props.v[culprit];
+        Buf vals = { 0 };
+        for (int k = 0; k < 3; k++) {
+            if (p->cell[k] == QI_NONE) continue;
+            if (vals.len) qf_buf_puts(&vals, ", ");
+            qf_buf_printf(&vals, "%s = ", e->cells.v[p->cell[k]].inner ? "an inner value" : e->cells.v[p->cell[k]].path);
+            put_value(e, &vals, p->cell[k], qn_get(net, id[p->cell[k]]));
+        }
+        err(e, inst_loc(&f->insts.v[e->insts.v[p->phen]]), "the values of %s at the start contradict the law %s: %s (%s)",
+            e->phens.v[p->phen].name, p->name, p->law, vals.s);
+        qf_buf_free(&vals);
+    } else {
+        err(e, inst_loc(&f->insts.v[e->insts.v[0]]), "the values at the start contradict the laws");
+    }
+    return false;
+}
+
+/* Gives each stock its first value (ADR 0019 section 3). net: the laws
+ * after they ran with the values of the start. */
+static void start_stocks(Elab *e, QNet *net, const QnCell *id)
+{
+    Front *f = e->f;
+    for (size_t i = 0; i < e->cells.n; i++) {
+        QiCell *c = &e->cells.v[i];
+        if (!c->stock) continue;
+        QInterval v = qn_get(net, id[i]);
+        bool bounded = v.lo != Q_NINF && v.hi != Q_INF;
+        if (bounded && v.hi - v.lo <= 2) {
+            /* The laws round outward, so an exact value can come as a range
+             * of one or two steps. One step: the value is between two steps,
+             * and the stock takes the lower one. Two steps: the middle. The
+             * start then holds to within one step. */
+            c->base = qi_point(v.hi - v.lo == 2 ? v.lo + 1 : v.lo);
+            continue;
+        }
+        /* the fields from which a law computes the stock, and which have no exact value */
+        Buf from = { 0 }, range = { 0 };
+        for (size_t pi = 0; pi < e->props.n; pi++) {
+            const QiProp *p = &e->props.v[pi];
+            if (p->cell[0] != i && p->cell[1] != i && p->cell[2] != i) continue;
+            for (int k = 0; k < 3; k++) {
+                uint32_t o = p->cell[k];
+                if (o == QI_NONE || o == i || e->cells.v[o].inner) continue;
+                QInterval ov = qn_get(net, id[o]);
+                if (ov.lo == ov.hi || (from.s && strstr(from.s, e->cells.v[o].path))) continue;
+                qf_buf_printf(&from, "%s%s", from.len ? ", " : "", e->cells.v[o].path);
+            }
+        }
+        if (v.lo != Q_NINF || v.hi != Q_INF) {
+            qf_buf_puts(&range, "the laws give ");
+            put_value(e, &range, (uint32_t) i, v);
+        } else {
+            qf_buf_puts(&range, "the laws give it no value");
+        }
+        Loc loc = inst_loc(&f->insts.v[e->insts.v[c->phen]]);
+        if (from.len)
+            err(e, loc, "the stock %s needs an exact value at the start, and %s. A law computes it from %s: give an "
+                "exact value there, or give the stock a value", c->path, range.s, from.s);
+        else
+            err(e, loc, "the stock %s needs an exact value at the start, and %s. Give the stock a value, or give the "
+                "values from which a law computes it", c->path, range.s);
+        qf_buf_free(&from);
+        qf_buf_free(&range);
+    }
+}
+
+/* Finds the start (ADR 0019 section 3). The laws run two times, in a network
+ * of the runtime, so the start has the arithmetic of the world.
+ *
+ * First with the values of the instances: a stock with no exact value takes
+ * the value that the laws give. Then with the values that the world has: the
+ * stocks, and no start value of a derived field. The world must give a
+ * derived field a value again. If it does not, the start value of that field
+ * has no effect, and that is an error. */
+static void solve_start(Elab *e)
+{
+    Front *f = e->f;
+    size_t n = e->cells.n, errors0 = f->nerrors;
+    QnCell *id = qf_xcalloc(n + 1, sizeof *id);
+    QNet *net = law_net(e, e->start.v, id);
+    if (net && settle(e, net, id)) start_stocks(e, net, id);
+    qn_free(net);
+    if (net && f->nerrors == errors0) {
+        QInterval *bases = qf_xcalloc(n + 1, sizeof *bases);
+        for (size_t i = 0; i < n; i++) bases[i] = e->cells.v[i].base;
+        net = law_net(e, bases, id);
+        if (net && settle(e, net, id))
+            for (size_t i = 0; i < n; i++) {
+                const QiCell *c = &e->cells.v[i];
+                QInterval s = e->start.v[i], v;
+                if (!c->derived || c->inner || (s.lo == c->base.lo && s.hi == c->base.hi)) continue;
+                v = qn_get(net, id[i]);
+                if (v.lo != c->base.lo || v.hi != c->base.hi) continue;
+                Buf val = { 0 };
+                put_value(e, &val, (uint32_t) i, s);
+                err(e, inst_loc(&f->insts.v[e->insts.v[c->phen]]),
+                    "%s has the value %s at the start, and no law gives it a value from the state after the start: the "
+                    "start value has no effect. If the field is a parameter, remove @derived in its type", c->path, val.s);
+                qf_buf_free(&val);
+            }
+        qn_free(net);
+        free(bases);
+    }
+    free(id);
 }
 
 /* --- orders and the dependency graph --------------------------------------------------------- */
@@ -1078,6 +1304,7 @@ QIr *qf_elaborate(Front *f, const QiOptions *opt)
             phen_laws(&e, p, conn0.v[p], conn0.v[p + 1]);
             phen_kernel(&e, p);
         }
+    if (f->nerrors == errors0) solve_start(&e);
     QIr *ir = f->nerrors == errors0 ? finish(&e) : NULL;
 
     VEC_FREE(conn0);
@@ -1090,6 +1317,7 @@ QIr *qf_elaborate(Front *f, const QiOptions *opt)
     VEC_FREE(e.phens);
     VEC_FREE(e.cells);
     VEC_FREE(e.ctypes);
+    VEC_FREE(e.start);
     VEC_FREE(e.aliases);
     VEC_FREE(e.ports);
     VEC_FREE(e.props);

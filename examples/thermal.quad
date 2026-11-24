@@ -7,9 +7,11 @@
 %capacity:    { dimension: "J/K" }
 %conductance: { dimension: "W/K" }
 
-// What a thermal port shows of a room.
+// What a thermal port shows of a room. The energy is the state of a room.
+// The laws compute the temperature from it, so the temperature has the mark
+// @derived: a value for it in an instance is the value at the start.
 #Thermal: {
-    temperature: %temperature
+    temperature: %temperature @derived
     capacity:    %capacity
     energy:      %energy
 }

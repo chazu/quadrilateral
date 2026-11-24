@@ -22,6 +22,8 @@ static void put_value(Buf *b, const QIr *ir, const QiCell *c)
     q_format_decimal(c->base.hi, scale, hi, sizeof hi);
     if (c->base.lo == Q_NINF && c->base.hi == Q_INF) qf_buf_puts(b, "any");
     else if (c->base.lo == c->base.hi) qf_buf_puts(b, lo);
+    else if (c->base.hi == Q_INF) qf_buf_printf(b, ">= %s", lo);
+    else if (c->base.lo == Q_NINF) qf_buf_printf(b, "<= %s", hi);
     else qf_buf_printf(b, "%s .. %s", lo, hi);
 }
 
@@ -53,7 +55,7 @@ char *qi_text(const QIr *ir)
         for (uint32_t i = 0; i < ir->ncells; i++) {
             const QiCell *c = &ir->cells[i];
             if (c->phen != p) continue;
-            qf_buf_printf(&b, "  %s %s: %s = ", c->stock ? "stock" : c->derived ? "derived" : "cell", c->path,
+            qf_buf_printf(&b, "  %s %s: %s = ", c->stock ? "stock" : c->inner ? "inner" : c->derived ? "derived" : "cell", c->path,
                           c->domain == QI_SET ? ir->enums[c->kind].name : ir->kinds[c->kind].name);
             put_value(&b, ir, c);
             qf_buf_putc(&b, '\n');
@@ -100,6 +102,39 @@ char *qi_text(const QIr *ir)
     }
     if (ir->ndeps) qf_buf_putc(&b, '\n');
     return b.s;
+}
+
+void qi_format_interval(QInterval v, int scale, char *out, size_t len)
+{
+    char lo[64], hi[64];
+    q_format_decimal(v.lo, scale, lo, sizeof lo);
+    q_format_decimal(v.hi, scale, hi, sizeof hi);
+    if (v.lo == Q_NINF && v.hi == Q_INF) snprintf(out, len, "unknown");
+    else if (v.lo == v.hi) snprintf(out, len, "%s", lo);
+    else if (v.lo != Q_NINF && v.hi != Q_INF && v.hi - v.lo == 1) snprintf(out, len, "~%s", lo);
+    else if (v.hi == Q_INF) snprintf(out, len, ">= %s", lo);
+    else if (v.lo == Q_NINF) snprintf(out, len, "<= %s", hi);
+    else snprintf(out, len, "%s .. %s", lo, hi);
+}
+
+const char *qi_unit(const char *dimension)
+{
+    static const char *const known[][2] = {
+        { "1", "" },
+        { "m^2 kg s^-2", "J" },
+        { "m^2 kg s^-3", "W" },
+        { "m^2 kg s^-2 K^-1", "J/K" },
+        { "m^2 kg s^-3 K^-1", "W/K" },
+        { "m kg s^-2", "N" },
+        { "m^-1 kg s^-2", "Pa" },
+        { "s^-1", "Hz" },
+        { "m^2 kg s^-3 A^-1", "V" },
+        { "m^2 kg s^-3 A^-2", "ohm" },
+        { "s A", "C" },
+    };
+    for (size_t i = 0; i < sizeof known / sizeof known[0]; i++)
+        if (!strcmp(dimension, known[i][0])) return known[i][1];
+    return dimension;
 }
 
 void qi_free(QIr *ir)

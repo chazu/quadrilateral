@@ -60,28 +60,6 @@ static int64_t parse_time(const char *text, int scale)
     return ticks > 9e18 ? -1 : (int64_t) (ticks + 0.5);
 }
 
-/* A common unit for a dimension, for a person. The IR has the dimension in
- * base units, and "m^2 kg s^-2" is hard to read. */
-static const char *unit_of(const char *dimension)
-{
-    static const char *const known[][2] = {
-        { "1", "" },
-        { "m^2 kg s^-2", "J" },
-        { "m^2 kg s^-3", "W" },
-        { "m^2 kg s^-2 K^-1", "J/K" },
-        { "m^2 kg s^-3 K^-1", "W/K" },
-        { "m kg s^-2", "N" },
-        { "m^-1 kg s^-2", "Pa" },
-        { "s^-1", "Hz" },
-        { "m^2 kg s^-3 A^-1", "V" },
-        { "m^2 kg s^-3 A^-2", "ohm" },
-        { "s A", "C" },
-    };
-    for (size_t i = 0; i < sizeof known / sizeof known[0]; i++)
-        if (!strcmp(dimension, known[i][0])) return known[i][1];
-    return dimension;
-}
-
 static const QiCell *find_cell(const QIr *ir, const char *path)
 {
     for (uint32_t i = 0; i < ir->ncells; i++)
@@ -101,22 +79,12 @@ static void format_value(const QIr *ir, QWorld *w, const QiCell *c, char *out, s
             if (mask >> a & 1) n += (size_t) snprintf(out + n, len - n, "%s%s", n ? " | " : "", en->atoms[a]);
         return;
     }
-    int scale = ir->kinds[c->kind].scale;
-    QInterval v = qw_get(w, c->path);
-    char lo[64], hi[64];
-    q_format_decimal(v.lo, scale, lo, sizeof lo);
-    q_format_decimal(v.hi, scale, hi, sizeof hi);
-    if (v.lo == Q_NINF && v.hi == Q_INF) snprintf(out, len, "unknown");
-    else if (v.lo == v.hi) snprintf(out, len, "%s", lo);
-    else if (v.lo != Q_NINF && v.hi - v.lo == 1) snprintf(out, len, "~%s", lo);   /* between two quanta */
-    else if (v.hi == Q_INF) snprintf(out, len, ">= %s", lo);
-    else if (v.lo == Q_NINF) snprintf(out, len, "<= %s", hi);
-    else snprintf(out, len, "%s .. %s", lo, hi);
+    qi_format_interval(qw_get(w, c->path), ir->kinds[c->kind].scale, out, len);
 }
 
 static const char *cell_unit(const QIr *ir, const QiCell *c)
 {
-    return c->domain == QI_SET ? "" : unit_of(ir->kinds[c->kind].dimension);
+    return c->domain == QI_SET ? "" : qi_unit(ir->kinds[c->kind].dimension);
 }
 
 /* Reports a failed run. For a contradiction, it names the law that could not
@@ -142,8 +110,23 @@ static void report(const QIr *ir, QWorld *w, int64_t ticks)
         if (p->cell[i] == QI_NONE) continue;
         const QiCell *c = &ir->cells[p->cell[i]];
         format_value(ir, w, c, text, sizeof text);
-        fprintf(stderr, "  %s%s = %s %s\n", c->path, c->derived ? " (an inner value of the law)" : "", text, cell_unit(ir, c));
+        fprintf(stderr, "  %s%s = %s %s\n", c->path, c->inner ? " (an inner value of the law)" : "", text, cell_unit(ir, c));
     }
+    /* A transfer changed a stock of the law, and each other field of the law
+     * keeps one value at every time. Then the type has no @derived for the
+     * field that the laws compute (ADR 0019). */
+    bool stock = false;
+    char fixed[512] = "";
+    for (int i = 0; i < 3; i++) {
+        if (p->cell[i] == QI_NONE) continue;
+        const QiCell *c = &ir->cells[p->cell[i]];
+        if (c->stock) stock = true;
+        else if (!c->derived && c->domain == QI_INTERVAL && c->base.lo == c->base.hi)
+            snprintf(fixed + strlen(fixed), sizeof fixed - strlen(fixed), "%s%s", *fixed ? ", " : "", c->path);
+    }
+    if (stock && ticks > 0 && *fixed)
+        fprintf(stderr, "  hint: a transfer changed the stock, and these fields keep their values at every time: %s.\n"
+                        "  If the laws compute one of them from the stock, mark it with @derived in its type.\n", fixed);
 }
 
 int main(int argc, char **argv)
@@ -220,7 +203,7 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    /* the cells to print: the ones that --show names, or every cell that is state */
+    /* the cells to print: the ones that --show names, or every field */
     const QiCell **cols = calloc(ir->ncells + 1, sizeof *cols);
     size_t ncols = 0;
     if (show) {
@@ -236,7 +219,7 @@ int main(int argc, char **argv)
         free(list);
     } else {
         for (uint32_t i = 0; i < ir->ncells; i++)
-            if (!ir->cells[i].derived) cols[ncols++] = &ir->cells[i];
+            if (!ir->cells[i].inner) cols[ncols++] = &ir->cells[i];
     }
 
     QWorld *w = NULL;

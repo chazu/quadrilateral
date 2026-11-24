@@ -125,7 +125,7 @@ static QWorld *c_rooms(uint64_t seed, double ta, double tb, int64_t ca, int64_t 
         snprintf(path, sizeof path, "%s.capacity", names[i]);
         OK(qw_cell(w, path, cap, qi_point(cq), &c));
         snprintf(path, sizeof path, "%s.temperature", names[i]);
-        OK(qw_cell(w, path, temp, qi_top(), &t));
+        OK(qw_derived_cell(w, path, temp, qi_top(), &t));       /* the law gives it: not state (ADR 0019) */
         CHECK(qn_product(qw_net(w), e, c, t, NULL) == QN_OK);
     }
     OK(qw_cell(w, "wall.conductance", cond, qi_point(g * 1000), NULL));
@@ -241,7 +241,7 @@ void test_elab_ir_text(void)
            "phenomenon roomA: #LumpedRoom\n"
            "  cell roomA.capacity: %capacity = 10000\n"
            "  stock roomA.energy: %energy = 3031500\n"
-           "  cell roomA.temperature: %temperature = any\n"
+           "  derived roomA.temperature: %temperature = any\n"
            "  alias roomA.west.capacity = roomA.capacity\n"
            "  alias roomA.west.energy = roomA.energy\n"
            "  alias roomA.west.temperature = roomA.temperature\n"
@@ -251,7 +251,7 @@ void test_elab_ir_text(void)
            "phenomenon roomB: #LumpedRoom\n"
            "  cell roomB.capacity: %capacity = 10000\n"
            "  stock roomB.energy: %energy = 2931500\n"
-           "  cell roomB.temperature: %temperature = any\n"
+           "  derived roomB.temperature: %temperature = any\n"
            "  alias roomB.west.capacity = roomB.capacity\n"
            "  alias roomB.west.energy = roomB.energy\n"
            "  alias roomB.west.temperature = roomB.temperature\n"
@@ -296,11 +296,12 @@ void test_elab_ir_text(void)
         CHECK(ir->kinds[energy->kind].conserved && ir->kinds[energy->kind].scale == -3);
         const QiCell *temp = &ir->cells[2];
         CHECK(!temp->stock && temp->base.lo == Q_NINF && temp->base.hi == Q_INF);
+        CHECK(temp->derived && !temp->inner);                    /* a derived field of #Thermal (ADR 0019) */
         const QiProp *p = &ir->props[0];
         CHECK(p->op == QI_PRODUCT && p->phen == 0 && p->cell[0] == 1 && p->cell[1] == 0 && p->cell[2] == 2);
         STR_EQ(p->file, "thermal.quad");
         STR_EQ(p->name, "roomA.storage");
-        CHECK(p->line == 20);
+        CHECK(p->line == 21);
         const QiKernelUse *k = &ir->kernels[0];
         CHECK(k->phen == 2 && k->nbinds == 8 && k->ntransfers == 1);
         CHECK(k->transfers[0].from == 1 && k->transfers[0].to == 4 && k->transfers[0].conserved);
@@ -506,12 +507,27 @@ void test_elab_laws(void)
     qw_free(w);
     qi_free(ir);
 
-    /* a contradiction between a law and the values is found when the world settles */
+    /* a contradiction between a law and the values of an instance is an error of the compile (ADR 0019) */
     snprintf(src, sizeof src, "%sbad: #Plate & { width: 2m, height: 1m, area: 3m^2 }\n", PLATE);
+    {
+        const char *name = "plate.quad", *text = src;
+        char *diag = NULL;
+        CHECK(qi_compile(&name, &text, 1, NULL, &diag) == NULL);
+        HAS(diag, ": error: the values of bad at the start contradict the law bad.by_area: .area == (.width * .height) "
+                  "(bad.area = 3 m^2, bad.width = 2 m, bad.height = 1 m)\n");
+        free(diag);
+    }
+
+    /* a contradiction that comes later is found when the world settles */
+    snprintf(src, sizeof src, "%slate: #Plate & { width: 2m, height: 1m }\n", PLATE);
     ir = compile(src, NULL);
     if (ir && (w = build(ir, 1))) {
-        CHECK(qw_run(w, 0) == QW_ECONTRADICTION);
-        HAS(qw_error(w), "bad.");
+        OK(qw_run(w, 0));
+        CHECK(qw_input(w, "late.area", qi_point(3000000)) == QW_ECONTRADICTION);
+        HAS(qw_error(w), "late.");
+        uint32_t prop = 0;
+        CHECK(qn_contradicted_by(qw_net(w), &prop) && prop < ir->nprops);
+        if (prop < ir->nprops) HAS(ir->props[prop].name, "late.");
         qw_free(w);
     }
     qi_free(ir);
@@ -539,7 +555,7 @@ void test_elab_expressions(void)
             HAS(text, "kind dim[m^2 kg s^-3]@-3: m^2 kg s^-3, scale -3, anonymous\n");
             HAS(text, "phenomenon wall: #Wall\n"
                       "  cell wall.conductance: %conductance = 20\n"
-                      "  derived wall.laws.first.1: %temperature = any\n"
+                      "  inner wall.laws.first.1: %temperature = any\n"
                       "  cell wall.power: dim[m^2 kg s^-3]@-3 = any\n"
                       "  port cold: #ThermalPort, connected to roomB.west\n"
                       "  port hot: #ThermalPort, connected to roomA.west\n"
@@ -583,8 +599,8 @@ void test_elab_expressions(void)
         HAS(text, "kind dim[K]@-2: K, scale -2, anonymous\n");
         HAS(text, "kind dim[K]@0: K, scale 0, anonymous\n");
         HAS(text, "kind dim[K]@2: K, scale 2, anonymous\n");
-        HAS(text, "  derived t.g.3: dim[K]@2 = 100\n");
-        HAS(text, "  derived t.c.1: dim[K]@-2 = 273.15\n");
+        HAS(text, "  inner t.g.3: dim[K]@2 = 100\n");
+        HAS(text, "  inner t.c.1: dim[K]@-2 = 273.15\n");
         HAS(text, "  propagator P0, in an epoch: t.celsius = t.kelvin - t.c.1\n    law t.c: .celsius == (.kelvin - 273.15K)\n");
         HAS(text, "  propagator P1, in an epoch: t.d.2 = t.a + t.d.1\n    law t.d: (.a + 1K) <= .b\n"
                   "  propagator P2, in an epoch: t.d.2 <= t.b\n    law t.d: (.a + 1K) <= .b\n");
@@ -597,7 +613,10 @@ void test_elab_expressions(void)
                   "  propagator P10, in an epoch: t.kelvin <= t.high\n    law t.i: .high >= .kelvin\n");
         free(text);
         int nderived = 0;
-        for (uint32_t i = 0; i < ir->ncells; i++) nderived += ir->cells[i].derived;
+        for (uint32_t i = 0; i < ir->ncells; i++) {
+            nderived += ir->cells[i].derived;
+            CHECK(ir->cells[i].inner == ir->cells[i].derived);   /* this type has no derived field */
+        }
         CHECK(nderived == 10 && ir->nprops == 11);
         QWorld *w = build(ir, 1);
         if (w) {
@@ -622,13 +641,11 @@ void test_elab_expressions(void)
     }
     qi_free(ir);
 
-    /* a law that the values contradict */
+    /* a law that the values contradict: the message has the value of the inner expression */
     snprintf(src, sizeof src, "%st: #T & { kelvin: 300K, a: 7K, b: 5K }\n", forms);
-    ir = compile(src, NULL);
-    QWorld *w = ir ? build(ir, 1) : NULL;
-    if (w) CHECK(qw_run(w, 0) == QW_ECONTRADICTION);
-    qw_free(w);
-    qi_free(ir);
+    HAS(compile_error(src), "world.quad:11:1: error: the values of t at the start contradict the law t.d: (.a + 1K) <= .b "
+                            "(an inner value = 8 K, t.b = 5 K)\n");
+    QWorld *w = NULL;
 
     /* the value of a field: an expression with an inner expression */
     ir = compile("#V: #Phenomenon & { a: %temperature, b: %temperature, mean: %temperature, mean: (.a + .b) / 2 }\n"
@@ -693,7 +710,7 @@ void test_elab_expressions(void)
     if (ir) {
         char *text = qi_text(ir);
         HAS(text, "kind dim[s^-1 K]@-3: s^-1 K, scale -3, anonymous\n");
-        HAS(text, "  cell r.flux: dim[m^2 kg s^-3]@-3 = 1500\n  cell r.gain: dim[s^-1 K]@-3 = 0.5 .. inf\n"
+        HAS(text, "  cell r.flux: dim[m^2 kg s^-3]@-3 = 1500\n  cell r.gain: dim[s^-1 K]@-3 = >= 0.5\n"
                   "  cell r.rate: dim[m^2 kg s^-3]@-3 = 5\n");
         free(text);
         CHECK(ir->nkinds == 2);                          /* the two powers have one anonymous kind */
@@ -1022,7 +1039,7 @@ void test_elab_ports(void)
         HAS(text, "phenomenon tank: #Tank\n"
                   "  cell tank.capacity: %capacity = 1\n"
                   "  stock tank.energy: %energy = 1\n"
-                  "  cell tank.temperature: %temperature = any\n"
+                  "  derived tank.temperature: %temperature = any\n"
                   "  alias tank.both.inlet.capacity = tank.capacity\n"
                   "  alias tank.both.inlet.energy = tank.energy\n"
                   "  alias tank.both.inlet.temperature = tank.temperature\n"
@@ -1247,6 +1264,326 @@ void test_elab_kernels(void)
     qi_free(ir);
 }
 
+/* --- the start and derived fields (ADR 0019) --------------------------------------------------------- */
+
+/* The diagnostics of one file with no other content, or "compiled". */
+static const char *alone_error(const char *text)
+{
+    static char out[4096];
+    const char *name = "alone.quad";
+    char *diag = NULL;
+    QIr *ir = qi_compile(&name, &text, 1, NULL, &diag);
+    snprintf(out, sizeof out, "%s", ir ? "compiled" : diag);
+    free(diag);
+    qi_free(ir);
+    return out;
+}
+
+/* A type marks a field that the laws compute with @derived. A value for it
+ * in an instance is the value at the start, and the compile finds the first
+ * value of each stock from the laws. */
+void test_elab_start(void)
+{
+    /* the temperature of a room gives its energy: 10000 J/K × 303.15 K */
+    QIr *ir = compile("r: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n", NULL);
+    QIr *plain = compile("r: #LumpedRoom & { energy: 3031500J, capacity: 10000J/K }\n", NULL);
+    if (ir && plain) {
+        char *text = qi_text(ir), *other = qi_text(plain);
+        HAS(text, "  stock r.energy: %energy = 3031500\n  derived r.temperature: %temperature = any\n");
+        STR_EQ(text, other);                                 /* the IR has the result, and no start value */
+        free(text);
+        free(other);
+        QWorld *w = build(ir, 1), *p = build(plain, 1);
+        if (w && p) {
+            OK(qw_run(w, 0));
+            OK(qw_run(p, 0));
+            CHECK_I64(qw_get(w, "r.temperature").lo, 303150000);
+            CHECK_I64(qw_get(w, "r.temperature").hi, 303150000);
+            CHECK(qw_hash(w) == qw_hash(p));
+            /* a derived field is not state: it takes no input */
+            CHECK(qw_input(w, "r.temperature", qi_point(300000000)) == QW_EOWNER);
+            HAS(qw_error(w), "'r.temperature' is derived: a law gives its value");
+            CHECK(qw_input(w, "r.west.temperature", qi_point(300000000)) == QW_EOWNER);
+        }
+        qw_free(w);
+        qw_free(p);
+    }
+    qi_free(ir);
+    qi_free(plain);
+
+    /* the stock and the derived field together: they must agree */
+    STR_EQ(compile_error("r: #LumpedRoom & { temperature: 303.15K, energy: 3031500J, capacity: 10000J/K }\n"), "compiled");
+    STR_EQ(compile_error("r: #LumpedRoom & { temperature: 300K, energy: 3031500J, capacity: 10000J/K }\n"),
+           "world.quad:1:1: error: the values of r at the start contradict the law r.storage: .energy == (.capacity * "
+           ".temperature) (r.energy = 3031500 J, r.capacity = 10000 J/K, r.temperature = 300 K)\n");
+    /* a contradiction stops the start: the compile does not also report a stock of another phenomenon */
+    STR_EQ(compile_error("r: #LumpedRoom & { temperature: 300K, energy: 3031500J, capacity: 10000J/K }\n"
+                         "s: #LumpedRoom & { capacity: 10000J/K }\n"),
+           "world.quad:1:1: error: the values of r at the start contradict the law r.storage: .energy == (.capacity * "
+           ".temperature) (r.energy = 3031500 J, r.capacity = 10000 J/K, r.temperature = 300 K)\n");
+    /* a range for the derived field gives a range for the stock */
+    STR_EQ(compile_error("r: #LumpedRoom & { temperature: >=290K & <=300K, capacity: 10000J/K }\n"),
+           "world.quad:1:1: error: the stock r.energy needs an exact value at the start, and the laws give 2900000 .. "
+           "3000000 J. A law computes it from r.temperature: give an exact value there, or give the stock a value\n");
+    STR_EQ(compile_error("r: #LumpedRoom & { temperature: >=290K, capacity: 10000J/K }\n"),
+           "world.quad:1:1: error: the stock r.energy needs an exact value at the start, and the laws give >= 2900000 J. "
+           "A law computes it from r.temperature: give an exact value there, or give the stock a value\n");
+    STR_EQ(compile_error("r: #LumpedRoom & { temperature: 300K }\n"),
+           "world.quad:1:1: error: the stock r.energy needs an exact value at the start, and the laws give it no value. "
+           "A law computes it from r.capacity: give an exact value there, or give the stock a value\n");
+
+    /* a value between two steps of the stock: the lower step. 0.001 J/K × 300.0005 K is 300.0005 mJ */
+    ir = compile("r: #LumpedRoom & { temperature: 300.0005K, capacity: 0.001J/K }\n", NULL);
+    if (ir) {
+        CHECK(ir->ncells == 3 && ir->cells[1].stock);
+        CHECK_I64(ir->cells[1].base.lo, 300);
+        CHECK_I64(ir->cells[1].base.hi, 300);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 0));
+            CHECK_I64(qw_get(w, "r.temperature").lo, 300000000);      /* the start value holds to within one step */
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+    ir = compile("r: #LumpedRoom & { temperature: -300.0005K, capacity: 0.001J/K }\n", NULL);
+    if (ir) CHECK_I64(ir->cells[1].base.lo, -301);
+    qi_free(ir);
+
+    /* An inner quotient rounds outward, so an exact value comes as a range of
+     * two steps: 1 J / 3 × 3 is 999 .. 1001 mJ. The stock takes the middle step. */
+    const char *third = "%energy: { dimension: \"J\", scale: -3, conserved: true }\n"
+                        "%heat: { dimension: \"J\", scale: -3 }\n"
+                        "#Third: #Phenomenon & { e: %energy, a: %heat, d: %ratio, rule: .e == .a / .d * .d }\n";
+    char src[2048];
+    snprintf(src, sizeof src, "%st: #Third & { a: 1J, d: 3 }\n", third);
+    {
+        const char *name = "third.quad", *text = src;
+        char *diag = NULL;
+        ir = qi_compile(&name, &text, 1, NULL, &diag);
+        CHECK(ir != NULL);
+        if (!ir) fprintf(stderr, "%s", diag);
+        free(diag);
+        if (ir) {
+            const QiCell *e = NULL;
+            for (uint32_t i = 0; i < ir->ncells; i++)
+                if (!strcmp(ir->cells[i].path, "t.e")) e = &ir->cells[i];
+            CHECK(e != NULL);
+            if (e) {
+                CHECK_I64(e->base.lo, 1000);
+                CHECK_I64(e->base.hi, 1000);
+            }
+            QWorld *w = build(ir, 1);
+            if (w) OK(qw_run(w, 0));
+            qw_free(w);
+        }
+        qi_free(ir);
+    }
+
+    /* A bound in a type holds at every time: it is the base of the cell. A
+     * value in a type does too, so the first transfer contradicts it. */
+    ir = compile("#Bounded: #LumpedRoom & { temperature: >=250K }\n"
+                 "#Warm: #LumpedRoom & { temperature: 303.15K }\n"
+                 "roomA: #Warm & { capacity: 10000J/K }\n"
+                 "roomB: #Bounded & { temperature: 293.15K, capacity: 10000J/K }\n"
+                 "wall: #ConductiveWall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 0.01 }\n",
+                 NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  stock roomA.energy: %energy = 3031500\n  derived roomA.temperature: %temperature = 303.15\n");
+        HAS(text, "  stock roomB.energy: %energy = 2931500\n  derived roomB.temperature: %temperature = >= 250\n");
+        free(text);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 0));
+            CHECK_I64(qw_get(w, "roomB.temperature").lo, 293150000);
+            CHECK(qw_run(w, 100000000) == QW_ECONTRADICTION);
+            uint32_t prop = 0;
+            CHECK(qn_contradicted_by(qw_net(w), &prop) && prop < ir->nprops);
+            if (prop < ir->nprops) STR_EQ(ir->props[prop].name, "roomA.storage");
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+    /* the start value of an instance is inside the bound of its type */
+    HAS(compile_error("#Bounded: #LumpedRoom & { temperature: >=250K }\n"
+                      "r: #Bounded & { temperature: 200K, capacity: 1J/K }\n"),
+        "world.quad:2:");
+
+    /* A mark on a field of an inner structure: the type of the structure
+     * gives it (shown), or the type around it does (twice). A type below a
+     * type with a mark has the mark. */
+    const char *nest = "%level: { dimension: \"m\", scale: -3 }\n"
+                       "#Gauge: { shown: %level @derived, twice: %level, offset: %level }\n"
+                       "#Tank: #Phenomenon & {\n"
+                       "    gauge: #Gauge & { twice: >=0m @derived }\n"
+                       "    depth: %level\n"
+                       "    rule: .gauge.shown == .depth + .gauge.offset\n"
+                       "    double: .gauge.twice == 2 * .gauge.shown\n"
+                       "}\n"
+                       "#BigTank: #Tank & { depth: >=1m }\n"
+                       "t: #BigTank & { depth: 2m, gauge: { shown: 2.5m, offset: 0.5m } }\n";
+    {
+        const char *name = "nest.quad";
+        char *diag = NULL;
+        ir = qi_compile(&name, &nest, 1, NULL, &diag);
+        CHECK(ir != NULL);
+        if (!ir) fprintf(stderr, "%s", diag);
+        free(diag);
+        if (ir) {
+            char *text = qi_text(ir);
+            HAS(text, "  cell t.depth: %level = 2\n  inner t.double.1: dim[1]@0 = 2\n  cell t.gauge.offset: %level = 0.5\n"
+                      "  derived t.gauge.shown: %level = any\n  derived t.gauge.twice: %level = >= 0\n");
+            free(text);
+            QWorld *w = build(ir, 1);
+            if (w) {
+                OK(qw_run(w, 0));
+                CHECK_I64(qw_get(w, "t.gauge.shown").lo, 2500);
+                OK(qw_input(w, "t.depth", qi_point(3000)));                /* the derived field follows */
+                CHECK_I64(qw_get(w, "t.gauge.shown").lo, 3500);
+                CHECK_I64(qw_get(w, "t.gauge.shown").hi, 3500);
+                CHECK_I64(qw_get(w, "t.gauge.twice").lo, 7000);
+            }
+            qw_free(w);
+        }
+        qi_free(ir);
+    }
+    /* a start value that the laws contradict, with no stock */
+    HAS(alone_error("%level: { dimension: \"m\", scale: -3 }\n"
+                    "#Tank: #Phenomenon & { shown: %level @derived, depth: %level, rule: .shown == .depth }\n"
+                    "t: #Tank & { depth: 2m, shown: 3m }\n"),
+        "alone.quad:3:1: error: the values of t at the start contradict the law t.rule: .shown == .depth");
+    /* a derived field with no law has no value: a kernel that narrows can give it */
+    STR_EQ(alone_error("%level: { dimension: \"m\", scale: -3 }\n#Tank: #Phenomenon & { shown: %level @derived }\nt: #Tank\n"),
+           "compiled");
+    /* a field with a dimension and no kind can be derived */
+    ir = compile("#Lamp: #Phenomenon & { power: %energy / %time @derived, twice: %energy / %time,\n"
+                 "    rule: .twice == 2 * .power }\n"
+                 "l: #Lamp & { twice: 10W }\n",
+                 NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  derived l.power: dim[m^2 kg s^-3]@-3 = any\n  inner l.rule.1: dim[1]@0 = 2\n"
+                  "  cell l.twice: dim[m^2 kg s^-3]@-3 = 10\n");
+        free(text);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 0));
+            CHECK_I64(qw_get(w, "l.power").lo, 5000);
+            CHECK_I64(qw_get(w, "l.power").hi, 5000);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+    /* a bound of a type that excludes its value, on a field with no kind: more than 0 W is at least 1 mW */
+    ir = compile("#Lamp: #Phenomenon & { power: %energy / %time & >0W & <1kW @derived, twice: %energy / %time,\n"
+                 "    rule: .twice == 2 * .power }\n"
+                 "l: #Lamp & { power: 5W, twice: 10W }\n",
+                 NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  derived l.power: dim[m^2 kg s^-3]@-3 = 0.001 .. 999.999\n");
+        free(text);
+    }
+    qi_free(ir);
+    /* A start value must have an effect: the world does not keep it, so the
+     * laws must give the field a value again from the state. Here nothing
+     * gives the power after the start. */
+    const char *lamp = "#Lamp: #Phenomenon & { power: %energy / %time @derived, twice: %energy / %time,\n"
+                       "    rule: .twice == 2 * .power }\n";
+    snprintf(src, sizeof src, "%sl: #Lamp & { power: 5W }\n", lamp);
+    STR_EQ(compile_error(src),
+           "world.quad:3:1: error: l.power has the value 5 W at the start, and no law gives it a value from the state "
+           "after the start: the start value has no effect. If the field is a parameter, remove @derived in its type\n");
+    snprintf(src, sizeof src, "%sl: #Lamp & { power: 5W, twice: 10W }\n", lamp);
+    STR_EQ(compile_error(src), "compiled");
+    snprintf(src, sizeof src, "%sl: #Lamp & { power: 4W, twice: 10W }\n", lamp);
+    HAS(compile_error(src), "the values of l at the start contradict the law l.rule");
+
+    /* the mark belongs to a field of a type, with a quantity that is not conserved */
+    STR_EQ(compile_error("r: #LumpedRoom & { temperature: 303.15K @derived, capacity: 10000J/K }\n"),
+           "world.quad:1:20: error: @derived on temperature is in an instance: a type marks the fields that the laws "
+           "compute. Write the mark in the type\n");
+    STR_EQ(compile_error("#A: #Phenomenon & { e: %energy @derived }\n"),
+           "world.quad:1:21: error: @derived on e: its kind %energy is conserved, so the field is a stock. A stock is "
+           "state, and the laws do not compute it\n");
+    STR_EQ(compile_error("#A: #Phenomenon & { door: \"open\" | \"closed\" @derived }\n"),
+           "world.quad:1:21: error: @derived on door: a derived field is a quantity, with a kind or a dimension\n");
+    STR_EQ(compile_error("#Part: { t: %temperature }\n#A: #Phenomenon & { part: #Part @derived }\n"),
+           "world.quad:2:21: error: @derived on part: a derived field is a quantity, with a kind or a dimension\n");
+    STR_EQ(compile_error("#A: #Phenomenon & { note: text @derived }\n"),
+           "world.quad:1:21: error: @derived on note: a derived field is a quantity, with a kind or a dimension\n");
+    STR_EQ(compile_error("#A: #Phenomenon & { n: number @derived }\n"),
+           "world.quad:1:21: error: @derived on n: a derived field is a quantity, with a kind or a dimension\n");
+    /* the front end knows the names of its attributes */
+    STR_EQ(compile_error("#A: #Phenomenon & { t: %temperature @derivd }\n"),
+           "world.quad:1:21: error: unknown attribute @derivd. The attribute of this stage is @derived, on a field of a "
+           "type\n");
+    STR_EQ(compile_error("#A: #Phenomenon & { t: %temperature @derived(always) }\n"),
+           "world.quad:1:21: error: @derived has no arguments\n");
+    STR_EQ(compile_error("#A: #Phenomenon & { @derived, t: %temperature }\n"),
+           "world.quad:1:19: error: @derived marks a field of a type: write it after the value of the field\n");
+    STR_EQ(compile_error("#A: #Phenomenon & { t: %temperature } @derived\n"),
+           "world.quad:1:1: error: @derived marks a field of a type: write it after the value of the field\n");
+    STR_EQ(compile_error("a: { t: 1 } @component(Tool)\n"),
+           "world.quad:1:1: error: unknown attribute @component. The attribute of this stage is @derived, on a field of "
+           "a type\n");
+
+    /* a kernel cannot write a derived field */
+    static const QkSlot wslots[2] = { { "level", QK_STATE, "K", -6, { Q_NINF, Q_INF } },
+                                      { "rate", QK_IN, "K", -6, { Q_NINF, Q_INF } } };
+    QkKernel writer = *qk_conduction();
+    writer.name = "test.writer";
+    writer.slots = wslots;
+    writer.nslots = 2;
+    writer.ntransfers = 0;
+    const QkKernel *wlist[1] = { &writer };
+    QiOptions wopt = { wlist, 1 };
+    {
+        const char *names[2] = { "thermal.quad", "world.quad" };
+        const char *srcs[2] = { thermal(), "#Tank: #Phenomenon & { level: %temperature @derived, rate: %temperature,\n"
+                                           "    evaluator: \"test.writer\" }\n"
+                                           "tank: #Tank & { level: 1K, rate: 1K }\n" };
+        char *diag = NULL;
+        CHECK(qi_compile(names, srcs, 2, &wopt, &diag) == NULL);
+        STR_EQ(diag, "world.quad:3:1: error: tank: the kernel test.writer writes its slot level, and tank.level is a "
+                     "derived field: the laws compute it, so a kernel cannot write it\n");
+        free(diag);
+        /* it can read one */
+        srcs[1] = "#Tank: #Phenomenon & { level: %temperature, rate: %temperature @derived,\n"
+                  "    evaluator: \"test.writer\" }\n"
+                  "tank: #Tank & { level: 1K }\n";
+        ir = qi_compile(names, srcs, 2, &wopt, &diag);
+        CHECK(ir != NULL);
+        if (!ir) fprintf(stderr, "%s", diag);
+        free(diag);
+        if (ir) {
+            QWorld *w = NULL;
+            OK(qi_instantiate(ir, 1, &wopt, &w, NULL));
+            qw_free(w);
+        }
+        qi_free(ir);
+    }
+
+    /* the text of a range and the unit of a dimension, for a person */
+    char text[64];
+    qi_format_interval(qi_point(303150000), -6, text, sizeof text);
+    STR_EQ(text, "303.15");
+    qi_format_interval((QInterval) { 300, 301 }, -3, text, sizeof text);
+    STR_EQ(text, "~0.3");
+    qi_format_interval((QInterval) { 300, 302 }, -3, text, sizeof text);
+    STR_EQ(text, "0.3 .. 0.302");
+    qi_format_interval((QInterval) { 5, Q_INF }, 0, text, sizeof text);
+    STR_EQ(text, ">= 5");
+    qi_format_interval((QInterval) { Q_NINF, 5 }, 0, text, sizeof text);
+    STR_EQ(text, "<= 5");
+    qi_format_interval(qi_top(), 0, text, sizeof text);
+    STR_EQ(text, "unknown");
+    STR_EQ(qi_unit("m^2 kg s^-2"), "J");
+    STR_EQ(qi_unit("1"), "");
+    STR_EQ(qi_unit("m^3"), "m^3");
+}
+
 /* --- errors ----------------------------------------------------------------------------------------- */
 
 #define ROOMS                                                           \
@@ -1259,13 +1596,17 @@ void test_elab_errors(void)
     STR_EQ(compile_error("#P: #Phenomenon & { size: number }\np: #P\n"),
            "world.quad:2:1: error: p.size is a number with no kind and no dimension: a cell needs one, as in "
            "`size: %energy`\n");
-    /* a stock needs an exact value */
+    /* a stock needs an exact value at the start: the author gives it, or the laws give it (ADR 0019) */
     STR_EQ(compile_error("r: #LumpedRoom & { capacity: 10000J/K }\n"),
-           "world.quad:1:1: error: the stock r.energy needs an exact value: only transfers change a stock, so its first "
-           "value is a point\n");
+           "world.quad:1:1: error: the stock r.energy needs an exact value at the start, and the laws give it no value. "
+           "A law computes it from r.temperature: give an exact value there, or give the stock a value\n");
     STR_EQ(compile_error("r: #LumpedRoom & { capacity: 10000J/K, energy: >=0J & <=5J }\n"),
-           "world.quad:1:1: error: the stock r.energy needs an exact value: only transfers change a stock, so its first "
-           "value is a point\n");
+           "world.quad:1:1: error: the stock r.energy needs an exact value at the start, and the laws give 0 .. 5 J. "
+           "A law computes it from r.temperature: give an exact value there, or give the stock a value\n");
+    /* a stock with no law */
+    STR_EQ(compile_error("#Purse: #Phenomenon & { coins: %energy }\np: #Purse\n"),
+           "world.quad:2:1: error: the stock p.coins needs an exact value at the start, and the laws give it no value. "
+           "Give the stock a value, or give the values from which a law computes it\n");
 
     /* connections */
     STR_EQ(compile_error(ROOMS "wall: #ConductiveWall & { hot: roomA.west, conductance: 10W/K, tolerance: 0.01 }\n"),
@@ -1380,9 +1721,9 @@ void test_elab_errors(void)
 
     /* an error of an earlier stage stops the compile, and the diagnostics are sorted by location */
     HAS(compile_error("r: #LumpedRoom & { energy: 1.00001J, capacity: 1J/K }\n"), "world.quad:1:");
-    STR_EQ(compile_error("b: #LumpedRoom & { capacity: 1J/K }\n#P: #Phenomenon & { size: number }\na: #P\n"),
-           "world.quad:1:1: error: the stock b.energy needs an exact value: only transfers change a stock, so its first "
-           "value is a point\n"
+    STR_EQ(compile_error("#P: #Phenomenon & { size: number }\nb: #P\na: #P\n"),
+           "world.quad:2:1: error: b.size is a number with no kind and no dimension: a cell needs one, as in "
+           "`size: %energy`\n"
            "world.quad:3:1: error: a.size is a number with no kind and no dimension: a cell needs one, as in "
            "`size: %energy`\n");
 }
@@ -1439,17 +1780,20 @@ void test_examples(void)
     qw_free(w);
     qi_free(ir);
 
-    /* the plan that cannot work: the network names the propagator, and the IR has its law */
-    ir = example("load-too-heavy.quad", NULL);
-    w = ir ? build(ir, 1) : NULL;
-    if (w) {
-        CHECK(qw_run(w, 0) == QW_ECONTRADICTION);
-        uint32_t prop = 0;
-        CHECK(qn_contradicted_by(qw_net(w), &prop) && prop < ir->nprops);
-        if (prop < ir->nprops) CHECK(!strcmp(ir->props[prop].name, "plan.total") || !strcmp(ir->props[prop].name, "plan.limit"));
+    /* the plan that cannot work: the compile names the law that the values contradict (ADR 0019) */
+    {
+        const char *name = "load-too-heavy.quad";
+        char *text = read_file("examples/load-too-heavy.quad"), *diag = NULL;
+        CHECK(text != NULL);
+        if (text) {
+            const char *src = text;
+            CHECK(qi_compile(&name, &src, 1, NULL, &diag) == NULL);
+            STR_EQ(diag, "load-too-heavy.quad:15:1: error: the values of plan at the start contradict the law plan.limit: "
+                         ".load <= .capacity (plan.load = 1150 kg, plan.capacity = 1000 kg)\n");
+        }
+        free(diag);
+        free(text);
     }
-    qw_free(w);
-    qi_free(ir);
 
     ir = example("thermal.quad", "two-rooms.quad");
     w = ir ? build(ir, 1) : NULL;

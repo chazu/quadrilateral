@@ -97,7 +97,7 @@ static Rooms make_rooms(uint64_t seed, double ta, double tb, int64_t ca, int64_t
         snprintf(path, sizeof path, "%s.capacity", names[i]);
         OK(qw_cell(r.w, path, r.cap, qi_point(cq), &c));
         snprintf(path, sizeof path, "%s.temperature", names[i]);
-        OK(qw_cell(r.w, path, r.temp, qi_top(), &t));
+        OK(qw_derived_cell(r.w, path, r.temp, qi_top(), &t));    /* the law gives it: not state (ADR 0019) */
         CHECK(qn_product(qw_net(r.w), e, c, t, NULL) == QN_OK);   /* energy = capacity × temperature */
     }
     OK(qw_cell(r.w, "wall.conductance", r.cond, qi_point(g * 1000), NULL));
@@ -648,7 +648,8 @@ void test_world_alias(void)
             char path[64], alias[64];
             snprintf(path, sizeof path, "%s.%s", names[i], fields[k]);
             snprintf(alias, sizeof alias, "%s.west.%s", names[i], fields[k]);
-            OK(qw_cell(w, path, kinds[k], bases[k], &c[k]));
+            if (k == 2) OK(qw_derived_cell(w, path, kinds[k], bases[k], &c[k]));
+            else OK(qw_cell(w, path, kinds[k], bases[k], &c[k]));
             OK(qw_alias(w, alias, path));
         }
         CHECK(qn_product(qw_net(w), c[0], c[1], c[2], NULL) == QN_OK);
@@ -720,6 +721,24 @@ void test_world_derived(void)
     CHECK(qn_product(qw_net(r.w), p, g, diff, NULL) == QN_OK);
     OK(qw_attach(r.w, r.wall, qk_conduction()));
     OK(qw_attach(plain.w, plain.wall, qk_conduction()));
+
+    /* a kernel cannot write a derived cell: a law gives its value (ADR 0019). It can read one. */
+    static const QkSlot wslots[1] = { { "law.1", QK_STATE, "K", -6, { Q_NINF, Q_INF } } };
+    static const QkSlot rslots[1] = { { "law.1", QK_IN, "K", -6, { Q_NINF, Q_INF } } };
+    QkKernel writer = *qk_conduction();
+    writer.name = "test.writer";
+    writer.slots = wslots;
+    writer.nslots = 1;
+    writer.ntransfers = 0;
+    Rooms probe = make_rooms(1, 303.15, 293.15, 10000, 10000, 10, 10000000);
+    QwKind pdt;
+    OK(qw_anonymous_kind(probe.w, "K", -6, &pdt));
+    OK(qw_derived_cell(probe.w, "wall.law.1", pdt, qi_top(), NULL));
+    CHECK(qw_attach(probe.w, probe.wall, &writer) == QW_EOWNER);
+    CHECK(strstr(qw_error(probe.w), "would write 'wall.law.1', which is derived") != NULL);
+    writer.slots = rslots;
+    OK(qw_attach(probe.w, probe.wall, &writer));
+    qw_free(probe.w);
 
     /* a derived cell is not state: the hash is the hash of the world without it */
     CHECK(qw_hash(r.w) == qw_hash(plain.w));

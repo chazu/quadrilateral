@@ -325,12 +325,12 @@ void qf_free(Front *f)
         VEC_FREE(ti->members);
         free_records(&ti->ariths);
         qf_refs_free(&ti->refs);
-        VEC_FREE(ti->field_attrs);
-        VEC_FREE(ti->field_feats);
     }
     VEC_FREE(f->types);
     for (size_t i = 0; i < f->feats.n; i++) VEC_FREE(f->feats.v[i].intros);
     VEC_FREE(f->feats);
+    for (size_t i = 0; i < f->derived.n; i++) VEC_FREE(f->derived.v[i].path);
+    VEC_FREE(f->derived);
     for (size_t i = 0; i < f->insts.n; i++) {
         InstInfo *in = &f->insts.v[i];
         VEC_FREE(in->decls);

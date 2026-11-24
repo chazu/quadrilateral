@@ -65,8 +65,11 @@ typedef struct {
     uint32_t    kind;        /* index into kinds; for a set cell, into enums */
     QInterval   base;        /* an interval cell: quanta of its kind */
     uint64_t    mask;        /* a set cell: the possible atoms, atom i is bit i */
-    bool        stock;       /* a cell of a conserved kind: only transfers change it */
-    bool        derived;     /* a law gives its value, or it is a constant of a law: not state (ADR 0018) */
+    bool        stock;       /* a cell of a conserved kind: only transfers change it. Its base is a point: the
+                                author gives it, or the laws give it at the start (ADR 0019) */
+    bool        derived;     /* the laws give its value in each epoch: not state. A derived field of a type
+                                (ADR 0019), or an inner value of a law */
+    bool        inner;       /* derived, with no field in source: an inner value or a constant of a law (ADR 0018) */
 } QiCell;
 
 /* A second path for a cell of the same phenomenon. A port that is a view of
@@ -188,6 +191,13 @@ void  qi_free(QIr *ir);
 /* The text form. The caller frees it. Two contents with the same meaning give
  * the same text. */
 char *qi_text(const QIr *ir);
+
+/* For a person: a range in quanta of `scale` as text, and a common unit for
+ * a dimension of the IR. The text: 303.15, ~303.15 (between two steps),
+ * >= 0, <= 5, 2.5 .. 3, unknown. The unit: J for "m^2 kg s^-2", or the
+ * dimension itself if it has no common unit. */
+void        qi_format_interval(QInterval v, int scale, char *out, size_t len);
+const char *qi_unit(const char *dimension);
 
 /* Builds a world from the IR. `opt` gives the same kernels as at qi_compile.
  * On an error, *out is NULL and `error`, if not NULL, gets a message that the

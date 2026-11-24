@@ -84,10 +84,12 @@ QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, Qn
  * inner expression of a law (ADR 0018). The same dimension and scale give the
  * same kind. An anonymous kind is not conserved. */
 QwStatus qw_anonymous_kind(QWorld *w, const char *dim, int scale, QwKind *out);
-/* A derived cell: a value that a law gives, such as the inner difference of
- * g * (a - b), or a constant of a law. Its base is the whole range, or a
- * point for a constant. A derived cell is not state: qw_hash does not cover
- * it, and it takes no input. */
+/* A derived cell: a value that the laws give. It is a derived field, such
+ * as the temperature of a room whose state is its energy (ADR 0019), or an
+ * inner value of a law, such as the difference in g * (a - b), or a constant
+ * of a law (ADR 0018). Its base holds at every time: the whole range, a
+ * bound, or a point for a constant. A derived cell is not state: qw_hash
+ * does not cover it, it takes no input, and a kernel cannot write it. */
 QwStatus qw_derived_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out);
 /* A second path for the cell `cell`, in the same phenomenon. A port that is a
  * view of the phenomenon's own state uses it: after
