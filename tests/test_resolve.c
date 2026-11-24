@@ -977,7 +977,6 @@ void test_resolve_fixture(void)
 void test_resolve_errors(void)
 {
     /* what a later stage brings: each error names its issue */
-    STR_EQ(load_error("#T: { x: *1 | 2 }\n"), "a.quad:1:10: error: a default (*) is not in this stage (quad-ijx.10)");
     STR_EQ(load_error("#T: { xs: [for x in [1] { x }] }\n"),
            "a.quad:1:12: error: a comprehension or a function is not in this stage (quad-ijx.9)");
     STR_EQ(load_error("#T: { for x in [1] { a: x } }\n"),
@@ -989,8 +988,8 @@ void test_resolve_errors(void)
            "a.quad:1:10: error: a regular-expression constraint is not in this stage (quad-ijx.11)");
     STR_EQ(load_error("#T: { x: \"a \\(1)\" }\n"), "a.quad:1:10: error: string interpolation is not in this stage (quad-ijx.11)");
     STR_EQ(load_error("#A: { a: _ }\n#B: { b: _ }\nx: #C & { c: #A | #B }\n#C: { c: _ }\n"),
-           "a.quad:3:17: error: a disjunction of structures stands in a type's body. In an instance it needs variants, "
-           "which are not in this stage (quad-ijx.10)");
+           "a.quad:3:17: error: a disjunction of structures stands in a type's body. An instance has one structure: "
+           "give the alternatives to a type, and name the type here");
 
     /* the hierarchy */
     STR_EQ(load_error("#A: { x: _ }\n#B: { x: _ }\n"), "loaded");            /* two types, one field name (ADR 0017) */
@@ -1540,6 +1539,198 @@ static size_t generated_types(const Front *f)
     size_t n = 0;
     for (uint32_t t = 0; t < f->types.n; t++) n += f->types.v[t].kind == TK_GLB;
     return n;
+}
+
+/* --- defaults (quad-ijx.10) ------------------------------------------------------------------- */
+
+/* Every diagnostic of a content, one on each line. */
+static const char *all_diags(const char *const *sources, size_t n)
+{
+    static Buf out;
+    out.len = 0;
+    qf_buf_puts(&out, "");
+    bool ok;
+    Front *f = load(sources, n, &ok);
+    for (size_t i = 0; i < f->diags.n; i++) qf_buf_printf(&out, "%s\n", f->diags.v[i].msg);
+    qf_free(f);
+    return out.s;
+}
+
+/* The structure of an instance before its defaults. */
+static const char *pattern_text(const char *src, const char *name)
+{
+    static Buf out;
+    out.len = 0;
+    qf_buf_puts(&out, "");
+    bool ok;
+    Front *f = load1(src, &ok);
+    uint32_t i = ok ? qf_instance(f, name) : QF_BOTTOM;
+    if (i != QF_BOTTOM) qf_node_print(f, &out, f->insts.v[i].pattern);
+    qf_free(f);
+    return out.s;
+}
+
+/* A default applies after unification, with the rules of Triangle: the more
+ * specific contributor wins, a default never changes a value, and defaults
+ * that conflict do not apply. The cases of Triangle's tests give the same
+ * results here. */
+void test_defaults(void)
+{
+    /* a default with one other alternative: a number, an enum, a range (Triangle: test_defaults_with_type_alternatives) */
+    static const char H[] =
+        "#M: \"steel\" | \"oak\"\n"
+        "#H: { h: *5 | number, m: *\"oak\" | #M, n: *3 | >=0 & <=9 }\n"
+        "x: #H\ny: #H & { h: 7 }\n";
+    STR_EQ(inst_text(H, "x"), "#H & { h: 5, m: \"oak\", n: 3 }");
+    STR_EQ(inst_text(H, "y"), "#H & { h: 7, m: \"oak\", n: 3 }");
+    /* the structure before the defaults stays: a name in source copies it */
+    STR_EQ(pattern_text(H, "x"), "#H & { h: number, m: #M, n: >=0 & <=9 }");
+
+    /* #R overrides #P. #R and #Q have no order, so neither applies. #P stays
+     * overridden (Triangle: test_default_override_survives_tie) */
+    static const char *const tie[] = {
+        "#F: { f: \"a\" | \"b\" | \"c\" }\n"
+        "#P: #F & { f: *\"a\" }\n#Q: #F & { f: *\"b\" }\n#R: #P & { f: *\"c\" }\n"
+        "x: #R & #Q\ny: #R\nz: #P & #Q\n" };
+    STR_EQ(inst_text(tie[0], "x"), "#Q & #R & { f: (\"a\" | \"b\" | \"c\") }");
+    STR_EQ(inst_text(tie[0], "y"), "#R & { f: \"c\" }");
+    STR_EQ(inst_text(tie[0], "z"), "glb[#P & #Q,#Q & #R] & { f: (\"a\" | \"b\" | \"c\") }");
+    STR_EQ(all_diags(tie, 1),
+           "a.quad:5:1: warning: x: the defaults for f from #Q, #R conflict, so none of them applies. Give f a value\n"
+           "a.quad:7:1: warning: z: the defaults for f from #P, #Q conflict, so none of them applies. Give f a value\n");
+
+    /* a supertype that states the value of one side of a conflict does not decide the conflict */
+    STR_EQ(inst_text("#F: { f: \"a\" | \"b\" | \"c\" }\n"
+                     "#P: #F & { f: *\"c\" }\n#Q: #F & { f: *\"b\" }\n#R: #P & { f: *\"c\" }\nx: #R & #Q\n", "x"),
+           "#Q & #R & { f: (\"a\" | \"b\" | \"c\") }");
+    /* of two defaults with no order, one loses to a value: the other applies, with no warning */
+    static const char *const one[] = {
+        "#F: { f: number }\n#Q: #F & { f: *1 }\n#R: #F & { f: *2 }\nx: #R & #Q & { f: <=1 }\ny: #R & #Q & { f: 2 }\n" };
+    STR_EQ(inst_text(one[0], "x"), "#Q & #R & { f: 1 }");
+    STR_EQ(inst_text(one[0], "y"), "#Q & #R & { f: 2 }");
+    STR_EQ(all_diags(one, 1), "");
+    /* a default that comes through two parents is one default */
+    static const char *const diamond[] = {
+        "#A: { x: *1 | number }\n#B: #A & { b: _ }\n#C: #A & { c: _ }\n#D: #B & #C\nd: #D\n" };
+    STR_EQ(inst_text(diamond[0], "d"), "#D & { b: _, c: _, x: 1 }");
+    STR_EQ(all_diags(diamond, 1), "");
+
+    /* a default among text, through a subtype too (Triangle: test_text_defaults) */
+    static const char text[] =
+        "#Log: { splitsInto: *\"firewood_20\" | text }\n"
+        "#Trunk: #Log & { lengths: number }\n"
+        "log1: #Log & {}\nlog2: #Log & { splitsInto: \"kindling\" }\ntrunk1: #Trunk & { lengths: 3 }\n";
+    STR_EQ(inst_text(text, "log1"), "#Log & { splitsInto: \"firewood_20\" }");
+    STR_EQ(inst_text(text, "log2"), "#Log & { splitsInto: \"kindling\" }");
+    STR_EQ(inst_text(text, "trunk1"), "#Trunk & { lengths: 3, splitsInto: \"firewood_20\" }");
+
+    /* the default of an instance wins over the default of a type, and loses to a value of the instance */
+    STR_EQ(inst_text("#H: { h: *5 | number }\nx: #H & { h: *7 | number }\n", "x"), "#H & { h: 7 }");
+    STR_EQ(inst_text("#H: { h: *5 | number }\nx: #H & { h: *7 | number }\nx: { h: 9 }\n", "x"), "#H & { h: 9 }");
+    /* a default with no alternative: the field stays open for a value */
+    STR_EQ(inst_text("#T: { x: *5 }\na: #T\n", "a"), "#T & { x: 5 }");
+    STR_EQ(inst_text("#T: { x: *5 }\na: #T & { x: \"other\" }\n", "a"), "#T & { x: \"other\" }");
+    /* a quantity: the value converts to the kind of the field */
+    static const char W[] = "#W: { tolerance: *1pct | %ratio }\na: #W\nb: #W & { tolerance: 5pct }\n";
+    STR_EQ(inst_text(W, "a"), "#W & { tolerance: %ratio & 0.01 }");
+    STR_EQ(inst_text(W, "b"), "#W & { tolerance: %ratio & 0.05 }");
+
+    /* an instance that names another instance takes its structure before the
+     * defaults, and its defaults: below its own, above those of a type */
+    static const char *const named[] = {
+        "#Bolt: { state: *\"loose\" | \"tight\" }\n"
+        "#Machine: { bolt: #Bolt, material: *\"steel\" }\n"
+        "m1: #Machine & { material: *\"ash\" }\n"
+        "m2: m1 & { bolt: { state: \"tight\" } }\n"
+        "m3: m1 & { material: *\"oak\" }\n"
+        "m4: #Machine & { material: *\"elm\" }\n"
+        "m5: m1 & m4\n"
+        "m6: m5 & { material: \"pine\" }\n" };
+    STR_EQ(inst_text(named[0], "m1"), "#Machine & { bolt: #Bolt & { state: \"loose\" }, material: \"ash\" }");
+    STR_EQ(inst_text(named[0], "m2"), "#Machine & { bolt: #Bolt & { state: \"tight\" }, material: \"ash\" }");
+    STR_EQ(inst_text(named[0], "m3"), "#Machine & { bolt: #Bolt & { state: \"loose\" }, material: \"oak\" }");
+    STR_EQ(inst_text(named[0], "m5"), "#Machine & { bolt: #Bolt & { state: \"loose\" }, material: _ }");
+    STR_EQ(inst_text(named[0], "m6"), "#Machine & { bolt: #Bolt & { state: \"loose\" }, material: \"pine\" }");
+    STR_EQ(all_diags(named, 1), "a.quad:7:1: warning: m5: the defaults for material from m1, m4 conflict, so none of them "
+                                "applies. Give material a value\n");
+
+    /* the defaults of the workshop example (tests/data/workshop/blueprints.tri, section 5), as Triangle resolves them */
+    static const char *const shop[] = {
+        "#Material: \"steel\" | \"brass\" | \"oak\" | \"ash\"\n"
+        "#Physical: { material: #Material, mass: %mass }\n"
+        "#Sized: { size: %length }\n"
+        "#Tool: #Physical & #Sized & { wear: *0 | >=0 & <=1000 }\n"
+        "#Nut: #Physical & #Sized & { state: \"loose\" | \"tight\" }\n",
+        "#Metal: #Physical & { material: *\"steel\" }\n"
+        "#Wooden: #Physical & { material: *\"oak\" }\n"
+        "#Handled: #Wooden & { mass: <=2kg }\n"
+        "hammer: #Tool & #Metal & #Handled & { size: 30cm, mass: 1.2kg }\n"
+        "mallet: #Tool & #Handled & #Metal & { material: *\"ash\", size: 25cm, mass: 0.9kg }\n"
+        "nut: #Nut & { material: \"brass\", size: 12mm, mass: 9g, state: *\"loose\" | \"tight\" }\n" };
+    const char *const pohs[] = { shop[1], shop[0] };
+    bool ok, ok2;
+    Front *f = load(shop, 2, &ok), *g = load(pohs, 2, &ok2);
+    CHECK(ok && ok2);
+    if (ok && ok2) {
+        STR_EQ(node_text(f, inst(f, "mallet")),
+               "#Handled & #Metal & #Tool & { mass: %mass & 0.9, material: \"ash\", size: %length & 0.25, wear: 0 }");
+        STR_EQ(node_text(f, inst(f, "hammer")),
+               "#Handled & #Metal & #Tool & { mass: %mass & 1.2, material: #Material, size: %length & 0.3, wear: 0 }");
+        STR_EQ(node_text(f, inst(f, "nut")),
+               "#Nut & { mass: %mass & 0.009, material: \"brass\", size: %length & 0.012, state: \"loose\" }");
+        /* the order of the files does not count: the same structures, the same warning, the same hash */
+        STR_EQ(node_text(g, inst(g, "mallet")),
+               "#Handled & #Metal & #Tool & { mass: %mass & 0.9, material: \"ash\", size: %length & 0.25, wear: 0 }");
+        STR_EQ(node_text(g, inst(g, "hammer")),
+               "#Handled & #Metal & #Tool & { mass: %mass & 1.2, material: #Material, size: %length & 0.3, wear: 0 }");
+        CHECK(f->hash == g->hash);
+        CHECK(f->diags.n == 1 && g->diags.n == 1);
+        if (f->diags.n == 1 && g->diags.n == 1) {
+            STR_EQ(f->diags.v[0].msg, "b.quad:4:1: warning: hammer: the defaults for material from #Metal, #Wooden conflict, "
+                                      "so none of them applies. Give material a value");
+            STR_EQ(g->diags.v[0].msg + 1, f->diags.v[0].msg + 1);          /* the same, in the other file */
+        }
+    }
+    qf_free(f);
+    qf_free(g);
+    /* a default is a part of the content: the hash changes with it */
+    Front *h5 = load1("#H: { h: *5 | number }\n", &ok), *h6 = load1("#H: { h: *6 | number }\n", &ok2);
+    CHECK(ok && ok2 && h5->hash != h6->hash);
+    qf_free(h5);
+    qf_free(h6);
+
+    /* a default alternative of structures in a type: the default gives the
+     * alternative, and then the alternative gives its own default */
+    static const char G[] =
+        "#G: { grip: { kind: \"bare\" } | *{ kind: \"wrapped\", wraps: *3 | number } }\n"
+        "g: #G\nh: #G & { grip: { kind: \"bare\" } }\n";
+    STR_EQ(inst_text(G, "g"), "#G & { grip: ({ kind: \"bare\" } | { kind: \"wrapped\", wraps: *3 | number })/{ kind: "
+                              "\"wrapped\", wraps: *3 | number } & { kind: \"wrapped\", wraps: 3 } }");
+    /* a value that the default alternative does not allow: the default loses */
+    STR_EQ(inst_text(G, "h"), "#G & { grip: ({ kind: \"bare\" } | { kind: \"wrapped\", wraps: *3 | number }) & { kind: "
+                              "\"bare\" } }");
+
+    /* errors */
+    STR_EQ(load_error("#T: { x: *1 | *2 | number }\n"), "a.quad:1:15: error: more than one default in a disjunction");
+    STR_EQ(load_error("#T: { a: _ }\nx: #T & { a: *\"p\" | *\"q\" }\n"),
+           "a.quad:2:21: error: more than one default in a disjunction");
+    STR_EQ(load_error("#A: { a: _ }\n#B: { b: _ }\n#T: { s: *#A | *#B }\n"),
+           "a.quad:3:16: error: more than one default in a disjunction");
+    /* numbers that are apart are still no type */
+    STR_EQ(load_error("#T: { x: *1 | 2 | 3 }\n"),
+           "a.quad:1:17: error: a disjunction of numbers is not a type; use a range, or an enum of atoms");
+    /* a default that can never apply: in a type, against the field; in an instance, against its other alternative */
+    STR_EQ(load_error("#T: { x: *1 | 2 }\n"),
+           "a.quad:1:11: error: #T: the default for x can never apply: x: 2 and 1 are different values");
+    STR_EQ(load_error("#F: { f: \"a\" | \"b\" | \"c\" }\n#P: #F & { f: *\"z\" }\n"),
+           "a.quad:2:16: error: #P: the default for f can never apply: f: \"z\" is not one of \"a\" | \"b\" | \"c\"");
+    STR_EQ(load_error("#H: { h: number }\nx: #H & { h: *\"q\" | number }\n"),
+           "a.quad:2:15: error: x: the default for h can never apply: \"q\" is not a number");
+    /* an error in the value of a default comes once, and not for each instance */
+    static const char *const nope[] = { "#T: { x: *nope | number }\na: #T\nb: #T\n" };
+    STR_EQ(all_diags(nope, 1), "a.quad:1:11: error: unknown name nope\n");
+    static const char *const nope2[] = { "#T: { x: number }\na: #T & { x: *nope | number }\n" };
+    STR_EQ(all_diags(nope2, 1), "a.quad:2:15: error: unknown name nope\n");
 }
 
 /* A message of the unifier uses the words of the author: the field, the

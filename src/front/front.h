@@ -236,6 +236,15 @@ typedef struct {
 } ArithRec;
 typedef VEC(ArithRec) ArithVec;
 
+/* A default: the value that the field at `path` takes if nothing more
+ * specific gives it one (`*v`). contributor: the type that states it, or one
+ * of the two values below for an instance. rest: the other alternative of
+ * `*v | rest`, if there is exactly one, or NULL. */
+typedef struct { U32Vec path; X *value; uint32_t contributor; X *rest; Sym who; } DefaultRec;   /* who: the named instance */
+typedef VEC(DefaultRec) DefVec;
+#define QF_CONTRIB_INSTANCE 0xFFFFFFFEu   /* the instance states the default itself */
+#define QF_CONTRIB_NAMED    0xFFFFFFFDu   /* an instance that it names states the default */
+
 /* A reference record: the structure at `path` is a copy of the instance
  * `inst`, or of its part at `sub`. `hot: roomA.west` gives (hot, roomA, west).
  * A copy has no link to its source, so stage 3 reads these records to find
@@ -261,6 +270,7 @@ typedef struct {
     int       xstate;                   /* 0 none, 1 in progress, 2 done */
     QfNode   *expansion;
     ArithVec  ariths;                   /* constraint records, own and inherited */
+    DefVec    defaults;                 /* defaults, own and inherited */
     InstRefVec refs;                    /* reference records, own and inherited */
     Sym       home;                     /* the package it is declared in, or NULL (the root) */
     bool      isdisj;                   /* its subtypes are alternatives (TK_ALT) */
@@ -383,7 +393,9 @@ typedef struct {
     Sym       name;
     VEC(Decl *) decls;
     int       pstate;            /* 0 none, 1 in progress, 2 done, 3 failed */
-    QfNode   *node;              /* its structure */
+    QfNode   *node;              /* its structure, with its defaults */
+    QfNode   *pattern;           /* its structure before the defaults: a name in source is a copy of this */
+    DefVec    defaults;          /* the defaults that it states, and those of the instances that it names */
     VEC(TagPath) tags;           /* where each tag and reference stands */
     ArithVec  ariths;            /* its constraint records */
     InstRefVec refs;             /* its reference records */
@@ -483,6 +495,7 @@ X    *x_name(Front *c, Sym name, Loc loc);
 X    *x_and(Front *c, X *a, X *b);
 void  x_flatten(X *x, XKind k, XPtrVec *out);
 bool  x_numeric(const X *x);                  /* a number, a bound, a kind, or a conjunction of those */
+bool  x_default_rest(X *x);                   /* *d | rest: one default and one other alternative */
 bool  x_numeric_or(X *x);                     /* a disjunction of numeric expressions */
 bool  x_text_or(X *x);                        /* a disjunction of text: `text` among strings */
 

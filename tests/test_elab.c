@@ -1267,6 +1267,59 @@ void test_elab_kernels(void)
 /* --- the start and derived fields (ADR 0019) --------------------------------------------------------- */
 
 /* The diagnostics of one file with no other content, or "compiled". */
+/* A default of a type gives a cell its value and a phenomenon its kernel.
+ * An instance or a subtype can give another value (quad-ijx.10). */
+void test_elab_defaults(void)
+{
+#define ROOMS                                                              \
+    "roomA: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n"  \
+    "roomB: #LumpedRoom & { temperature: 293.15K, capacity: 10000J/K }\n"
+#define EASY "#Easy: #Wall & { tolerance: *1pct | %ratio, evaluator: *\"native.conduction\" }\n"
+    QIr *ir = compile(ROOMS EASY "wall: #Easy & { hot: roomA.west, cold: roomB.west, conductance: 10W/K }\n", NULL);
+    QIr *plain = compile(ROOMS "wall: #ConductiveWall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, "
+                               "tolerance: 0.01 }\n", NULL);
+    if (ir && plain) {
+        char *text = qi_text(ir);
+        HAS(text, "  cell wall.tolerance: %ratio = 0.01\n");
+        HAS(text, "  kernel K0, at a boundary: native.conduction\n");
+        free(text);
+        /* the world is the world of the content that states both values */
+        QWorld *w = build(ir, 1), *p = build(plain, 1);
+        if (w && p) {
+            for (int64_t t = 0; t <= 1000000000; t += 250000000) {
+                OK(qw_run(w, t));
+                OK(qw_run(p, t));
+                CHECK(qw_hash(w) == qw_hash(p));
+            }
+            CHECK(qw_get(w, "roomA.energy").lo < 3031500000);          /* the kernel moved heat */
+        }
+        qw_free(w);
+        qw_free(p);
+    }
+    qi_free(ir);
+    qi_free(plain);
+
+    /* a value of the instance wins over the default */
+    ir = compile(ROOMS EASY "wall: #Easy & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 5pct }\n",
+                 NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  cell wall.tolerance: %ratio = 0.05\n");
+        free(text);
+    }
+    qi_free(ir);
+
+    /* a subtype gives another kernel: without the default, the two texts do not unify (ADR 0016) */
+    HAS(compile_error(ROOMS EASY "#Other: #Easy & { evaluator: \"native.none\" }\n"
+                      "wall: #Other & { hot: roomA.west, cold: roomB.west, conductance: 10W/K }\n"),
+        "wall: unknown evaluator \"native.none\"");
+    HAS(compile_error(ROOMS "#Other: #ConductiveWall & { evaluator: \"native.none\" }\n"
+                      "wall: #Other & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 0.01 }\n"),
+        "evaluator: \"native.none\" and \"native.conduction\" are different values");
+#undef ROOMS
+#undef EASY
+}
+
 static const char *alone_error(const char *text)
 {
     static char out[4096];

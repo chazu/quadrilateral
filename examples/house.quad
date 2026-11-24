@@ -11,8 +11,8 @@ bedroom: #Room & { temperature: 289.65K, capacity: 12000J/K }        // 16.5 C
 outside: #Room & { temperature: 273.15K, capacity: 1000000000J/K }   // 0 C
 
 // An inner wall is thin. The outer wall has insulation.
-#InnerWall: #Wall & { conductance: 15W/K, tolerance: 1pct }
+#InnerWall: #Wall & { conductance: 15W/K }
 
 door1: #InnerWall & { hot: kitchen.west, cold: hall.west }
 door2: #InnerWall & { hot: hall.west, cold: bedroom.west }
-outer: #Wall & { hot: bedroom.west, cold: outside.west, conductance: 4W/K, tolerance: 1pct }
+outer: #Wall & { hot: bedroom.west, cold: outside.west, conductance: 4W/K }

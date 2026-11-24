@@ -9,4 +9,4 @@
 // from the law of the room: 10000 J/K × 303.15 K is 3031500 J.
 living: #Room & { temperature: 303.15K, capacity: 10000J/K }
 cellar: #Room & { temperature: 293.15K, capacity: 10000J/K }
-wall:   #Wall & { hot: living.west, cold: cellar.west, conductance: 10W/K, tolerance: 1pct }
+wall:   #Wall & { hot: living.west, cold: cellar.west, conductance: 10W/K }

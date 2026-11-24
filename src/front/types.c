@@ -443,8 +443,7 @@ static void register_disj(Front *c, X *x, Sym owner)
     x_flatten(x, X_OR, &ds);
     for (size_t i = 0; i < ds.n; i++) {
         X *a = ds.v[i];
-        if (a->k == X_DEFAULT) {
-            if (d.def >= 0) qf_diag(c, true, a->loc, "more than one default in a disjunction");
+        if (a->k == X_DEFAULT) {                 /* one at most: scan_expr checks it */
             d.def = (int) i;
             a = a->u.sub;
         }
@@ -483,9 +482,19 @@ static void scan_expr(Front *c, X *x, bool typebody)
             }
             VEC_FREE(atoms);
         }
+        XPtrVec alts = { 0 };
+        x_flatten(x, X_OR, &alts);
+        int ndef = 0;
+        for (size_t i = 0; i < alts.n; i++)
+            if (alts.v[i]->k == X_DEFAULT && ++ndef == 2)
+                qf_diag(c, true, alts.v[i]->loc, "more than one default in a disjunction");
+        VEC_FREE(alts);
+        if (ndef > 1) break;
         if (!an && typebody) {
             if (x_numeric_or(x)) {
-                qf_diag(c, true, x->loc, "a disjunction of numbers is not a type; use a range, or an enum of atoms");
+                /* *0 | >=0 & <=1000 is the range, with the default 0 */
+                if (!x_default_rest(x))
+                    qf_diag(c, true, x->loc, "a disjunction of numbers is not a type; use a range, or an enum of atoms");
             } else if (!x_text_or(x)) {
                 register_disj(c, x, NULL);
                 break;
