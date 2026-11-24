@@ -5,6 +5,8 @@
 //   quad run examples/thermal.quad examples/two-rooms.quad --until 30min --every 10min \
 //        --show living.temperature,cellar.temperature,wall.power
 
-living: #Room & { energy: 3031500J, capacity: 10000J/K }    // 303.15 K
-cellar: #Room & { energy: 2931500J, capacity: 10000J/K }    // 293.15 K
+// A room gives its temperature at the start. The compile finds its energy
+// from the law of the room: 10000 J/K × 303.15 K is 3031500 J.
+living: #Room & { temperature: 303.15K, capacity: 10000J/K }
+cellar: #Room & { temperature: 293.15K, capacity: 10000J/K }
 wall:   #Wall & { hot: living.west, cold: cellar.west, conductance: 10W/K, tolerance: 1pct }

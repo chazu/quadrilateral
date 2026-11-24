@@ -483,6 +483,31 @@ static uint32_t struct_type(Build *b, X *x, uint32_t base, uint32_t e, const uin
     return QF_BOTTOM;
 }
 
+/* The attribute @derived on a field (ADR 0019): the laws compute the field
+ * from the state. A type gives the mark, to a field with a quantity that is
+ * not conserved. b->path is the path of the field. */
+static void mark_derived(Build *b, const XField *fl, const QfNode *value)
+{
+    Front *f = b->c->f;
+    bool marked = false;
+    for (int a = 0; a < fl->nattrs; a++) marked |= !strcmp(fl->attrs[a].name, "derived");
+    if (!marked) return;
+    const TypeInfo *ti = &f->types.v[value->type];
+    if (b->owner == QF_BOTTOM)
+        qf_diag(f, true, fl->loc, "@derived on %s is in an instance: a type marks the fields that the laws compute. "
+                "Write the mark in the type", fl->label);
+    else if (ti->kind != TK_KIND && ti->kind != TK_DIMT)
+        qf_diag(f, true, fl->loc, "@derived on %s: a derived field is a quantity, with a kind or a dimension", fl->label);
+    else if (ti->kind == TK_KIND && f->kinds.v[ti->kindix].conserved)
+        qf_diag(f, true, fl->loc, "@derived on %s: its kind %s is conserved, so the field is a stock. A stock is state, "
+                "and the laws do not compute it", fl->label, f->kinds.v[ti->kindix].name);
+    else {
+        DerivedMark m = { b->owner, { 0 }, fl->loc };
+        for (size_t i = 0; i < b->path.n; i++) VEC_PUSH(m.path, b->path.v[i]);
+        VEC_PUSH(f->derived, m);
+    }
+}
+
 static QfNode *build_struct_into(Build *b, QfNode *r, X *x)
 {
     QfOp *c = b->c;
@@ -499,6 +524,7 @@ static QfNode *build_struct_into(Build *b, QfNode *r, X *x)
         b->ctx1 = expect != c->f->top ? expect + 1 : 0;      /* a field's value: the declared type of the field */
         QfNode *child = build_raw(b, fl->value);
         b->ctx1 = ctx1;
+        if (child) mark_derived(b, fl, deref(c, child));
         b->path.n--;
         if (!child) break;
         QfNode *rd = deref(c, r);
@@ -1441,6 +1467,21 @@ static void name_plainly(Front *c)
 /* The type hierarchy reads the declarations before any structure is built,
  * and it expects labels on fields. So source that needs a later stage is
  * found here, before the hierarchy. */
+/* The front end knows the names of its attributes (ADR 0019). `field`: the
+ * attributes are those of a field, where @derived can stand. */
+static void check_attrs(Front *c, const Attr *attrs, int n, bool field, Loc loc)
+{
+    for (int i = 0; i < n; i++) {
+        if (strcmp(attrs[i].name, "derived") != 0)
+            qf_diag(c, true, loc, "unknown attribute @%s. The attribute of this stage is @derived, on a field of a type",
+                    attrs[i].name);
+        else if (!field)
+            qf_diag(c, true, loc, "@derived marks a field of a type: write it after the value of the field");
+        else if (attrs[i].args && attrs[i].args[0])
+            qf_diag(c, true, loc, "@derived has no arguments");
+    }
+}
+
 static void check_stage(Front *c, const X *x)
 {
     if (!x) return;
@@ -1458,8 +1499,10 @@ static void check_stage(Front *c, const X *x)
         qf_diag(c, true, x->loc, "a regular-expression constraint is not in this stage (quad-ijx.11)");
         break;
     case X_STRUCT:
+        check_attrs(c, x->u.st.attrs, x->u.st.nattrs, false, x->loc);
         for (int i = 0; i < x->u.st.n; i++) {
             const XField *fl = &x->u.st.fields[i];
+            check_attrs(c, fl->attrs, fl->nattrs, true, fl->loc);
             if (!fl->label && !field_comp(fl)) {
                 qf_diag(c, true, fl->loc, "a computed label is not in this stage (quad-ijx.9)");
                 continue;
@@ -1707,8 +1750,10 @@ void qf_sort_diags(Front *f)
 static bool resolve(Front *c)
 {
     size_t errors0 = c->nerrors;
-    for (size_t i = 0; i < c->decls.n; i++)
+    for (size_t i = 0; i < c->decls.n; i++) {
+        check_attrs(c, c->decls.v[i].attrs, c->decls.v[i].nattrs, false, c->decls.v[i].loc);
         if (c->decls.v[i].kind != L_KIND) check_stage(c, c->decls.v[i].value);
+    }
     if (c->nerrors > errors0) return false;
     resolve_packages(c);
     if (c->nerrors > errors0 || !qf_kinds_build(c) || !types_build(c) || !check_lets(c)) return false;

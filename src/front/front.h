@@ -264,8 +264,6 @@ typedef struct {
     InstRefVec refs;                    /* reference records, own and inherited */
     Sym       home;                     /* the package it is declared in, or NULL (the root) */
     bool      isdisj;                   /* its subtypes are alternatives (TK_ALT) */
-    VEC(Attr *) field_attrs;            /* parallel to own introduced features */
-    U32Vec field_feats;
 } TypeInfo;
 
 /* A feature is a field name of a package: two packages may each have one of
@@ -390,6 +388,11 @@ typedef struct {
     InstRefVec refs;             /* its reference records */
 } InstInfo;
 
+/* A field that a type marks with @derived (ADR 0019): the laws compute it
+ * from the state. path: from the body of the type to the field. The mark
+ * holds for each structure with a type below `type`. */
+typedef struct { uint32_t type; U32Vec path; Loc loc; } DerivedMark;
+
 /* --- the front end -------------------------------------------------------------------- */
 
 typedef struct Front {
@@ -425,6 +428,7 @@ typedef struct Front {
 
     VEC(InstInfo) insts;
     U64Map instidx;              /* Sym → instance + 1 */
+    VEC(DerivedMark) derived;    /* the fields that a type marks with @derived (ADR 0019) */
 
     XPtrVec listelems;           /* element expressions of typed lists [...X] */
     VEC(char *) buildlog;        /* generated types, for the developer */

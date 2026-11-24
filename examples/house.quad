@@ -5,10 +5,10 @@
 //   quad run examples/thermal.quad examples/house.quad --until 6h --every 1h \
 //        --show kitchen.temperature,hall.temperature,bedroom.temperature,outer.power
 
-kitchen: #Room & { energy: 2981500J, capacity: 10000J/K }       // 298.15 K, 25 C
-hall:    #Room & { energy: 1465750J, capacity: 5000J/K }        // 293.15 K, 20 C
-bedroom: #Room & { energy: 3477800J, capacity: 12000J/K }       // about 289.8 K
-outside: #Room & { energy: 273150000000J, capacity: 1000000000J/K }   // 273.15 K, 0 C
+kitchen: #Room & { temperature: 298.15K, capacity: 10000J/K }        // 25 C
+hall:    #Room & { temperature: 293.15K, capacity: 5000J/K }         // 20 C
+bedroom: #Room & { temperature: 289.65K, capacity: 12000J/K }        // 16.5 C
+outside: #Room & { temperature: 273.15K, capacity: 1000000000J/K }   // 0 C
 
 // An inner wall is thin. The outer wall has insulation.
 #InnerWall: #Wall & { conductance: 15W/K, tolerance: 1pct }

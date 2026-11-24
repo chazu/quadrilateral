@@ -1016,6 +1016,11 @@ static QwStatus bind_kernel(QWorld *w, QwPhen pid, int m, const QkKernel *k, con
                       w->phens[ci->owner].name);
             goto out;
         }
+        if ((s->role == QK_STATE || s->role == QK_OUT) && ci->derived) {
+            st = fail(w, QW_EOWNER, "%s: slot '%s' would write '%s', which is derived: a law gives its value", pn, s->name,
+                      path);
+            goto out;
+        }
         if ((s->role == QK_STATE || s->role == QK_OUT) && kind->conserved) {
             st = fail(w, QW_ESTOCK, "%s: slot '%s' would write the stock '%s'; a stock changes only by transfers", pn,
                       s->name, path);
