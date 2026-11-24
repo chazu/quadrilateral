@@ -344,6 +344,7 @@ void qf_free(Front *f)
         qf_refs_free(&in->refs);
     }
     VEC_FREE(f->insts);
+    u64map_free(&f->declidx);
     for (size_t i = 0; i < f->disjs.n; i++) {
         VEC_FREE(f->disjs.v[i].altx);
         VEC_FREE(f->disjs.v[i].alts);
