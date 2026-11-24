@@ -14,9 +14,11 @@
  *     unification gives it a kind.
  *   - An arithmetic expression or a comparison is not evaluated. It gives a
  *     constraint record, and stage 3 makes propagators from the records.
- *   - An instance has one structure. Defaults and variants (quad-ijx.10),
- *     comprehensions and functions (quad-ijx.9), and text constraints and
- *     interpolation (quad-ijx.11) are errors that name their issue. */
+ *   - An instance has one structure, so alternatives of structures in an
+ *     instance are an error. Defaults apply after unification, as in
+ *     Triangle. Comprehensions and functions (quad-ijx.9), and text
+ *     constraints and interpolation (quad-ijx.11) are errors that name their
+ *     issue. */
 
 /* The prelude: the types that the front end knows (ADR 0011 section 2).
  * The list types are in the root. #Phenomenon and #Port, which the
@@ -49,6 +51,7 @@ typedef struct {
     uint32_t owner;  /* type whose body is being built, or QF_BOTTOM */
     size_t decl;     /* which of its declarations */
     ArithVec ariths; /* constraint records met while building; tags resolved afterwards */
+    DefVec defs;     /* defaults met while building */
     InstRefVec refs; /* reference records met while building */
     uint32_t ctx1;   /* the type a struct's labels are written against (T & { … }), + 1; 0: none */
 } Build;
@@ -109,11 +112,18 @@ static void free_ariths(ArithVec *v)
     VEC_FREE(*v);
 }
 
+static void free_defaults(DefVec *v)
+{
+    for (size_t i = 0; i < v->n; i++) VEC_FREE(v->v[i].path);
+    VEC_FREE(*v);
+}
+
 static void build_free(Build *b)
 {
     VEC_FREE(b->tags);
     VEC_FREE(b->path);
     free_ariths(&b->ariths);
+    free_defaults(&b->defs);
     qf_refs_free(&b->refs);
 }
 
@@ -217,6 +227,46 @@ static bool unify_at(Build *b, QfNode *x, QfNode *y, Loc loc, const char *what)
     return unify_at_other(b, x, y, loc, what, QF_BOTTOM);
 }
 
+/* --- defaults: the records ------------------------------------------------------------------------ */
+
+/* A default at the place of the build. rest: the one other alternative, or NULL. */
+static void record_default(Build *b, X *value, X *rest)
+{
+    DefaultRec d = { { 0 }, value, b->owner == QF_BOTTOM ? QF_CONTRIB_INSTANCE : b->owner, rest, NULL };
+    for (size_t i = 0; i < b->path.n; i++) VEC_PUSH(d.path, b->path.v[i]);
+    VEC_PUSH(b->defs, d);
+}
+
+/* Adds a copy of a default, with a prefix before its path. One default comes
+ * once, although it can come through two parents or two paths of a walk. */
+static void add_default(DefVec *defs, const DefaultRec *d, const uint32_t *prefix, size_t plen, uint32_t contributor)
+{
+    DefaultRec n = { { 0 }, d->value, contributor, d->rest, d->who };
+    for (size_t i = 0; i < plen; i++) VEC_PUSH(n.path, prefix[i]);
+    for (size_t i = 0; i < d->path.n; i++) VEC_PUSH(n.path, d->path.v[i]);
+    for (size_t i = 0; i < defs->n; i++) {
+        const DefaultRec *o = &defs->v[i];
+        if (o->value == n.value && o->contributor == n.contributor && o->path.n == n.path.n &&
+            (!n.path.n || !memcmp(o->path.v, n.path.v, n.path.n * sizeof(uint32_t)))) {
+            VEC_FREE(n.path);
+            return;
+        }
+    }
+    VEC_PUSH(*defs, n);
+}
+
+/* The defaults that an instance states, moved to the path where a copy of
+ * the instance now stands. In an instance, they are less specific than its
+ * own defaults and more specific than the defaults of a type. */
+static void include_defaults(Build *b, const InstInfo *ri)
+{
+    for (size_t i = 0; i < ri->defaults.n; i++) {
+        DefaultRec d = ri->defaults.v[i];
+        if (!d.who) d.who = ri->name;
+        add_default(&b->defs, &d, b->path.v, b->path.n, b->owner == QF_BOTTOM ? QF_CONTRIB_NAMED : b->owner);
+    }
+}
+
 static QfNode *build_raw(Build *b, X *x);
 
 /* The constraint records that an instance states, moved to the path where a
@@ -300,7 +350,7 @@ static QfNode *name_path(Build *b, X *x)
                 build_error(b, x->loc, "instance %s could not be resolved", name);
                 return NULL;
             }
-            node = copy_raw(c, &c->scratch, f->insts.v[v - 1].node);
+            node = copy_raw(c, &c->scratch, f->insts.v[v - 1].pattern);
             from = (uint32_t) v - 1;
         } else continue;
         /* the rest: .name and [k] */
@@ -412,7 +462,7 @@ static uint32_t chain_type(Build *b, X *x, uint32_t t)
         if (!u64map_get(&f->instidx, (uint64_t) (uintptr_t) x->u.name, &v)) return t;
         InstInfo *in = &f->insts.v[v - 1];
         if (in->pstate == 1 || in->pstate == 3 || !inst_build(c, (uint32_t) v - 1)) return t;
-        named = f->insts.v[v - 1].node->type;
+        named = f->insts.v[v - 1].pattern->type;
     }
     uint32_t m = op_meet(c, t, named);
     return m != QF_BOTTOM ? m : t;
@@ -694,7 +744,8 @@ static QfNode *build_raw(Build *b, X *x)
             /* a name unifies a copy of its constraints, its records among them */
             include_ariths(b, &f->insts.v[v - 1]);
             include_refs(b, &f->insts.v[v - 1], NULL, 0);
-            return copy_raw(c, &c->scratch, f->insts.v[v - 1].node);
+            include_defaults(b, &f->insts.v[v - 1]);
+            return copy_raw(c, &c->scratch, f->insts.v[v - 1].pattern);
         }
         if (strchr(x->u.name, '.') || strchr(x->u.name, '[')) {
             QfNode *n = name_path(b, x);
@@ -837,52 +888,59 @@ static QfNode *build_raw(Build *b, X *x)
         build_error(b, x->loc, "%s", "a let's use was not resolved");
         return NULL;
     case X_DEFAULT:
-        build_error(b, x->loc, "%s", "a default (*) is not in this stage (quad-ijx.10)");
-        return NULL;
+        /* *v with no alternative: the field stays open, and v is its default */
+        record_default(b, x->u.sub, NULL);
+        return node_new(c, &c->scratch, f->top);
     case X_OR: {
         uint64_t di;
         if (u64map_get(&f->disjidx, (uint64_t) (uintptr_t) x, &di)) {
             /* a disjunction of structures in a type body: its type, whose
              * alternatives are subtypes */
             DisjInfo *d = &f->disjs.v[di - 1];
-            if (d->def >= 0) {
-                build_error(b, x->loc, "%s", "a default (*) is not in this stage (quad-ijx.10)");
-                return NULL;
-            }
+            if (d->def >= 0)
+                record_default(b, d->collapse ? d->altx.v[d->def] : x_name(f, d->alts.v[d->def], x->loc), NULL);
             X *named = x_name(f, d->collapse ? d->collapse : d->dname, x->loc);
             if (d->collapse && f->types.v[type_lookup(f, d->collapse)].kind == TK_ATOM) named->k = X_ATOM;
             return build_raw(b, named);
         }
         XPtrVec ds = { 0 };
         x_flatten(x, X_OR, &ds);
-        bool all_atoms = true, has_default = false;
+        bool all_atoms = true;
+        X *def = NULL, *rest = NULL;
+        size_t nrest = 0;
         for (size_t i = 0; i < ds.n; i++) {
-            if (ds.v[i]->k == X_DEFAULT) has_default = true;
-            else if (ds.v[i]->k != X_ATOM) all_atoms = false;
+            X *a = ds.v[i];
+            if (a->k == X_DEFAULT) {             /* one at most: the type stage checks it */
+                def = a = a->u.sub;
+            } else {
+                rest = a;
+                nrest++;
+            }
+            if (a->k != X_ATOM) all_atoms = false;
         }
         VEC_FREE(ds);
-        if (has_default) {
-            build_error(b, x->loc, "%s", "a default (*) is not in this stage (quad-ijx.10)");
-            return NULL;
-        }
+        bool text = !all_atoms && x_text_or(x);
+        /* *0 | >=0 & <=1000: the other alternative gives the values, and 0 is the default */
+        bool one = def && nrest == 1 && !all_atoms && !text;
+        if (def) record_default(b, def, one ? rest : NULL);
         if (all_atoms) {
             Sym an = anon_name(f, x);
             if (!an) {                           /* every disjunct is the same atom */
                 X *d = x;
                 while (d->k == X_OR) d = d->u.bin.a;
-                return build_raw(b, d);
+                return build_raw(b, d->k == X_DEFAULT ? d->u.sub : d);
             }
             uint32_t t = type_lookup(f, an);
             if (t == QF_BOTTOM) { build_error(b, x->loc, "unknown enum %s", an); return NULL; }
             return node_new(c, &c->scratch, t);
         }
-        if (x_text_or(x)) {
+        if (text) {
             /* text, and strings it covers: text (a string an enum lists is
              * no free text, so not among it) */
             XPtrVec ts = { 0 };
             x_flatten(x, X_OR, &ts);
             for (size_t i = 0; i < ts.n; i++) {
-                X *a = ts.v[i];
+                X *a = ts.v[i]->k == X_DEFAULT ? ts.v[i]->u.sub : ts.v[i];
                 if (a->k == X_REGEX) {
                     build_error(b, a->loc, "%s", "a regular-expression constraint is not in this stage (quad-ijx.11)");
                     VEC_FREE(ts);
@@ -898,12 +956,13 @@ static QfNode *build_raw(Build *b, X *x)
             VEC_FREE(ts);
             return leaf_new(c, &c->scratch, f->ttext, Q_NINF, Q_INF);
         }
+        if (one) return build_raw(b, rest);
         if (x_numeric_or(x)) {
             build_error(b, x->loc, "%s", "a disjunction of numbers is not a type; use a range, or an enum of atoms");
             return NULL;
         }
-        build_error(b, x->loc, "%s", "a disjunction of structures stands in a type's body. In an instance it needs "
-                    "variants, which are not in this stage (quad-ijx.10)");
+        build_error(b, x->loc, "%s", "a disjunction of structures stands in a type's body. An instance has one "
+                    "structure: give the alternatives to a type, and name the type here");
         return NULL;
     }
     case X_LIST: {
@@ -1160,6 +1219,12 @@ QfNode *type_expansion(QfOp *c, uint32_t t)
             const ArithVec *pa = &f->types.v[ti->parents.v[k]].ariths;
             for (size_t i = 0; i < pa->n; i++) copy_arith(&ti->ariths, &pa->v[i]);
         }
+        /* defaults: the type's own, and its parents' */
+        for (size_t i = 0; i < b.defs.n; i++) add_default(&ti->defaults, &b.defs.v[i], NULL, 0, b.defs.v[i].contributor);
+        for (size_t k = 0; k < ti->parents.n; k++) {
+            const DefVec *pd = &f->types.v[ti->parents.v[k]].defaults;
+            for (size_t i = 0; i < pd->n; i++) add_default(&ti->defaults, &pd->v[i], NULL, 0, pd->v[i].contributor);
+        }
         for (size_t i = 0; i < b.refs.n; i++) copy_ref(&ti->refs, &b.refs.v[i]);
         for (size_t k = 0; k < ti->parents.n; k++) {
             const InstRefVec *pr = &f->types.v[ti->parents.v[k]].refs;
@@ -1237,7 +1302,8 @@ static bool inst_build(QfOp *c, uint32_t i)
             qf_diag(f, true, in->decls.v[0]->loc, "%s: its type does not allow one of its fields", in->name);
             b.ok = false;
         } else {
-            in->node = pat;
+            in->node = in->pattern = pat;        /* resolve() gives the node its defaults, after every instance */
+            for (size_t q = 0; q < b.defs.n; q++) add_default(&in->defaults, &b.defs.v[q], NULL, 0, b.defs.v[q].contributor);
             for (size_t t = 0; t < b.tags.n; t++) {
                 TagPath tp = { b.tags.v[t].name, { 0 } };
                 tag_path(&b, pat, b.tags.v[t].node, &tp.path);
@@ -1497,9 +1563,6 @@ static void check_stage(Front *c, const X *x)
     case X_COMP: case X_VAR: case X_CALL:
         qf_diag(c, true, x->loc, "a comprehension or a function is not in this stage (quad-ijx.9)");
         break;
-    case X_DEFAULT:
-        qf_diag(c, true, x->loc, "a default (*) is not in this stage (quad-ijx.10)");
-        break;
     case X_INTERP:
         qf_diag(c, true, x->loc, "string interpolation is not in this stage (quad-ijx.11)");
         break;
@@ -1530,7 +1593,7 @@ static void check_stage(Front *c, const X *x)
         check_stage(c, x->u.ar.a);
         check_stage(c, x->u.ar.b);
         break;
-    case X_NOT:
+    case X_NOT: case X_DEFAULT:
         check_stage(c, x->u.sub);
         break;
     case X_BOUND:
@@ -1556,6 +1619,27 @@ static int cmp_kindp(const void *a, const void *b)
 static int cmp_strp(const void *a, const void *b)
 {
     return strcmp(*(char *const *) a, *(char *const *) b);
+}
+
+/* The defaults that a type has, as sorted lines. */
+static void dump_defaults(const Front *f, Buf *b, const DefVec *v)
+{
+    VEC(char *) lines = { 0 };
+    for (size_t i = 0; i < v->n; i++) {
+        Buf l = { 0 };
+        qf_buf_puts(&l, "  default at ");
+        path_format(f, &l, v->v[i].path.v, v->v[i].path.n);
+        qf_buf_puts(&l, ": ");
+        qf_print(&l, v->v[i].value);
+        qf_buf_printf(&l, " from %s", f->types.v[v->v[i].contributor].name);
+        VEC_PUSH(lines, l.s);
+    }
+    if (lines.n) qsort(lines.v, lines.n, sizeof(char *), cmp_strp);
+    for (size_t i = 0; i < lines.n; i++) {
+        qf_buf_printf(b, "%s\n", lines.v[i]);
+        free(lines.v[i]);
+    }
+    VEC_FREE(lines);
 }
 
 /* The records of one owner, as sorted lines: the order in which a load met
@@ -1632,6 +1716,7 @@ void qf_dump(const Front *f, Buf *b)
         if (ti->expansion) qf_node_print(f, b, ti->expansion);
         qf_buf_putc(b, '\n');
         dump_records(f, b, &ti->ariths);
+        dump_defaults(f, b, &ti->defaults);
         dump_refs(f, b, &ti->refs);
     }
     for (uint32_t ft = 0; ft < f->feats.n; ft++) {
@@ -1755,6 +1840,280 @@ void qf_sort_diags(Front *f)
     if (f->diags.n) qsort(f->diags.v, f->diags.n, sizeof(Diag), cmp_diag);
 }
 
+/* --- defaults: the resolution (quad-ijx.10) ------------------------------------------------------------
+ *
+ * The method is Triangle's resolve_defaults. A default applies after every
+ * value is unified. For one path, the most specific defaults apply first: an
+ * instance's own, then those of the instances that it names, then those of
+ * the types, a subtype before its supertype. A default never changes a value.
+ * Defaults from types with no order between them that conflict do not apply,
+ * and a warning names them. A default that conflicts with one of those does
+ * not apply either. The result does not depend on the order of files or
+ * declarations. */
+
+static int cmp_path(const U32Vec *a, const U32Vec *b)
+{
+    size_t n = a->n < b->n ? a->n : b->n;
+    for (size_t i = 0; i < n; i++)
+        if (a->v[i] != b->v[i]) return a->v[i] < b->v[i] ? -1 : 1;
+    return a->n < b->n ? -1 : a->n > b->n;
+}
+
+/* The defaults of the type of each node, with full paths. A node that stands
+ * for the constraint of a recursive type gives the defaults of its type, and
+ * not those of its fields. */
+static void defaults_walk(const Front *f, const QfNode *n, U32Vec *path, U64Map *seen, DefVec *out)
+{
+    uint64_t k = (uint64_t) (uintptr_t) n;
+    if (u64map_get(seen, k, NULL)) return;       /* a shared node: its first path */
+    u64map_put(seen, k, 1);
+    const DefVec *v = &f->types.v[n->type].defaults;
+    for (size_t i = 0; i < v->n; i++) add_default(out, &v->v[i], path->v, path->n, v->v[i].contributor);
+    if (n->flags & NF_VALUE) return;
+    for (uint32_t i = 0; i < n->narcs; i++) {
+        VEC_PUSH(*path, n->arcs[i].feat);
+        defaults_walk(f, n->arcs[i].val, path, seen, out);
+        path->n--;
+    }
+}
+
+static void collect_defaults(const Front *f, const QfNode *root, const DefVec *own, DefVec *out)
+{
+    U32Vec path = { 0 };
+    U64Map seen = { 0 };
+    defaults_walk(f, root, &path, &seen, out);
+    VEC_FREE(path);
+    u64map_free(&seen);
+    for (size_t k = 0; own && k < own->n; k++) add_default(out, &own->v[k], NULL, 0, own->v[k].contributor);
+}
+
+/* A chain of nodes of the top type that has `value` at `path`. */
+static QfNode *wrap_path(QfOp *c, const U32Vec *path, QfNode *value)
+{
+    QfNode *n = value;
+    for (size_t i = path->n; i-- > 0 && n;) n = qf_build_struct(c, &c->scratch, c->f->top, &path->v[i], &n, 1);
+    return n;
+}
+
+/* Unifies `root` with each default at its path. Gives the new root in `out`,
+ * or NULL if they do not all fit. why: gets the reason, if a default does not
+ * fit. An error in the value of a default gives a diagnostic: check_defaults
+ * builds each value first, so the resolution meets no such error. */
+static QfNode *try_defaults(QfOp *c, QfNode *root, DefaultRec *const *ds, size_t n, QfStore *out, Buf *why)
+{
+    QfMark m = qf_arena_mark(c->scratch.arena);
+    uint32_t mn = c->scratch.n;
+    uint64_t saved = op_begin(c);
+    int saveddepth = c->depth;
+    bool savedfailed = c->failed;
+    Build b = { 0 };
+    b.c = c; b.ok = true; b.owner = QF_BOTTOM;
+    QfNode *r = NULL;
+    bool ok = true;
+    for (size_t i = 0; i < n && ok; i++) {
+        path_set(c, NULL, 0);
+        QfNode *v = build_raw(&b, ds[i]->value);
+        QfNode *w = v ? wrap_path(c, &ds[i]->path, v) : NULL;
+        if (!w) { ok = false; break; }
+        path_set(c, NULL, 0);
+        reset_failure(c);
+        ok = unify1(c, root, w);
+        if (!ok && why) failure_text(why, fail_info(c));
+    }
+    if (ok) {
+        bool closed;
+        r = copy_out(c, out, root, &closed);
+        if (!closed) r = NULL;
+    }
+    build_free(&b);
+    op_end(c, saved);
+    qf_arena_release(c->scratch.arena, m);
+    c->scratch.n = mn;
+    c->depth = saveddepth;
+    c->failed = savedfailed;
+    c->failfmt = false;
+    return r;
+}
+
+static const char *contributor_name(const Front *f, const DefaultRec *d)
+{
+    return d->contributor == QF_CONTRIB_INSTANCE ? "the instance" : d->contributor == QF_CONTRIB_NAMED ? d->who
+                                                                                                    : f->types.v[d->contributor].name;
+}
+
+/* a is strictly more specific than b */
+static bool more_specific(const Front *f, uint32_t a, uint32_t b)
+{
+    if (a == b) return false;
+    if (a == QF_CONTRIB_INSTANCE || b == QF_CONTRIB_INSTANCE) return a == QF_CONTRIB_INSTANCE;
+    if (a == QF_CONTRIB_NAMED || b == QF_CONTRIB_NAMED) return a == QF_CONTRIB_NAMED;
+    return is_subtype(f, a, b);
+}
+
+static int cmp_defptr(const void *a, const void *b)
+{
+    const DefaultRec *x = *(DefaultRec *const *) a, *y = *(DefaultRec *const *) b;
+    int d = cmp_path(&x->path, &y->path);
+    /* qsort is not stable: the records of one path keep the order of the collection */
+    return d ? d : (x > y) - (x < y);
+}
+
+/* The structure of an instance with its defaults. *count gets the number of
+ * defaults that the structure had. */
+static QfNode *resolve_defaults(QfOp *c, QfNode *root, const InstInfo *in, size_t *count)
+{
+    Front *f = c->f;
+    DefVec all = { 0 };
+    collect_defaults(f, root, &in->defaults, &all);
+    *count = all.n;
+    DefaultRec **order = qf_xmalloc(sizeof *order * (all.n ? all.n : 1));
+    for (size_t k = 0; k < all.n; k++) order[k] = &all.v[k];
+    if (all.n) qsort(order, all.n, sizeof *order, cmp_defptr);       /* by path, then as collected */
+
+    for (size_t g0 = 0, g1; g0 < all.n; g0 = g1) {
+        for (g1 = g0; g1 < all.n && cmp_path(&order[g1]->path, &order[g0]->path) == 0;) g1++;
+        size_t gn = g1 - g0, left = gn;
+        bool *done = qf_xmalloc(gn);
+        memset(done, 0, gn);
+        VEC(DefaultRec *) dropped = { 0 };
+        DefaultRec **ready = qf_xmalloc(sizeof *ready * gn), **compat = qf_xmalloc(sizeof *compat * gn);
+        while (left) {
+            /* the defaults that no default more specific waits before */
+            size_t nr = 0;
+            for (size_t a = 0; a < gn; a++) {
+                bool isready = !done[a];
+                for (size_t o = 0; o < gn && isready; o++)
+                    if (!done[o] && more_specific(f, order[g0 + o]->contributor, order[g0 + a]->contributor)) isready = false;
+                if (isready) ready[nr++] = order[g0 + a];
+            }
+            for (size_t a = 0; a < gn; a++)
+                for (size_t q = 0; q < nr; q++)
+                    if (order[g0 + a] == ready[q]) { done[a] = true; left--; }
+            /* A default that conflicts with a default that did not apply
+             * does not apply either. So a default that a more specific default
+             * overrides stays overridden. Triangle has this rule only for the
+             * more specific default. Then a supertype that states the value of
+             * one side of a conflict decides the conflict. */
+            size_t kept = 0;
+            for (size_t q = 0; q < nr; q++) {
+                bool overridden = false;
+                for (size_t k = 0; k < dropped.n && !overridden; k++) {
+                    DefaultRec *pair[2] = { ready[q], dropped.v[k] };
+                    overridden = !try_defaults(c, root, pair, 2, &f->store, NULL);
+                }
+                if (!overridden) ready[kept++] = ready[q];
+            }
+            nr = kept;
+            if (!nr) continue;
+            QfNode *res = try_defaults(c, root, ready, nr, &f->store, NULL);
+            if (res) { root = res; continue; }
+            /* not all together: a default that does not fit alone loses to a value */
+            size_t nc = 0;
+            for (size_t q = 0; q < nr; q++)
+                if (try_defaults(c, root, &ready[q], 1, &f->store, NULL)) compat[nc++] = ready[q];
+            if (nc == 1) {
+                root = try_defaults(c, root, compat, 1, &f->store, NULL);
+            } else if (nc > 1) {
+                Buf names = { 0 }, pth = { 0 };
+                const char **ns = qf_xmalloc(sizeof *ns * nc);       /* in the order of the names, not of the load */
+                for (size_t q = 0; q < nc; q++) ns[q] = contributor_name(f, compat[q]);
+                qsort(ns, nc, sizeof *ns, cmp_strp);
+                for (size_t q = 0; q < nc; q++) qf_buf_printf(&names, "%s%s", q ? ", " : "", ns[q]);
+                free(ns);
+                path_format(f, &pth, order[g0]->path.v, order[g0]->path.n);
+                qf_diag(f, false, in->decls.v[0]->loc, "%s: the defaults for %s from %s conflict, so none of them "
+                        "applies. Give %s a value", in->name, pth.s, names.s, pth.s);
+                for (size_t q = 0; q < nc; q++) VEC_PUSH(dropped, compat[q]);
+                qf_buf_free(&names);
+                qf_buf_free(&pth);
+            }
+        }
+        VEC_FREE(dropped);
+        free(done);
+        free(ready);
+        free(compat);
+    }
+    free(order);
+    free_defaults(&all);
+    return root;
+}
+
+/* An error for each default that can never apply: a default of a type that
+ * does not fit the field in that type, and a default of an instance that is
+ * not a value of its other alternative. */
+static void check_defaults(Front *f)
+{
+    QfOp *c = f->op;
+    QfStore *tmp = qf_store_new();
+    for (uint32_t t = 0; t < f->types.n; t++) {
+        for (size_t i = 0; i < f->types.v[t].defaults.n; i++) {
+            DefaultRec *d = &f->types.v[t].defaults.v[i];
+            if (d->contributor != t || !f->types.v[t].expansion) continue;
+            Buf why = { 0 }, pth = { 0 };
+            size_t errors = f->nerrors;
+            if (!try_defaults(c, f->types.v[t].expansion, &d, 1, tmp, &why) && f->nerrors == errors) {
+                path_format(f, &pth, d->path.v, d->path.n);
+                qf_diag(f, true, d->value->loc, "%s: the default for %s can never apply: %s", f->types.v[t].name, pth.s,
+                        why.s ? why.s : "its type does not allow the value");
+            }
+            qf_buf_free(&why);
+            qf_buf_free(&pth);
+        }
+    }
+    for (uint32_t i = 0; i < f->insts.n; i++) {
+        for (size_t k = 0; k < f->insts.v[i].defaults.n; k++) {
+            DefaultRec *d = &f->insts.v[i].defaults.v[k];
+            if (d->contributor != QF_CONTRIB_INSTANCE) continue;
+            /* against its other alternative only: a value of the instance can
+             * make the default lose, and that is not an error */
+            QfMark m = qf_arena_mark(c->scratch.arena);
+            uint32_t mn = c->scratch.n;
+            uint64_t saved = op_begin(c);
+            Build b = { 0 };
+            b.c = c; b.ok = true; b.owner = QF_BOTTOM;
+            path_set(c, NULL, 0);
+            QfNode *v = build_raw(&b, d->value), *r = v && d->rest ? build_raw(&b, d->rest) : NULL;
+            reset_failure(c);
+            if (r && !unify1(c, r, v)) {
+                Buf pth = { 0 };
+                path_format(f, &pth, d->path.v, d->path.n);
+                qf_diag(f, true, d->value->loc, "%s: the default for %s can never apply: %s", f->insts.v[i].name, pth.s,
+                        fail_info(c)->text);
+                qf_buf_free(&pth);
+            }
+            build_free(&b);
+            op_end(c, saved);
+            qf_arena_release(c->scratch.arena, m);
+            c->scratch.n = mn;
+            c->depth = 0;
+            c->failed = false;
+            c->failfmt = false;
+        }
+    }
+    qf_store_free(tmp);
+}
+
+/* Gives each instance its structure with defaults. A default can give a
+ * node a type with defaults of its own, so the step repeats while the
+ * structure gets more defaults. */
+static void apply_defaults(Front *f)
+{
+    for (uint32_t i = 0; i < f->insts.n; i++) {
+        if (f->insts.v[i].pstate != 2 || !f->insts.v[i].pattern) continue;
+        QfNode *root = f->insts.v[i].pattern;
+        size_t had = 0, has = 0;
+        for (int round = 0; round < 64; round++) {
+            root = resolve_defaults(f->op, root, &f->insts.v[i], &had);
+            DefVec now = { 0 };
+            collect_defaults(f, root, &f->insts.v[i].defaults, &now);
+            has = now.n;
+            free_defaults(&now);
+            if (has <= had) break;
+        }
+        f->insts.v[i].node = root;
+    }
+}
+
 static bool resolve(Front *c)
 {
     size_t errors0 = c->nerrors;
@@ -1770,6 +2129,9 @@ static bool resolve(Front *c)
     for (uint32_t t = 0; t < c->types.n; t++) type_expansion(c->op, t);
     for (uint32_t i = 0; i < c->insts.n; i++) inst_build(c->op, i);
     if (c->nerrors > errors0) return false;
+    check_defaults(c);
+    if (c->nerrors > errors0) return false;
+    apply_defaults(c);
     Buf b = { 0 };
     qf_dump(c, &b);
     c->hash = qf_fnv1a(0xcbf29ce484222325ULL, b.s, b.len);

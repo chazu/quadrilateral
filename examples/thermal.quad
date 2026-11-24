@@ -30,7 +30,9 @@
     hot:  #ThermalPort
     cold: #ThermalPort
     conductance: %conductance
-    tolerance:   %ratio
+    // the length of a step, as a part of the time constant of the two rooms.
+    // An instance can give another value. The default is 1 percent.
+    tolerance:   *1pct | %ratio
     evaluator:   "native.conduction"
     // the power through the wall, for the reader: the kernel does not need it
     power: %energy / %time

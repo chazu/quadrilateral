@@ -324,6 +324,8 @@ void qf_free(Front *f)
         VEC_FREE(ti->decls);
         VEC_FREE(ti->members);
         free_records(&ti->ariths);
+        for (size_t k = 0; k < ti->defaults.n; k++) VEC_FREE(ti->defaults.v[k].path);
+        VEC_FREE(ti->defaults);
         qf_refs_free(&ti->refs);
     }
     VEC_FREE(f->types);
@@ -337,6 +339,8 @@ void qf_free(Front *f)
         for (size_t k = 0; k < in->tags.n; k++) VEC_FREE(in->tags.v[k].path);
         VEC_FREE(in->tags);
         free_records(&in->ariths);
+        for (size_t k = 0; k < in->defaults.n; k++) VEC_FREE(in->defaults.v[k].path);
+        VEC_FREE(in->defaults);
         qf_refs_free(&in->refs);
     }
     VEC_FREE(f->insts);

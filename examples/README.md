@@ -78,6 +78,14 @@ time [s]    living.temperature [K]  cellar.temperature [K]  wall.power [W]
 1800                   ~298.284165             ~298.015834          ~2.683
 ```
 
+The wall has a setting of its kernel, `tolerance`. The type gives it a default with `*`, so an instance does not state it:
+
+```
+tolerance: *1pct | %ratio
+```
+
+An instance that states `tolerance: 5pct` gets that value. A default never changes a value.
+
 ## thermal.quad and house.quad: several phenomena
 
 Three rooms in a row and the air outside, with three walls. The same types as the two rooms, in a second file.

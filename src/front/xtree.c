@@ -72,6 +72,16 @@ bool x_numeric_or(X *x)
     return ok;
 }
 
+/* `*d | rest`: a disjunction of one default and one other alternative. */
+bool x_default_rest(X *x)
+{
+    XPtrVec ds = { 0 };
+    x_flatten(x, X_OR, &ds);
+    bool ok = ds.n == 2 && (ds.v[0]->k == X_DEFAULT) != (ds.v[1]->k == X_DEFAULT);
+    VEC_FREE(ds);
+    return ok;
+}
+
 /* A disjunction of text: `text` itself among the alternatives, the rest
  * string literals or regular expressions, which it covers. The hull is
  * `text`, so it is no disjunction of structures. */
