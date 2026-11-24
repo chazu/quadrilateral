@@ -1320,6 +1320,321 @@ void test_elab_defaults(void)
 #undef EASY
 }
 
+/* An interaction with a rate moves a stock over time, with no kernel in C
+ * (ADR 0020). The four acceptance tests of the ADR are here. */
+static QIr *compile_alone(const char *text)
+{
+    const char *name = "alone.quad";
+    char *diag = NULL;
+    QIr *ir = qi_compile(&name, &text, 1, NULL, &diag);
+    CHECK(ir != NULL);
+    if (!ir) fprintf(stderr, "%s", diag);
+    free(diag);
+    return ir;
+}
+
+#define SECONDS(t) ((int64_t) (t) * 1000000)
+#define ROOMS2                                                         \
+    "r: #LumpedRoom & { temperature: 300K, capacity: 1000J/K }\n"      \
+    "s: #LumpedRoom & { temperature: 300K, capacity: 1000J/K }\n"
+#define HEATER                                                                             \
+    "#H: #Phenomenon & { room: #ThermalPort, p: %energy / %time,\n"                        \
+    "    heat: #Interaction & { sink: .room.energy, rate: .p, conserved: false } }\n"
+
+void test_elab_interactions(void)
+{
+    /* 1. a heater of 1500 W gives a room exactly 1500 J more for each second */
+    QIr *ir = compile(ROOMS2 HEATER "h: #H & { room: r.west, p: 1500W }\n", NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        /* the rate has no kind: it gets the scale of its stock with 6 more decimals */
+        HAS(text, "  cell h.heat.tolerance: %ratio = 0.01\n"
+                  "  cell h.p: dim[m^2 kg s^-3]@-9 = 1500\n"
+                  "  alias h.heat.rate = h.p\n");
+        HAS(text, "  kernel K0, at a boundary: native.rate\n"
+                  "    in p = h.p\n"
+                  "    in heat.tolerance = h.heat.tolerance\n"
+                  "    link room.energy = r.energy\n"
+                  "    transfer heat: nothing -> r.energy, at the rate h.p, with the tolerance h.heat.tolerance\n");
+        HAS(text, "  h.p: read by K0\n");
+        HAS(text, "  r.energy: narrowed by P0; transferred by K0\n");
+        /* the source, the sink and the flag of an interaction are not cells */
+        CHECK(!strstr(text, "h.heat.sink") && !strstr(text, "h.heat.source") && !strstr(text, "h.heat.conserved"));
+        free(text);
+        QWorld *w = build(ir, 1), *again = build(ir, 1);
+        if (w && again) {
+            const int times[] = { 0, 1, 7, 60, 61, 3600 };
+            for (size_t i = 0; i < sizeof times / sizeof times[0]; i++) {
+                OK(qw_run(w, SECONDS(times[i])));
+                OK(qw_run(again, SECONDS(times[i])));
+                CHECK_I64(qw_get(w, "r.energy").lo, 300000000 + (int64_t) 1500000 * times[i]);
+                CHECK(qw_hash(w) == qw_hash(again));                   /* 4. the same hash at each time */
+            }
+            CHECK_I64(qw_get(w, "s.energy").lo, 300000000);            /* the other room keeps its energy */
+        }
+        qw_free(w);
+        qw_free(again);
+    }
+    qi_free(ir);
+    /* one rate for two interactions is one slot of the kernel: each room gets the power */
+    ir = compile(ROOMS2 "#Two: #Phenomenon & { a: #ThermalPort, b: #ThermalPort, p: %energy / %time,\n"
+                        "    one: #Interaction & { sink: .a.energy, rate: .p, conserved: false }\n"
+                        "    two: #Interaction & { sink: .b.energy, rate: .p, conserved: false } }\n"
+                        "h: #Two & { a: r.west, b: s.west, p: 10W }\n", NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  kernel K0, at a boundary: native.rate\n"
+                  "    in p = h.p\n"
+                  "    in one.tolerance = h.one.tolerance\n"
+                  "    link a.energy = r.energy\n"
+                  "    in two.tolerance = h.two.tolerance\n"
+                  "    link b.energy = s.energy\n"
+                  "    transfer one: nothing -> r.energy, at the rate h.p, with the tolerance h.one.tolerance\n"
+                  "    transfer two: nothing -> s.energy, at the rate h.p, with the tolerance h.two.tolerance\n");
+        free(text);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, SECONDS(100)));
+            CHECK_I64(qw_get(w, "r.energy").lo, 300000000 + 1000000);
+            CHECK_I64(qw_get(w, "s.energy").lo, 300000000 + 1000000);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+    /* a negative rate takes the quantity out */
+    ir = compile(ROOMS2 HEATER "h: #H & { room: r.west, p: -100W }\n", NULL);
+    if (ir) {
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, SECONDS(50)));
+            CHECK_I64(qw_get(w, "r.energy").lo, 300000000 - 5000000);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+    /* a rate with a kind keeps the scale of the kind */
+    ir = compile(ROOMS2 "%power: { dimension: \"W\", scale: -2 }\n"
+                 "#H: #Phenomenon & { room: #ThermalPort, p: %power,\n"
+                 "    heat: #Interaction & { sink: .room.energy, rate: .p, conserved: false, tolerance: 5pct } }\n"
+                 "h: #H & { room: r.west, p: 2W }\n", NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  cell h.heat.tolerance: %ratio = 0.05\n  cell h.p: %power = 2\n");
+        free(text);
+    }
+    qi_free(ir);
+    /* a rate with no value and no law: the run stops, and the message names the interaction */
+    ir = compile(ROOMS2 HEATER "h: #H & { room: r.west }\n", NULL);
+    if (ir) {
+        QWorld *w = build(ir, 1);
+        if (w) {
+            CHECK(qw_run(w, SECONDS(1)) == QW_EKERNEL);
+            HAS(qw_error(w), "h: kernel 'native.rate' failed in predict: the rate of the interaction heat has no bound: a "
+                             "law or a value must give it");
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* 2. a tank that leaks in proportion to its volume follows the exponential within the tolerance.
+     * The law reads `.volume`, and the same value stands at `leak.source` */
+    static const char tank[] =
+        "%volume: { dimension: \"m^3\", scale: -9, conserved: true }\n"
+        "#Tank: #Phenomenon & {\n"
+        "    volume:  %volume & >=0m^3\n"
+        "    empties: %time\n"
+        "    outflow: %volume / %time\n"
+        "    speed:   .outflow == .volume / .empties\n"
+        "    leak:    #Interaction & { source: .volume, rate: .outflow, conserved: false }\n"
+        "}\n"
+        "tank: #Tank & { volume: 2m^3, empties: 600s }\n";
+    ir = compile_alone(tank);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "kind dim[m^3 s^-1]@-15: m^3 s^-1, scale -15, anonymous\n");
+        HAS(text, "    stock volume = tank.volume\n"
+                  "    transfer leak: tank.volume -> nothing, at the rate tank.outflow, with the tolerance "
+                  "tank.leak.tolerance\n");
+        free(text);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            for (int t = 600; t <= 6000; t += 600) {
+                OK(qw_run(w, SECONDS(t)));
+                double exact = 2.0 * exp(-(double) t / 600.0), got = (double) qw_get(w, "tank.volume").lo * 1e-9;
+                CHECK(fabs(got - exact) <= 0.01 * (t / 600) * exact && got > 0);
+            }
+            OK(qw_run(w, SECONDS(60000)));                             /* 100 time constants: the bound >= 0 holds */
+            CHECK(qw_get(w, "tank.volume").lo >= 0 && qw_get(w, "tank.volume").lo < 1000);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+    /* two interactions on one stock are one kernel: an inflow and the leak come to inflow × empties */
+    ir = compile_alone(
+        "%volume: { dimension: \"m^3\", scale: -9, conserved: true }\n"
+        "#Tank: #Phenomenon & {\n"
+        "    volume: %volume, empties: %time, inflow: %volume / %time, outflow: %volume / %time\n"
+        "    speed: .outflow == .volume / .empties\n"
+        "    fill: #Interaction & { sink: .volume, rate: .inflow, conserved: false }\n"
+        "    leak: #Interaction & { source: .volume, rate: .outflow, conserved: false }\n"
+        "}\n"
+        "tank: #Tank & { volume: 0m^3, empties: 100s, inflow: 0.002m^3/s }\n");
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  kernel K0, at a boundary: native.rate\n"
+                  "    in inflow = tank.inflow\n"
+                  "    in fill.tolerance = tank.fill.tolerance\n"
+                  "    stock volume = tank.volume\n"
+                  "    in outflow = tank.outflow\n"
+                  "    in leak.tolerance = tank.leak.tolerance\n"
+                  "    transfer fill: nothing -> tank.volume, at the rate tank.inflow, with the tolerance tank.fill.tolerance\n"
+                  "    transfer leak: tank.volume -> nothing, at the rate tank.outflow, with the tolerance tank.leak.tolerance\n");
+        free(text);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, SECONDS(2000)));                              /* 20 time constants */
+            CHECK(llabs(qw_get(w, "tank.volume").lo - 200000000) <= 2000000);      /* 0.2 m^3, within 1 % */
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+    /* a stock can be the rate of another interaction: the speed of a body is the rate of its height */
+    ir = compile_alone(
+        "%position: { dimension: \"m\", scale: -6, conserved: true }\n"
+        "%speed: { dimension: \"m/s\", scale: -6, conserved: true }\n"
+        "#Body: #Phenomenon & {\n"
+        "    height: %position, speed: %speed, g: %speed / %time\n"
+        "    fall: #Interaction & { sink: .speed, rate: .g, conserved: false }\n"
+        "    move: #Interaction & { sink: .height, rate: .speed, conserved: false }\n"
+        "}\n"
+        "ball: #Body & { height: 0m, speed: 0m/s, g: 9.81m/s^2 }\n");
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "    stock speed = ball.speed\n");                   /* one slot: a stock that the kernel also reads */
+        CHECK(!strstr(text, "    in speed = ball.speed\n"));
+        free(text);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, SECONDS(10)));
+            CHECK_I64(qw_get(w, "ball.speed").lo, 98100000);           /* exact: 9.81 m/s^2 × 10 s */
+            CHECK(llabs(qw_get(w, "ball.height").lo - 490500000) <= 4905000);      /* 490.5 m, within 1 % */
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* 3. a wall with an interaction and a law for the rate gives the result of native.conduction within the
+     * tolerance, and the sum of the two energies stays exactly the same */
+#define WARM                                                                   \
+    "roomA: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n"      \
+    "roomB: #LumpedRoom & { temperature: 293.15K, capacity: 10000J/K }\n"
+    ir = compile(WARM
+                 "#SoftWall: #Phenomenon & { hot: #ThermalPort, cold: #ThermalPort, conductance: %conductance,\n"
+                 "    power: %energy / %time\n"
+                 "    flow: .power == .conductance * (.hot.temperature - .cold.temperature)\n"
+                 "    heat: #Interaction & { source: .hot.energy, sink: .cold.energy, rate: .power } }\n"
+                 "wall: #SoftWall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K }\n", NULL);
+    QIr *native = compile(WARM "wall: #ConductiveWall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, "
+                               "tolerance: 0.01 }\n", NULL);
+    if (ir && native) {
+        char *text = qi_text(ir);
+        HAS(text, "    transfer heat: roomA.energy -> roomB.energy, conserved, at the rate wall.power, with the tolerance "
+                  "wall.heat.tolerance\n");
+        free(text);
+        QWorld *w = build(ir, 1), *n = build(native, 1);
+        if (w && n) {
+            for (int t = 500; t <= 3000; t += 500) {
+                OK(qw_run(w, SECONDS(t)));
+                OK(qw_run(n, SECONDS(t)));
+                int64_t a = qw_get(w, "roomA.energy").lo, b = qw_get(w, "roomB.energy").lo;
+                CHECK_I64(a + b, 3031500000 + 2931500000);
+                int64_t moved = 3031500000 - qw_get(n, "roomA.energy").lo;
+                CHECK(llabs(a - qw_get(n, "roomA.energy").lo) <= moved / 100);
+            }
+            CHECK(qw_get(w, "roomA.energy").lo > qw_get(w, "roomB.energy").lo);    /* it does not go past the balance */
+        }
+        qw_free(w);
+        qw_free(n);
+    }
+    qi_free(ir);
+    qi_free(native);
+    /* an interaction with no rate states the transfer of a native kernel: the kernel moves the heat (quad-ijx.4) */
+    ir = compile(WARM "#Said: #ConductiveWall & { heat: #Interaction & { source: .hot.energy, sink: .cold.energy } }\n"
+                 "wall: #Said & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 0.01 }\n", NULL);
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  kernel K0, at a boundary: native.conduction\n");
+        CHECK(!strstr(text, "native.rate"));
+        free(text);
+    }
+    qi_free(ir);
+
+    /* errors: each names the interaction and says what to write */
+#define P "p: %energy / %time, "
+#define PH(body, inst) ROOMS2 "#H: #Phenomenon & { room: #ThermalPort, " body " }\n" inst "\n"
+    HAS(compile_error(PH("heat: #Interaction & { sink: .room.energy, conserved: false }", "h: #H & { room: r.west }")),
+        "h.heat has no rate, and h names no evaluator: nothing moves the quantity. Give the interaction a rate, as in "
+        "`rate: .power`");
+    HAS(compile_error(PH(P "heat: #Interaction & { sink: .room.energy, rate: .p, conserved: false }, "
+                           "evaluator: \"native.conduction\"", "h: #H & { room: r.west, p: 1W }")),
+        "h.heat has a rate, and h names the evaluator \"native.conduction\": a phenomenon moves its quantities with rates "
+        "or with a kernel, and not with both");
+    HAS(compile_error(PH("heat: #Interaction & { sink: .room.energy, rate: \"fast\", conserved: false }",
+                         "h: #H & { room: r.west }")),
+        "the rate of h.heat must be a quantity: the amount for each second");
+    HAS(compile_error(PH("heat: #Interaction & { sink: .room.energy, rate: .room.capacity, conserved: false }",
+                         "h: #H & { room: r.west }")),
+        "the rate and the tolerance of h.heat must be fields of h: give h a field with a law for the rate");
+    HAS(compile_error(PH(P "heat: #Interaction & { sink: 5J, rate: .p, conserved: false }", "h: #H & { room: r.west, p: 1W }")),
+        "the sink of h.heat must be a path to a stock, as in `sink: .energy`");
+    HAS(compile_error(PH(P "heat: #Interaction & { source: \"tank\", rate: .p, conserved: false }",
+                         "h: #H & { room: r.west, p: 1W }")),
+        "the source of h.heat must be a path to a stock, as in `source: .energy`");
+    HAS(compile_error(PH(P "heat: #Interaction & { sink: .room.capacity, rate: .p, conserved: false }",
+                         "h: #H & { room: r.west, p: 1W }")),
+        "the sink of h.heat is r.capacity, which is not a stock: an interaction moves a quantity of a kind with "
+        "`conserved: true`");
+    HAS(compile_error(PH(P "heat: #Interaction & { sink: .room.energy, rate: .p, conserved: false }", "h: #H & { p: 1W }")),
+        "the sink of h.heat goes through the port h.room, which is not connected");
+    HAS(compile_error(PH(P "heat: #Interaction & { rate: .p }", "h: #H & { room: r.west, p: 1W }")),
+        "h.heat has no source and no sink: an interaction moves a stock, as in `sink: .energy`");
+    HAS(compile_error(PH(P "heat: #Interaction & { source: .room.energy, sink: .room.energy, rate: .p }",
+                         "h: #H & { room: r.west, p: 1W }")),
+        "the source and the sink of h.heat are the same stock, r.energy");
+    HAS(compile_error(PH(P "q: %charge, heat: #Interaction & { source: .q, sink: .room.energy, rate: .p }",
+                         "%charge: { dimension: \"C\", conserved: true }\nh: #H & { room: r.west, p: 1W, q: 1C }")),
+        "h.heat moves h.q to r.energy, and they have different kinds, %charge and %energy: a quantity keeps its kind");
+    HAS(compile_error(PH(P "b: #ThermalPort, heat: #Interaction & { source: .room.energy, sink: .b.energy, rate: .p, "
+                           "conserved: false }", "h: #H & { room: r.west, b: s.west, p: 1W }")),
+        "h.heat has a source and a sink, so it conserves the quantity: remove `conserved: false`");
+    HAS(compile_error(PH(P "heat: #Interaction & { sink: .room.energy, rate: .p }", "h: #H & { room: r.west, p: 1W }")),
+        "h.heat has a sink and no source: the quantity then comes from outside the world, or goes there. If that is the "
+        "intent, write `conserved: false`. If not, give the source");
+    HAS(compile_error(PH(P "heat: #Interaction & { source: .room.energy, rate: .p }", "h: #H & { room: r.west, p: 1W }")),
+        "h.heat has a source and no sink: the quantity then comes from outside the world, or goes there. If that is the "
+        "intent, write `conserved: false`. If not, give the sink");
+    HAS(compile_error(PH("p: %energy, heat: #Interaction & { sink: .room.energy, rate: .p, conserved: false }",
+                         "h: #H & { room: r.west, p: 1J }")),
+        "the rate of h.heat is h.p, in J, and the stock r.energy is in J: the rate must be the quantity for each second, "
+        "in W");
+    /* each interaction reports its own error */
+    const char *two = compile_error(PH(P "one: #Interaction & { sink: .room.energy, rate: .p }, "
+                                         "two: #Interaction & { rate: .p }, "
+                                         "three: #Interaction & { sink: .room.energy, rate: \"fast\" }, "
+                                         "zero: #Interaction & { sink: .room.energy, rate: \"slow\" }",
+                                       "h: #H & { room: r.west, p: 1W }"));
+    HAS(two, "h.one has a sink and no source");
+    HAS(two, "h.two has no source and no sink");
+    HAS(two, "the rate of h.three must be a quantity");
+    HAS(two, "the rate of h.zero must be a quantity");
+#undef P
+#undef PH
+#undef WARM
+}
+#undef SECONDS
+#undef ROOMS2
+#undef HEATER
+
 static const char *alone_error(const char *text)
 {
     static char out[4096];

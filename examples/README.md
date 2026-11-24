@@ -99,3 +99,60 @@ time [s]    kitchen.temperature [K]  hall.temperature [K]  bedroom.temperature [
 14400                   ~276.642967           ~276.338011              ~275.893888          ~10.973
 21600                   ~274.510498           ~274.391747              ~274.218804           ~4.273
 ```
+
+## thermal.quad and heater.quad: a flow with no kernel in C
+
+A heater in a room, and a wall to the air outside. The heater is an interaction with a rate: it moves energy into the room at the rate `power`. No kernel in C is necessary.
+
+```
+#Heater: #Phenomenon & {
+    room:  #ThermalPort
+    power: %energy / %time
+    heat:  #Interaction & { sink: .room.energy, rate: .power, conserved: false }
+}
+```
+
+The energy comes from outside the world, so the interaction says `conserved: false`. Without it, the compile gives an error: a forgotten `source` must not make energy from nothing.
+
+```
+$ build/quad run examples/thermal.quad examples/heater.quad --until 6h --every 1h \
+      --show living.temperature,wall.power
+time [s]    living.temperature [K]  wall.power [W]
+0                           283.15             500
+3600                   ~299.875038       ~1336.065
+7200                   ~302.619355       ~1473.025
+10800                  ~303.073338       ~1495.456
+14400                  ~303.152208        ~1499.13
+18000                  ~303.169641       ~1499.732
+21600                  ~303.177011        ~1499.83
+```
+
+The room comes to the temperature where the wall loses the 1500 W of the heater: 30 K above the air outside.
+
+## tank.quad: a rate that a law gives
+
+A tank with a tap and a leak. The tap has a constant rate. A law gives the rate of the leak from the volume, so a fuller tank leaks faster.
+
+```
+speed: .outflow == .volume / .empties
+tap:   #Interaction & { sink: .volume, rate: .inflow, conserved: false }
+leak:  #Interaction & { source: .volume, rate: .outflow, conserved: false }
+```
+
+```
+$ build/quad run examples/tank.quad --until 20min --every 2min --show tank.volume,tank.outflow
+time [s]    tank.volume [m^3]  tank.outflow [m^3 s^-1]
+0                           0                        0
+120               0.140092738            0.00140092738
+240               0.182503146            0.00182503146
+360               0.195277914            0.00195277914
+480               0.198991953            0.00198991953
+600                0.19993646             0.0019993646
+720               0.199989867            0.00199989867
+840               0.200002027            0.00200002027
+960               0.199999594            0.00199999594
+1080              0.200000081            0.00200000081
+1200              0.199999984            0.00199999984
+```
+
+The level comes to the inflow times the time constant: 0.002 m^3/s × 100 s = 0.2 m^3. Each interaction has a `tolerance` with the default 1 %. A smaller tolerance gives shorter steps and a smaller error.

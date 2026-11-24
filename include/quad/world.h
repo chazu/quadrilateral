@@ -102,6 +102,9 @@ QwStatus qw_find(const QWorld *w, const char *path, QnCell *out);
 const char *qw_cell_path(const QWorld *w, QnCell c);
 QwStatus qw_connect(QWorld *w, QwPhen p, const char *port, const char *target);
 QwStatus qw_attach(QWorld *w, QwPhen p, const QkKernel *k);
+/* Gives a generated kernel to the world: qw_free calls free_kernel(k). The
+ * world does not attach it: call qw_attach also. */
+QwStatus qw_adopt_kernel(QWorld *w, QkKernel *k, void (*free_kernel)(QkKernel *));
 
 /* --- models (ADR 0010) ----------------------------------------------------------- */
 

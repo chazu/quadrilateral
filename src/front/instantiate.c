@@ -2,6 +2,7 @@
 #include <stdio.h>
 
 #include "front/front.h"
+#include "quad/kernels.h"
 
 /* Builds a world from an IR, through the C API of quad/world.h (ADR 0011
  * section 3, step 4). Each call is made in the order of the IR, so two
@@ -46,6 +47,38 @@ static char *world_name(const char *name, char **taken, uint32_t ntaken)
         b.s[stem] = 0;
         qf_buf_printf(&b, "_%u", k);
     }
+}
+
+/* The kernel native.rate for the transfers of a kernel use (ADR 0020): one
+ * slot for each bind, with the quantity type of its cell. NULL without memory. */
+static QkKernel *rate_kernel(const QIr *ir, const QiKernelUse *ku)
+{
+    QkSlot *slots = calloc(ku->nbinds ? ku->nbinds : 1, sizeof *slots);
+    QkRateTransfer *moves = calloc(ku->ntransfers, sizeof *moves);
+    QkKernel *k = NULL;
+    if (slots && moves) {
+        for (uint32_t b = 0; b < ku->nbinds; b++) {
+            const QiKind *kind = &ir->kinds[ir->cells[ku->binds[b].cell].kind];
+            slots[b] = (QkSlot) { ku->binds[b].slot, ku->binds[b].role, kind->dimension, kind->scale, { Q_NINF, Q_INF } };
+        }
+        for (uint32_t t = 0; t < ku->ntransfers; t++) {
+            const QiTransfer *tr = &ku->transfers[t];
+            uint32_t ends[4] = { tr->rate, tr->tolerance, tr->from, tr->to }, at[4] = { QK_NONE, QK_NONE, QK_NONE, QK_NONE };
+            for (int e = 0; e < 4; e++)
+                for (uint32_t b = 0; b < ku->nbinds && ends[e] != QI_NONE; b++)
+                    if (ku->binds[b].cell == ends[e]) at[e] = b;
+            moves[t] = (QkRateTransfer) { tr->name, at[0], at[1], at[2], at[3] };
+            /* the kernel reads the tolerance as a part of one, in units of 10^-9 */
+            if (at[1] != QK_NONE) {
+                slots[at[1]].scale = -9;
+                slots[at[1]].valid = (QInterval) { 1, 1000000000 };
+            }
+        }
+        k = qk_rate_new(slots, ku->nbinds, moves, ku->ntransfers);
+    }
+    free(slots);
+    free(moves);
+    return k;
 }
 
 QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWorld **out, char **error)
@@ -123,6 +156,14 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
         if (ir->ports[i].state == QI_PORT_CONNECTED)
             s = qw_connect(w, phens[ir->ports[i].phen], ir->ports[i].name, ir->ports[i].target);
     for (uint32_t i = 0; i < ir->nkernels && !s; i++) {
+        if (ir->kernels[i].ntransfers && ir->kernels[i].transfers[0].rate != QI_NONE) {
+            /* interactions with a rate: the kernel comes from the IR, and the world frees it */
+            QkKernel *k = rate_kernel(ir, &ir->kernels[i]);
+            s = k ? qw_adopt_kernel(w, k, qk_rate_free) : QW_ENOMEM;
+            if (s && k) qk_rate_free(k);
+            if (!s) s = qw_attach(w, phens[ir->kernels[i].phen], k);
+            continue;
+        }
         const QkKernel *k = qi_find_kernel(opt, ir->kernels[i].kernel);
         if (!k) {
             Buf b = { 0 };
