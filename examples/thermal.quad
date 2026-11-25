@@ -34,6 +34,8 @@
     // An instance can give another value. The default is 1 percent.
     tolerance:   *1pct | %ratio
     evaluator:   "native.conduction"
+    // what the kernel moves. The compile checks this statement against the kernel
+    heat: #Interaction & { source: .hot.energy, sink: .cold.energy }
     // the power through the wall, for the reader: the kernel does not need it
     power: %energy / %time
     flow:  .power == .conductance * (.hot.temperature - .cold.temperature)

@@ -1106,7 +1106,16 @@ void test_detail_stated_transfers(void)
         ir = compile_with(cases[i].src, cases[i].vent ? &opt : NULL, &diag);
         CHECK(ir == NULL);
         HAS(diag, cases[i].message);
+        /* one statement gives one error */
+        const char *first = strstr(diag, "error: ");
+        CHECK(first && !strstr(first + 1, "error: "));
         free(diag);
         qi_free(ir);
     }
+    /* a kernel with an error of its own: the statement gives no second error */
+    HAS(compile_error("#Odd: #Wall & { evaluator: \"native.nothing\", heat: #Interaction & { source: .hot.energy, sink: .cold.energy } }\n"
+                      "roomA: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n"
+                      "roomB: #LumpedRoom & { temperature: 293.15K, capacity: 10000J/K }\n"
+                      "wall: #Odd & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 1pct }\n"),
+        "world.quad:4:1: error: wall: unknown evaluator \"native.nothing\"\n");
 }

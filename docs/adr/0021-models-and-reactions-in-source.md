@@ -173,3 +173,11 @@ This example sends the heat straight to the room. If the model includes a stove 
 - **The tool can switch.** `quad run --switch study=fine@5min` switches at a time, with the map that the content gives. `examples/detail-room.quad` shows it.
 - A value that two models share has its cell in one model: the one with the first path. An interaction of the other model cannot move it. We know no use for such a value.
 
+### An interaction with no rate (`quad-ijx.4.2`)
+
+- **The check.** An interaction with no rate states one transfer of the kernel that its phenomenon or its model names. The kernel must make a transfer between the two stocks, in that direction, with the same flag `conserved`. If not, the error lists the transfers of the kernel. Two interactions cannot state one transfer.
+- **The IR names the statement.** Each transfer of a kernel has the path of the interaction that states it, or none. The text form shows it: `transfer heat: roomA.energy -> roomB.energy, conserved, stated by wall.heat`.
+- **The inspection.** `quad transfers FILE...` lists each transfer of each kernel: the stocks, the flag, and the statement. A transfer that source does not state is in the list. `quad ir` shows the same data.
+- An interaction with no rate has no cell for its `tolerance`, because nothing reads it.
+- A transfer through the port of the active model shows the stock of the model at the start. The fix is a line for each model, as `quad ir` has for a slot. Time: with the EXPLAIN work, `quad-5xe.3`.
+
