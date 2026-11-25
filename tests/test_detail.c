@@ -1265,3 +1265,42 @@ void test_reaction_errors(void)
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) HAS(compile_error(cases[i].src), cases[i].message);
 }
+
+/* More cases of reactions and models that a mutation round found. */
+void test_reaction_more(void)
+{
+    /* each flow reports its own error */
+    const char *two = compile_error(FIRE("#Burn & { rate: .burning, fuel: { source: .wood, rate: .burning }, heat: { sink: .room.energy } }"));
+    HAS(two, "error: fire.burn.fuel is a flow of the reaction fire.burn, and it has a rate");
+    HAS(two, "error: fire.burn.heat is a flow of the reaction fire.burn, and it has no ratio");
+
+    /* two flows with a number as the ratio, on stocks with different scales: the rate has the finer scale */
+    QIr *ir = compile(MASS "%grain: { dimension: \"kg\", scale: -3, conserved: true }\n"
+                      "#Sift: #Reaction & { fine: #Interaction & { ratio: 1, conserved: false },\n"
+                      "                     coarse: #Interaction & { ratio: 2, conserved: false } }\n"
+                      "#Mill: #Phenomenon & { flour: %mass, bran: %grain, speed: %mass / %time,\n"
+                      "  sift: #Sift & { rate: .speed, fine: { sink: .flour }, coarse: { sink: .bran } } }\n"
+                      "mill: #Mill & { flour: 0kg, bran: 0kg, speed: 1g/s }\n");
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  cell mill.speed: dim[kg s^-1]@-12 = 0.001\n");
+        free(text);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 1000 * SEC));
+            CHECK_I64(stock(w, "mill.flour"), 1000000);                    /* 1 kg, in mg */
+            CHECK_I64(stock(w, "mill.bran"), 2000);                        /* 2 kg, in g */
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* a stock of a model that is not active at the start: a range from zero is a value also */
+    HAS(compile_error(ROOM("#DetailRoom") "r: { fine: { c1: { energy: >= 0J } } }\n"),
+        "error: r.fine.c1.energy has a value, and its model fine is not active at the start");
+    HAS(compile_error(ROOM("#DetailRoom") "r: { fine: { c1: { energy: <= 0J } } }\n"),
+        "error: r.fine.c1.energy has a value, and its model fine is not active at the start");
+    /* and zero is no error */
+    ir = compile(ROOM("#DetailRoom") "r: { fine: { c1: { energy: 0J } } }\n");
+    qi_free(ir);
+}

@@ -181,3 +181,26 @@ This example sends the heat straight to the room. If the model includes a stove 
 - An interaction with no rate has no cell for its `tolerance`, because nothing reads it.
 - A transfer through the port of the active model shows the stock of the model at the start. The fix is a line for each model, as `quad ir` has for a slot. Time: with the EXPLAIN work, `quad-5xe.3`.
 
+### Reactions (`quad-ijx.4.3`)
+
+- **A reaction needs a type with a name.** Section 7 writes the flows in place, in `#Reaction & { … }`. That does not load: a structure cannot have a field that its type does not declare (ADR 0017 section 3). The author writes a type for the reaction, and the phenomenon gives the rate and the stocks:
+
+  ```cue
+  #Burn: #Reaction & {
+      fuel: #Interaction & { ratio: 1, conserved: false }
+      heat: #Interaction & { conserved: false }
+  }
+
+  #Stove: #Phenomenon & {
+      burn: #Burn & { rate: .burning, fuel: { source: .wood }, heat: { sink: .room.energy, ratio: .heating } }
+  }
+  ```
+
+  The fix is a structure that can add fields to its type where it stands. It changes ADR 0017, so it needs its own ADR. Time: `quad-14w`, after this work.
+- **The amount.** In a step, a flow moves the rate times the step times its ratio. The arithmetic is exact, and each flow keeps the part that is smaller than one quantum of its stock. With a constant ratio, the sum of a flow differs from the ratio times the sum of the reaction by less than one quantum.
+- **The scales.** A ratio that is a number has 9 decimals. A ratio or a rate with a dimension and no kind has 6 decimals more than the default of its dimension. If a flow has a number as its ratio, the rate gets the scale of that stock with 6 more decimals. The rate of an interaction has the same rule (ADR 0020).
+- A flow has no cell for a tolerance of its own. The reaction has the tolerance.
+- The step follows the rate of the reaction. It does not follow a ratio that changes during the run. The fix is a step that also reads each ratio. Time: with the group solver, `quad-h21.4`.
+- An amount that the kernel cannot hold stops the run with a message that names the interaction. Before, the message was only "kernel error".
+- `examples/fire.quad` has a stove that burns wood and heats a room.
+
