@@ -2197,13 +2197,15 @@ void test_examples(void)
                                        "study.fine.c3.energy" };
         int64_t total = qw_get(w, "hall.energy").lo + qw_get(w, "study.coarse.energy").lo, fine = 0;
         OK(qw_run(w, 300000000));
-        OK(qi_switch(ir, w, "study", "fine"));
+        OK(qw_input_set(w, "study.visible", 2));                 /* somebody looks: the condition of the map is true */
         OK(qw_run(w, 900000000));
+        CHECK_I64((int64_t) qw_switches(w), 1);
         for (int i = 0; i < 4; i++) fine += qw_get(w, cells[i]).lo;
         CHECK_I64(qw_get(w, "hall.energy").lo + fine, total);
         CHECK(qw_get(w, "study.fine.c0.temperature").lo > qw_get(w, "study.fine.c3.temperature").hi);
-        OK(qi_switch(ir, w, "study", "coarse"));
+        OK(qw_input_set(w, "study.visible", 1));
         OK(qw_run(w, 1200000000));
+        CHECK_I64((int64_t) qw_switches(w), 2);
         CHECK_I64(qw_get(w, "hall.energy").lo + qw_get(w, "study.coarse.energy").lo, total);
         CHECK(qw_get(w, "door.power").lo > 12000 && qw_get(w, "door.power").hi < 13000);   /* the README has ~12.529 W */
     }

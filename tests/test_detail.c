@@ -1304,3 +1304,316 @@ void test_reaction_more(void)
     ir = compile(ROOM("#DetailRoom") "r: { fine: { c1: { energy: 0J } } }\n");
     qi_free(ir);
 }
+
+/* --- the condition of a map (ADR 0022) -------------------------------------------------------------------- */
+
+/* A detail room with an input of the application and two conditions. */
+#define WATCHED(refine, abstract)                                                                       \
+    "#Watched: #Phenomenon & { west: #ThermalPort, spread: %temperature, model: *\"coarse\" | text,\n"  \
+    "  visible: *false | bool, door: *\"closed\" | \"open\" | \"closed\", coarse: #CoarseRoom, fine: #FineRoom,\n" \
+    "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\"" refine " },\n" \
+    "  abstract: #Map & { from: \"fine\", to: \"coarse\", evaluator: \"native.room.abstract\"" abstract " } }\n"
+#define SEEN WATCHED(", when: .visible", ", when: .visible == false")
+#define WROOM(name, type)                                                                               \
+    name ": " type " & { coarse: { temperature: 293.15K, capacity: 10000J/K },\n"                       \
+    "  fine: { c0: { capacity: 2500J/K }, c1: { capacity: 2500J/K }, c2: { capacity: 2500J/K },\n"      \
+    "          c3: { capacity: 2500J/K }, conductance: 100W/K, tolerance: 5pct }, spread: 0K }\n"
+#define WARM                                                                                            \
+    "roomA: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n"                               \
+    "wall: #ConductiveWall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 1pct }\n"
+
+static bool is_fine(QWorld *w, const char *room)
+{
+    QwPhen p;
+    return qw_find_phenomenon(w, room, &p) == QW_OK && !strcmp(qw_active_model(w, p), "fine");
+}
+
+/* ADR 0021, acceptance test 5: a condition from source, and its change
+ * through the C API. Two rooms with different inputs make different
+ * decisions with one rule. */
+void test_when_source(void)
+{
+    QIr *ir = compile(SEEN "#Big: #Watched\n" WROOM("roomB", "#Watched") WROOM("roomC", "#Watched") WROOM("roomD", "#Big") WARM);
+    if (!ir) return;
+    char *text = qi_text(ir);
+    HAS(text, "  cell roomB.visible: bool = false\n");
+    HAS(text, "  map abstract, at a switch: fine -> coarse, native.room.abstract, for 4 cells, when roomB.visible is false\n");
+    HAS(text, "  map refine, at a switch: coarse -> fine, native.room.refine, for 4 cells, when roomB.visible is true\n");
+    /* the condition is not a law */
+    CHECK(!strstr(text, "law roomB.abstract.when") && !strstr(text, "law roomB.refine.when"));
+    free(text);
+    const QiMap *abs = &ir->maps[0], *ref = &ir->maps[1];
+    CHECK(!strcmp(ref->when.path, "visible") && ref->when.mask == 2 && !strcmp(ir->cells[ref->when.cell].path, "roomB.visible") &&
+          !strcmp(ref->when.text, ".visible"));
+    CHECK(!strcmp(abs->when.path, "visible") && abs->when.mask == 1 && !strcmp(abs->when.text, ".visible == false"));
+
+    QWorld *w = build(ir, 3), *replayed = build(ir, 3);
+    if (w && replayed) {
+        QwPhen b, c, d;
+        OK(qw_find_phenomenon(w, "roomB", &b));
+        OK(qw_find_phenomenon(w, "roomC", &c));
+        OK(qw_find_phenomenon(w, "roomD", &d));
+        qw_record(w, true);
+        /* the world has the type of each phenomenon and the condition of the content */
+        CHECK(!strcmp(qw_type(w, b), "#Watched") && !strcmp(qw_type(w, d), "#Big"));
+        QwCondition got;
+        QwLevel level;
+        OK(qw_condition(w, b, "refine", &got, &level));
+        CHECK(level == QW_LEVEL_SOURCE && !strcmp(got.path, "visible") && got.mask == 2);
+
+        /* two rooms, one rule, two inputs */
+        OK(qw_run(w, 50 * SEC));
+        OK(qw_input_set(w, "roomB.visible", 2));
+        OK(qw_run(w, 100 * SEC));
+        CHECK(is_fine(w, "roomB") && !is_fine(w, "roomC") && !is_fine(w, "roomD"));
+
+        /* the application replaces the condition of the content for the exact type: a room becomes fine when
+         * its coarse temperature is above 280 K, which is true at once. roomD is a #Big, and it keeps the rule
+         * of the content */
+        QwCondition warm = qw_when_in("coarse.temperature", (QInterval) { 280000000, Q_INF }), never = qw_never();
+        OK(qw_override_type_condition(w, "#Watched", "refine", &warm));
+        OK(qw_override_type_condition(w, "#Watched", "abstract", &never));
+        OK(qw_run(w, 150 * SEC));
+        CHECK(is_fine(w, "roomB") && is_fine(w, "roomC") && !is_fine(w, "roomD"));
+        OK(qw_condition(w, c, "refine", &got, &level));
+        CHECK(level == QW_LEVEL_TYPE);
+        OK(qw_condition(w, d, "refine", &got, &level));
+        CHECK(level == QW_LEVEL_SOURCE);
+
+        /* the instance has precedence: roomC becomes coarse while nobody looks, and roomB stays fine */
+        QwCondition unseen = qw_when_false("visible");
+        OK(qw_override_condition(w, c, "abstract", &unseen));
+        OK(qw_override_condition(w, c, "refine", &never));
+        OK(qw_run(w, 200 * SEC));
+        CHECK(is_fine(w, "roomB") && !is_fine(w, "roomC"));
+        OK(qw_condition(w, c, "abstract", &got, &level));
+        CHECK(level == QW_LEVEL_INSTANCE);
+
+        /* the removal of both: the rule of the content again. Nobody looks at roomC, and somebody looks at roomB */
+        OK(qw_clear_condition(w, c, "abstract"));
+        OK(qw_clear_condition(w, c, "refine"));
+        OK(qw_condition(w, c, "abstract", &got, &level));
+        CHECK(level == QW_LEVEL_TYPE && got.path == NULL);
+        OK(qw_clear_type_condition(w, "#Watched", "refine"));
+        OK(qw_clear_type_condition(w, "#Watched", "abstract"));
+        OK(qw_condition(w, c, "abstract", &got, &level));
+        CHECK(level == QW_LEVEL_SOURCE && got.mask == 1);
+        OK(qw_input_set(w, "roomB.visible", 1));
+        OK(qw_input_set(w, "roomD.visible", 2));
+        OK(qw_run(w, 300 * SEC));
+        CHECK(!is_fine(w, "roomB") && !is_fine(w, "roomC") && is_fine(w, "roomD"));
+        CHECK_I64((int64_t) qw_switches(w), 5);
+
+        /* the replay: the same calls in a new world from the same IR give the same state, and the same
+         * number of boundaries and of switches */
+        size_t n = 0;
+        const QwCall *calls = qw_calls(w, &n);
+        CHECK_I64((int64_t) n, 16);
+        OK(qw_replay(replayed, calls, n));
+        CHECK(qw_hash(replayed) == qw_hash(w));
+        CHECK_I64((int64_t) qw_boundaries(replayed), (int64_t) qw_boundaries(w));
+        CHECK_I64((int64_t) qw_switches(replayed), 5);
+    }
+    qw_free(w);
+    qw_free(replayed);
+    qi_free(ir);
+}
+
+/* The forms of a condition in source. */
+void test_when_forms(void)
+{
+    static const struct { const char *refine, *abstract, *text; } forms[] = {
+        /* a quantity: the room becomes fine above 294 K, and coarse again when its first cell is above 297 K */
+        { ", when: .coarse.temperature > 294K", ", when: .fine.c0.temperature >= 297K",
+          "  map abstract, at a switch: fine -> coarse, native.room.abstract, for 4 cells, when roomB.fine.c0.temperature is >= 297\n" },
+        { ", when: .coarse.temperature > 294K", "",
+          "  map refine, at a switch: coarse -> fine, native.room.refine, for 4 cells, when roomB.coarse.temperature is >= 294.000001\n" },
+        /* the path on the right, and a number between two steps of the field */
+        { ", when: 294.0000005K <= .coarse.temperature", "",
+          "native.room.refine, for 4 cells, when roomB.coarse.temperature is >= 294.000001\n" },
+        { ", when: .coarse.temperature < 294.0000005K", "", "when roomB.coarse.temperature is <= 294\n" },
+        { ", when: .coarse.temperature <= 294K", "", "when roomB.coarse.temperature is <= 294\n" },
+        { ", when: .coarse.temperature == 294K", "", "when roomB.coarse.temperature is 294\n" },
+        /* through the port of the active model */
+        { ", when: .west.temperature > 294K", ", when: .west.temperature > 297K",
+          "  map abstract, at a switch: fine -> coarse, native.room.abstract, for 4 cells, when roomB.west.temperature is >= 297.000001\n" },
+        /* an atom of an enumeration, with == and with != */
+        { ", when: .door == \"open\"", ", when: .door != \"open\"",
+          "  map abstract, at a switch: fine -> coarse, native.room.abstract, for 4 cells, when roomB.door is closed\n" },
+        { ", when: .visible != false", "", "when roomB.visible is true\n" },
+        /* a truth value of the map itself */
+        { ", when: true", "", "native.room.refine, for 4 cells, when roomB.refine.when is true\n" },
+    };
+    for (size_t i = 0; i < sizeof forms / sizeof forms[0]; i++) {
+        char src[4096];
+        snprintf(src, sizeof src,
+                 "#Watched: #Phenomenon & { west: #ThermalPort, spread: %%temperature, model: *\"coarse\" | text,\n"
+                 "  visible: *false | bool, door: *\"closed\" | \"open\" | \"closed\", coarse: #CoarseRoom, fine: #FineRoom,\n"
+                 "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\"%s },\n"
+                 "  abstract: #Map & { from: \"fine\", to: \"coarse\", evaluator: \"native.room.abstract\"%s } }\n%s%s",
+                 forms[i].refine, forms[i].abstract, WROOM("roomB", "#Watched"), WARM);
+        QIr *ir = compile(src);
+        if (!ir) continue;
+        char *text = qi_text(ir);
+        HAS(text, forms[i].text);
+        free(text);
+        qi_free(ir);
+    }
+
+    /* the room becomes fine when it is warm, and coarse again when its first cell is warmer. Then the whole
+     * room is above the first limit, so it becomes fine again at the next boundary: the test stops there */
+    static const char *const pairs[2][2] = {
+        { ", when: .coarse.temperature > 294K", ", when: .fine.c0.temperature >= 297K" },
+        { ", when: .west.temperature > 294K", ", when: .west.temperature >= 297K" },     /* through the port */
+    };
+    for (int v = 0; v < 2; v++) {
+        char src[4096];
+        snprintf(src, sizeof src,
+                 "#Watched: #Phenomenon & { west: #ThermalPort, spread: %%temperature, model: *\"coarse\" | text,\n"
+                 "  visible: *false | bool, coarse: #CoarseRoom, fine: #FineRoom,\n"
+                 "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\"%s },\n"
+                 "  abstract: #Map & { from: \"fine\", to: \"coarse\", evaluator: \"native.room.abstract\"%s } }\n%s%s",
+                 pairs[v][0], pairs[v][1], WROOM("roomB", "#Watched"), WARM);
+        QIr *ir = compile(src), *none = compile(WATCHED("", "") WROOM("roomB", "#Watched") WARM);
+        QWorld *w = ir ? build(ir, 1) : NULL, *plain = none ? build(none, 1) : NULL;
+        if (w && plain) {
+            int became = 0, back = 0;
+            for (int t = 5; t <= 1500 && !back; t += 5) {
+                OK(qw_run(w, t * SEC));
+                if (!became) OK(qw_run(plain, t * SEC));
+                if (!became && is_fine(w, "roomB")) {
+                    became = t;
+                    /* the world with no condition is above the limit at that time, and it was not before */
+                    CHECK(qw_get(plain, "roomB.coarse.temperature").lo > 294000000);
+                    CHECK(qw_get(plain, "roomB.coarse.temperature").lo < 294200000);
+                }
+                if (became && qw_switches(w) >= 2) {
+                    back = t;
+                    /* an odd number of switches: fine. The room can be fine again at this stop */
+                    CHECK(is_fine(w, "roomB") == (qw_switches(w) % 2 == 1));
+                }
+            }
+            CHECK(became > 5 && back > became);
+            CHECK_I64((int64_t) qw_switches(plain), 0);
+            /* a map with no condition has no condition in the world */
+            QwPhen b;
+            QwCondition got;
+            QwLevel level;
+            OK(qw_find_phenomenon(plain, "roomB", &b));
+            OK(qw_condition(plain, b, "refine", &got, &level));
+            CHECK(level == QW_LEVEL_NONE && got.path == NULL);
+            OK(qw_find_phenomenon(w, "roomB", &b));
+            OK(qw_condition(w, b, "abstract", &got, &level));
+            CHECK(level == QW_LEVEL_SOURCE && !strcmp(got.path, v ? "west.temperature" : "fine.c0.temperature") &&
+                  got.range.lo == 297000000 && got.range.hi == Q_INF);
+        }
+        qw_free(w);
+        qw_free(plain);
+        qi_free(ir);
+        qi_free(none);
+    }
+
+    /* two conditions that are true together stop the run, with the names of the two transitions */
+    QIr *ir = compile("#One: #Model & { c0: #Lump }\n"
+                      "#Three: #Phenomenon & { model: \"a\", go: bool, spread: %temperature, a: #CoarseRoom, b: #One, c: #One,\n"
+                      "  ab: #Map & { from: \"a\", to: \"b\", evaluator: \"native.room.refine\", when: .go },\n"
+                      "  ac: #Map & { from: \"a\", to: \"c\", evaluator: \"native.room.refine\", when: .go == true } }\n"
+                      "t: #Three & { go: false, spread: 0K, a: { temperature: 300K, capacity: 1J/K },\n"
+                      "  b: { c0: { capacity: 1J/K } }, c: { c0: { capacity: 1J/K } } }\n");
+    if (ir) {
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 10 * SEC));
+            OK(qw_input_set(w, "t.go", 2));
+            uint64_t h = qw_hash(w);
+            CHECK(qw_run(w, 20 * SEC) == QW_ECONDITION);
+            HAS(qw_error(w), "t: the conditions of the transitions 'ab' and 'ac' are true at one time, and a phenomenon "
+                             "makes one switch: the conditions must exclude each other");
+            CHECK(qw_hash(w) == h && qw_switches(w) == 0);
+            /* with one of them removed, the run goes on */
+            QwPhen t;
+            QwCondition never = qw_never();
+            OK(qw_find_phenomenon(w, "t", &t));
+            CHECK(t == 0);
+            OK(qw_override_type_condition(w, "#Three", "ac", &never));     /* for the first phenomenon of the world */
+            QwCondition got;
+            QwLevel level;
+            OK(qw_condition(w, t, "ac", &got, &level));
+            CHECK(level == QW_LEVEL_TYPE);
+            OK(qw_run(w, 20 * SEC));
+            CHECK(!strcmp(qw_active_model(w, t), "b"));
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+}
+
+/* The errors of a condition in source. */
+void test_when_errors(void)
+{
+    static const struct { const char *refine, *message; } cases[] = {
+        { ", when: .coarse.temperature", "error: the condition of the map roomB.refine is not a truth value. A condition is a path "
+          "to a field with the type bool, as in `when: .visible`, or a comparison of one path with an atom or a quantity, "
+          "as in `when: .temperature > 300K`\n" },
+        { ", when: .door", "error: the condition of the map roomB.refine is not a truth value." },
+        { ", when: false", "error: the condition of the map roomB.refine is always false: remove it, and the map has no "
+          "condition\n" },
+        { ", when: .coarse.temperature > .spread", "error: the condition of the map roomB.refine is .coarse.temperature > "
+          ".spread. A condition is a path to a field with the type bool" },
+        { ", when: .coarse.temperature + 1K > 300K", "error: the condition of the map roomB.refine is (.coarse.temperature + 1K) "
+          "> 300K. A condition is a path" },
+        { ", when: .coarse.temperature != 300K", "error: the condition of the map roomB.refine is .coarse.temperature != 300K: "
+          "a quantity has no condition with !=. Use < or >\n" },
+        { ", when: .coarse.temperature == 300.0000005K", "error: the condition of the map roomB.refine is .coarse.temperature == "
+          "300.0000005K: the number is between two steps of the field. Use <= or >=\n" },
+        { ", when: .coarse.temperature > 5J", "error: the condition of the map roomB.refine is .coarse.temperature > 5J: the "
+          "number is in J, and roomB.coarse.temperature is in K\n" },
+        { ", when: .coarse.temperature == true", "error: the condition of the map roomB.refine is .coarse.temperature == true, "
+          "and roomB.coarse.temperature is a quantity: compare it with a quantity\n" },
+        { ", when: .visible == 5", "error: the condition of the map roomB.refine is .visible == 5, and roomB.visible is a set of "
+          "atoms: compare it with an atom, with == or !=\n" },
+        { ", when: .door == \"ajar\"", "error: the condition of the map roomB.refine is .door == \"ajar\", and ajar is not an "
+          "atom of roomB.door. Its atoms: closed, open\n" },
+        { ", when: .west.capacity > 5J/K, extra: 1", "unknown field 'extra'" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char src[4096];
+        snprintf(src, sizeof src,
+                 "#Watched: #Phenomenon & { west: #ThermalPort, spread: %%temperature, model: *\"coarse\" | text,\n"
+                 "  visible: *false | bool, door: *\"closed\" | \"open\" | \"closed\", coarse: #CoarseRoom, fine: #FineRoom,\n"
+                 "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\"%s } }\n%s%s",
+                 cases[i].refine, WROOM("roomB", "#Watched"), WARM);
+        HAS(compile_error(src), cases[i].message);
+    }
+    /* a condition reads a field of its own phenomenon, and not through a connection */
+    HAS(compile_error("#Linked: #Phenomenon & { other: #ThermalPort, west: #ThermalPort, spread: %temperature, model: \"coarse\",\n"
+                      "  coarse: #CoarseRoom, fine: #FineRoom,\n"
+                      "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\", when: .other.temperature > 300K } }\n"
+                      "roomA: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n"
+                      WROOM("roomB", "#Linked & { other: roomA.west }")),
+        "error: the condition of the map roomB.refine reads roomA.temperature, a field of another phenomenon: a condition "
+        "reads a field of its own phenomenon. Give roomB a field with a law for the value\n");
+    /* a field with one text value is not state, so a condition cannot read it */
+    HAS(compile_error("#Solo: #Phenomenon & { west: #ThermalPort, spread: %temperature, model: \"coarse\", mode: \"on\",\n"
+                      "  coarse: #CoarseRoom, fine: #FineRoom,\n"
+                      "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\", when: .mode != \"on\" } }\n"
+                      WROOM("roomB", "#Solo")),
+        "error: the condition of the map roomB.refine reads roomB.mode, which is not a cell of roomB\n");
+    /* an instance can give the condition of a map of its type */
+    QIr *ir = compile(WATCHED("", "") WROOM("roomB", "#Watched") "roomB: { refine: { when: .visible }, visible: true }\n" WARM);
+    if (ir) {
+        CHECK(ir->maps[1].when.path && !strcmp(ir->maps[1].when.path, "visible") && ir->maps[0].when.path == NULL);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 0));
+            CHECK(is_fine(w, "roomB"));
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+    /* an atom in a law that is not the condition of a map */
+    HAS(compile_error("#P: #Phenomenon & { on: bool, rule: .on == true }\np: #P & { on: true }\n"),
+        "error: the law .on == true uses p.on, which is a set of atoms: arithmetic needs quantities");
+    HAS(compile_error("#P: #Phenomenon & { on: bool, x: %energy, rule: .x == true + 1J }\np: #P & { on: true }\n"),
+        "error: the atom true can stand in an expression only in a comparison with == or !=");
+}

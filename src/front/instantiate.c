@@ -128,6 +128,7 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
     for (uint32_t i = 0; i < ir->nphens && !s; i++) {
         const QiPhen *ph = &ir->phens[i];
         s = qw_phenomenon(w, ph->name, &phens[i]);
+        if (!s) s = qw_set_type(w, phens[i], ph->type);
         /* the first model that the world gets is active: the model of the start, and then the others (ADR 0021) */
         if (!s && ph->nmodels) s = qw_model(w, phens[i], ph->models[ph->start]);
         for (uint32_t m = 0; m < ph->nmodels && !s; m++)
@@ -213,6 +214,11 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
             break;
         }
         s = qw_transition(w, phens[mp->phen], mp->name, ph->models[mp->from], ph->models[mp->to], k);
+        if (!s && mp->when.path) {
+            /* the condition of the content (ADR 0022) */
+            QwCondition c = { mp->when.path, mp->when.range, mp->when.mask };
+            s = qw_transition_when(w, phens[mp->phen], mp->name, &c);
+        }
     }
 
     for (uint32_t i = 0; i < taken; i++) free(names[i]);

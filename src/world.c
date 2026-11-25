@@ -41,7 +41,23 @@ typedef struct {
 } Att;
 
 typedef struct { char *name; QnGroup group; Att att; } Model;
-typedef struct { char *name; int from, to; const QkKernel *map; } Transition;   /* qw_transition */
+/* A condition (ADR 0022): the cell at `path` of the phenomenon has a value in `range`, or for a set cell an
+ * atom of `mask`. A NULL path: never. */
+typedef struct { char *path; QInterval range; uint64_t mask; } Cond;
+/* A transition, with the condition of the content, the condition of the application for the instance, and the
+ * condition that is in effect: `eff` with its level, and its cell if `ok`. */
+typedef struct {
+    char           *name;
+    int             from, to;
+    const QkKernel *map;
+    bool            has_src, has_inst;
+    Cond            src, inst;
+    const Cond     *eff;
+    int             level;      /* QwLevel */
+    bool            ok;         /* the path of `eff` is a cell now */
+    QnCell          cell;
+} Transition;
+typedef struct { char *type, *name; Cond cond; } TypeCond;         /* qw_override_type_condition */
 
 typedef struct {
     char    *name;
@@ -54,6 +70,7 @@ typedef struct {
     int      active;            /* a model index, or NO_MODEL if the phenomenon has no models */
     Transition *trans;
     size_t   ntrans, captrans;
+    char    *type;              /* the exact type in source, or NULL */
     Att      base;
     uint64_t predicts;
     uint64_t ident;             /* a hash of the name: the identity for random streams (ADR 0013) */
@@ -129,6 +146,17 @@ struct QWorld {
     QwChange  *log_entries;
     size_t     nlog, caplog;
 
+    /* transition conditions (ADR 0022) */
+    TypeCond  *tconds;
+    size_t     ntconds, captconds;
+    size_t     nauto;       /* the transitions that have a condition in effect */
+
+    /* the record of the calls of the application */
+    bool       recording;
+    int        depth;       /* inside a call of the application: a call from the world is not in the record */
+    QwCall    *calls;
+    size_t     ncalls, capcalls;
+
     bool       narrow_failed;
     char       narrow_msg[300];
     char       err[512];
@@ -179,6 +207,7 @@ const char *qw_status_str(QwStatus s)
     case QW_ESTOCK:         return "stock changed other than by a transfer";
     case QW_ETIME:          return "invalid time";
     case QW_ELIFE:          return "instance in the wrong state";
+    case QW_ECONDITION: return "two conditions are true";
     case QW_ESNAPSHOT:      return "snapshot does not fit";
     case QW_ENOMEM:         return "out of memory";
     }
@@ -466,8 +495,13 @@ void qw_free(QWorld *w)
             free(p->pmaps[j].port);
             free(p->pmaps[j].target);
         }
-        for (size_t j = 0; j < p->ntrans; j++) free(p->trans[j].name);
+        for (size_t j = 0; j < p->ntrans; j++) {
+            free(p->trans[j].name);
+            free(p->trans[j].src.path);
+            free(p->trans[j].inst.path);
+        }
         free(p->trans);
+        free(p->type);
         free(p->models);
         free(p->ports);
         free(p->pmaps);
@@ -497,6 +531,18 @@ void qw_free(QWorld *w)
     free(w->changed);
     free(w->log_entries);
     qn_free(w->net);
+    for (size_t i = 0; i < w->ntconds; i++) {
+        free(w->tconds[i].type);
+        free(w->tconds[i].name);
+        free(w->tconds[i].cond.path);
+    }
+    free(w->tconds);
+    for (size_t i = 0; i < w->ncalls; i++) {
+        free((char *) w->calls[i].target);
+        free((char *) w->calls[i].name);
+        free((char *) w->calls[i].cond.path);
+    }
+    free(w->calls);
     for (size_t i = 0; i < w->nadopted; i++) w->adopted[i].free_kernel(w->adopted[i].k);
     free(w->adopted);
     free(w);
@@ -1384,13 +1430,19 @@ static QwStatus commit(QWorld *w)
 }
 
 static QwStatus lifecycle(QWorld *w);
+static QwStatus transitions_step(QWorld *w);
+static void refresh_phen(QWorld *w, Phen *p);
+static void refresh_conditions(QWorld *w);
+static void record(QWorld *w, QwCallKind kind, const char *target, const char *name, QInterval value, uint64_t mask,
+                   bool clear, const QwCondition *cond);
 
-QwStatus qw_run(QWorld *w, int64_t until)
+static QwStatus run_to(QWorld *w, int64_t until)
 {
     if (until < w->now) return fail(w, QW_ETIME, "cannot run back to %lld from %lld", (long long) until, (long long) w->now);
     QwStatus st = settle(w);
     if (st) return st;
     if ((st = lifecycle(w))) return st;
+    if ((st = transitions_step(w))) return st;
     while (w->now < until) {
         int64_t b = until;
         for (size_t i = 0; i < w->nphens; i++)
@@ -1430,8 +1482,18 @@ QwStatus qw_run(QWorld *w, int64_t until)
         if ((st = settle(w))) return st;
         invalidate(w);
         if ((st = lifecycle(w))) return st;
+        if ((st = transitions_step(w))) return st;
     }
     return QW_OK;
+}
+
+QwStatus qw_run(QWorld *w, int64_t until)
+{
+    w->depth++;
+    QwStatus st = run_to(w, until);
+    w->depth--;
+    if (!st) record(w, QW_CALL_RUN, NULL, NULL, qi_top(), 0, false, NULL);
+    return st;
 }
 
 /* --- switching models ---------------------------------------------------------------- */
@@ -1545,6 +1607,8 @@ QwStatus qw_switch(QWorld *w, QwPhen pid, const char *model, const QkKernel *map
     w->switches++;
     st = settle(w);
     invalidate(w);
+    refresh_phen(w, p);                              /* a condition can read through the port of the active model */
+    if (!st) record(w, QW_CALL_SWITCH, pn, model, qi_top(), 0, false, NULL);
 done:
     if (map->destroy && ma.inst) map->destroy(ma.inst);
     ma.inst = NULL;
@@ -1876,7 +1940,9 @@ QwStatus qw_start(QWorld *w, QwPhen pid)
     if (p->has_cond) return fail(w, QW_ELIFE, "%s: has an existence condition, so the world starts it", p->name);
     if (p->alive) return fail(w, QW_ELIFE, "%s: is already alive", p->name);
     QwStatus st = settle(w);
-    return st ? st : do_start(w, pid);
+    if (!st) st = do_start(w, pid);
+    if (!st) record(w, QW_CALL_START, w->phens[pid].name, NULL, qi_top(), 0, false, NULL);
+    return st;
 }
 
 QwStatus qw_end(QWorld *w, QwPhen pid)
@@ -1886,7 +1952,9 @@ QwStatus qw_end(QWorld *w, QwPhen pid)
     if (p->has_cond) return fail(w, QW_ELIFE, "%s: has an existence condition, so the world ends it", p->name);
     if (!p->alive) return fail(w, QW_ELIFE, "%s: is dormant", p->name);
     QwStatus st = settle(w);
-    return st ? st : do_end(w, pid, false);
+    if (!st) st = do_end(w, pid, false);
+    if (!st) record(w, QW_CALL_END, w->phens[pid].name, NULL, qi_top(), 0, false, NULL);
+    return st;
 }
 
 /* --- the lifecycle step (ADR 0013 section 5) --------------------------------------------- */
@@ -2031,6 +2099,340 @@ static QwStatus lifecycle(QWorld *w)
     }
 }
 
+/* --- transition conditions (ADR 0022) ---------------------------------------------------- */
+
+QwCondition qw_when_true(const char *path) { return (QwCondition) { path, { 0, 0 }, COND_TRUE }; }
+QwCondition qw_when_false(const char *path) { return (QwCondition) { path, { 0, 0 }, COND_FALSE }; }
+QwCondition qw_when_atoms(const char *path, uint64_t mask) { return (QwCondition) { path, { 0, 0 }, mask }; }
+QwCondition qw_when_in(const char *path, QInterval range) { return (QwCondition) { path, range, 0 }; }
+QwCondition qw_never(void) { return (QwCondition) { NULL, { 0, 0 }, 0 }; }
+
+QwStatus qw_set_type(QWorld *w, QwPhen pid, const char *type)
+{
+    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
+    char *copy = dupstr(type);
+    if (!copy) return fail(w, QW_ENOMEM, "out of memory");
+    free(w->phens[pid].type);
+    w->phens[pid].type = copy;
+    refresh_conditions(w);
+    return QW_OK;
+}
+
+const char *qw_type(const QWorld *w, QwPhen pid) { return pid < w->nphens && w->phens[pid].type ? w->phens[pid].type : ""; }
+
+/* The cell of a condition for a phenomenon, now. An error names what does not fit. */
+static QwStatus cond_cell(QWorld *w, const Phen *p, const QwCondition *c, QnCell *cell)
+{
+    *cell = 0;
+    if (!c->path) return QW_OK;                      /* never */
+    char raw[512], path[512];
+    bool via = false;
+    snprintf(raw, sizeof raw, "%s.%s", p->name, c->path);
+    resolve_ports(w, raw, path, sizeof path, &via);
+    if (qw_find(w, path, cell) != QW_OK) return fail(w, QW_ENAME, "%s: the condition reads '%s', which is not a cell", p->name, raw);
+    if (set_cell(w, *cell)) {
+        if (!c->mask || (c->mask & ~qn_universe(w->net, *cell)))
+            return fail(w, QW_ETYPE, "%s: the condition on the set cell '%s' needs atoms of that cell", p->name, raw);
+    } else if (c->mask || !qi_valid(c->range)) {
+        return fail(w, QW_ETYPE, "%s: the condition on '%s' needs a range, and no atoms", p->name, raw);
+    }
+    return QW_OK;
+}
+
+static bool cond_copy(Cond *dst, const QwCondition *src)
+{
+    char *path = src->path ? dupstr(src->path) : NULL;
+    if (src->path && !path) return false;
+    free(dst->path);
+    *dst = (Cond) { path, src->range, src->mask };
+    return true;
+}
+
+static QwCondition cond_public(const Cond *c) { return (QwCondition) { c->path, c->range, c->mask }; }
+
+/* Finds the condition that is in effect for each transition of a phenomenon,
+ * and its cell: the condition of the instance, then of the exact type, then
+ * of the content (ADR 0022 section 4). */
+static void refresh_phen(QWorld *w, Phen *p)
+{
+    for (size_t t = 0; t < p->ntrans; t++) {
+        Transition *tr = &p->trans[t];
+        if (tr->eff) w->nauto--;
+        tr->eff = NULL;
+        tr->level = QW_LEVEL_NONE;
+        tr->ok = false;
+        if (tr->has_inst) {
+            tr->eff = &tr->inst;
+            tr->level = QW_LEVEL_INSTANCE;
+        }
+        for (size_t k = 0; !tr->eff && p->type && k < w->ntconds; k++)
+            if (!strcmp(w->tconds[k].type, p->type) && !strcmp(w->tconds[k].name, tr->name)) {
+                tr->eff = &w->tconds[k].cond;
+                tr->level = QW_LEVEL_TYPE;
+            }
+        if (!tr->eff && tr->has_src) {
+            tr->eff = &tr->src;
+            tr->level = QW_LEVEL_SOURCE;
+        }
+        if (!tr->eff) continue;
+        w->nauto++;
+        QwCondition c = cond_public(tr->eff);
+        char keep[sizeof w->err];
+        memcpy(keep, w->err, sizeof keep);           /* a path that is no cell now is not an error of this call */
+        tr->ok = c.path && cond_cell(w, p, &c, &tr->cell) == QW_OK;
+        memcpy(w->err, keep, sizeof keep);
+    }
+}
+
+static void refresh_conditions(QWorld *w)
+{
+    for (size_t i = 0; i < w->nphens; i++) refresh_phen(w, &w->phens[i]);
+}
+
+static Transition *find_transition(QWorld *w, QwPhen pid, const char *name)
+{
+    if (pid >= w->nphens) {
+        fail(w, QW_ENAME, "no such phenomenon");
+        return NULL;
+    }
+    Phen *p = &w->phens[pid];
+    for (size_t t = 0; t < p->ntrans; t++)
+        if (!strcmp(p->trans[t].name, name)) return &p->trans[t];
+    fail(w, QW_ENAME, "%s: no transition '%s'", p->name, name);
+    return NULL;
+}
+
+static void record(QWorld *w, QwCallKind kind, const char *target, const char *name, QInterval value, uint64_t mask,
+                   bool clear, const QwCondition *cond);
+
+QwStatus qw_transition_when(QWorld *w, QwPhen pid, const char *transition, const QwCondition *cond)
+{
+    Transition *tr = find_transition(w, pid, transition);
+    if (!tr) return QW_ENAME;
+    QnCell cell;
+    QwStatus st = cond_cell(w, &w->phens[pid], cond, &cell);
+    if (st) return st;
+    if (!cond_copy(&tr->src, cond)) return fail(w, QW_ENOMEM, "out of memory");
+    tr->has_src = true;
+    refresh_phen(w, &w->phens[pid]);
+    return QW_OK;
+}
+
+QwStatus qw_override_condition(QWorld *w, QwPhen pid, const char *transition, const QwCondition *cond)
+{
+    Transition *tr = find_transition(w, pid, transition);
+    if (!tr) return QW_ENAME;
+    QnCell cell;
+    QwStatus st = cond_cell(w, &w->phens[pid], cond, &cell);
+    if (st) return st;
+    if (!cond_copy(&tr->inst, cond)) return fail(w, QW_ENOMEM, "out of memory");
+    tr->has_inst = true;
+    refresh_phen(w, &w->phens[pid]);
+    record(w, QW_CALL_CONDITION, w->phens[pid].name, transition, qi_top(), 0, false, cond);
+    return QW_OK;
+}
+
+QwStatus qw_clear_condition(QWorld *w, QwPhen pid, const char *transition)
+{
+    Transition *tr = find_transition(w, pid, transition);
+    if (!tr) return QW_ENAME;
+    if (!tr->has_inst)
+        return fail(w, QW_ENAME, "%s: the transition '%s' has no condition of the instance", w->phens[pid].name, transition);
+    tr->has_inst = false;
+    free(tr->inst.path);
+    tr->inst.path = NULL;
+    refresh_phen(w, &w->phens[pid]);
+    record(w, QW_CALL_CONDITION, w->phens[pid].name, transition, qi_top(), 0, true, NULL);
+    return QW_OK;
+}
+
+QwStatus qw_override_type_condition(QWorld *w, const char *type, const char *transition, const QwCondition *cond)
+{
+    /* the condition must fit each phenomenon of the type that has the transition */
+    size_t users = 0;
+    for (size_t i = 0; i < w->nphens; i++) {
+        Phen *p = &w->phens[i];
+        if (!p->type || strcmp(p->type, type)) continue;
+        for (size_t t = 0; t < p->ntrans; t++) {
+            if (strcmp(p->trans[t].name, transition)) continue;
+            QnCell cell;
+            QwStatus st = cond_cell(w, p, cond, &cell);
+            if (st) return st;
+            users++;
+        }
+    }
+    if (!users) return fail(w, QW_ENAME, "no phenomenon of the type '%s' has a transition '%s'", type, transition);
+    TypeCond *tc = NULL;
+    for (size_t k = 0; k < w->ntconds; k++)
+        if (!strcmp(w->tconds[k].type, type) && !strcmp(w->tconds[k].name, transition)) tc = &w->tconds[k];
+    if (!tc) {
+        if (!grow((void **) &w->tconds, &w->captconds, w->ntconds + 1, sizeof *w->tconds)) return fail(w, QW_ENOMEM, "out of memory");
+        tc = &w->tconds[w->ntconds];
+        memset(tc, 0, sizeof *tc);
+        tc->type = dupstr(type);
+        tc->name = dupstr(transition);
+        if (!tc->type || !tc->name) {
+            free(tc->type);
+            free(tc->name);
+            return fail(w, QW_ENOMEM, "out of memory");
+        }
+        w->ntconds++;
+    }
+    if (!cond_copy(&tc->cond, cond)) return fail(w, QW_ENOMEM, "out of memory");
+    refresh_conditions(w);                           /* the array of the type conditions can have moved */
+    record(w, QW_CALL_TYPE_CONDITION, type, transition, qi_top(), 0, false, cond);
+    return QW_OK;
+}
+
+QwStatus qw_clear_type_condition(QWorld *w, const char *type, const char *transition)
+{
+    for (size_t k = 0; k < w->ntconds; k++) {
+        if (strcmp(w->tconds[k].type, type) || strcmp(w->tconds[k].name, transition)) continue;
+        free(w->tconds[k].type);
+        free(w->tconds[k].name);
+        free(w->tconds[k].cond.path);
+        w->tconds[k] = w->tconds[--w->ntconds];
+        refresh_conditions(w);
+        record(w, QW_CALL_TYPE_CONDITION, type, transition, qi_top(), 0, true, NULL);
+        return QW_OK;
+    }
+    return fail(w, QW_ENAME, "the type '%s' has no condition for the transition '%s'", type, transition);
+}
+
+QwStatus qw_condition(const QWorld *w, QwPhen pid, const char *transition, QwCondition *out, QwLevel *level)
+{
+    if (pid >= w->nphens) return QW_ENAME;
+    const Phen *p = &w->phens[pid];
+    for (size_t t = 0; t < p->ntrans; t++) {
+        const Transition *tr = &p->trans[t];
+        if (strcmp(tr->name, transition)) continue;
+        if (out) *out = tr->eff ? cond_public(tr->eff) : qw_never();
+        if (level) *level = (QwLevel) tr->level;
+        return QW_OK;
+    }
+    return QW_ENAME;
+}
+
+/* The value of the condition that is in effect for a transition: COND_TRUE,
+ * COND_FALSE, or 0 for unknown. */
+static int cond_value(const QWorld *w, const Transition *tr)
+{
+    if (!tr->eff || !tr->eff->path || !tr->ok) return 0;
+    if (set_cell(w, tr->cell)) {
+        uint64_t v = qn_get_set(w->net, tr->cell);
+        return !v ? 0 : !(v & ~tr->eff->mask) ? COND_TRUE : !(v & tr->eff->mask) ? COND_FALSE : 0;
+    }
+    QInterval v = qn_get(w->net, tr->cell), r = tr->eff->range;
+    if (v.lo >= r.lo && v.hi <= r.hi) return COND_TRUE;
+    if (v.hi < r.lo || v.lo > r.hi) return COND_FALSE;
+    return 0;
+}
+
+typedef struct { QwPhen id; size_t tr; const char *name; } Due;
+
+static int cmp_due(const void *a, const void *b) { return strcmp(((const Due *) a)->name, ((const Due *) b)->name); }
+
+/* The step for the models, after the step for the instances (ADR 0022
+ * section 3). It decides each switch from the values now, and then makes the
+ * switches in the order of the names. A phenomenon makes one switch at most:
+ * the conditions of its new model have their turn at the next boundary. */
+static QwStatus transitions_step(QWorld *w)
+{
+    if (!w->nauto) return QW_OK;
+    Due *due = NULL;
+    size_t n = 0, cap = 0;
+    QwStatus st = QW_OK;
+    for (size_t i = 0; i < w->nphens && !st; i++) {
+        const Phen *p = &w->phens[i];
+        if (!p->ntrans || !p->alive || p->active == NO_MODEL) continue;
+        size_t found = SIZE_MAX;
+        for (size_t t = 0; t < p->ntrans && !st; t++) {
+            if (p->trans[t].from != p->active || cond_value(w, &p->trans[t]) != COND_TRUE) continue;
+            if (found != SIZE_MAX)
+                st = fail(w, QW_ECONDITION, "%s: the conditions of the transitions '%s' and '%s' are true at one time, and a "
+                          "phenomenon makes one switch: the conditions must exclude each other", p->name,
+                          p->trans[found].name, p->trans[t].name);
+            found = t;
+        }
+        if (st || found == SIZE_MAX) continue;
+        if (!grow((void **) &due, &cap, n + 1, sizeof *due)) st = fail(w, QW_ENOMEM, "out of memory");
+        else due[n++] = (Due) { (QwPhen) i, found, p->name };
+    }
+    if (!st && n) qsort(due, n, sizeof *due, cmp_due);
+    w->depth++;                                      /* a switch of the world is not a call of the application */
+    for (size_t i = 0; i < n && !st; i++) {
+        const Phen *p = &w->phens[due[i].id];
+        const Transition *tr = &p->trans[due[i].tr];
+        st = qw_switch(w, due[i].id, p->models[tr->to].name, tr->map);
+    }
+    w->depth--;
+    free(due);
+    return st;
+}
+
+/* --- the record of the calls of the application (ADR 0022 section 5) ---------------------- */
+
+void qw_record(QWorld *w, bool on) { w->recording = on; }
+
+const QwCall *qw_calls(const QWorld *w, size_t *n)
+{
+    *n = w->ncalls;
+    return w->calls;
+}
+
+static void record(QWorld *w, QwCallKind kind, const char *target, const char *name, QInterval value, uint64_t mask,
+                   bool clear, const QwCondition *cond)
+{
+    if (!w->recording || w->depth) return;
+    if (!grow((void **) &w->calls, &w->capcalls, w->ncalls + 1, sizeof *w->calls)) return;
+    QwCall *c = &w->calls[w->ncalls];
+    memset(c, 0, sizeof *c);
+    c->kind = kind;
+    c->time = w->now;
+    c->target = target ? dupstr(target) : NULL;
+    c->name = name ? dupstr(name) : NULL;
+    c->value = value;
+    c->mask = mask;
+    c->clear = clear;
+    if (cond) {
+        c->cond = *cond;
+        c->cond.path = cond->path ? dupstr(cond->path) : NULL;
+    }
+    w->ncalls++;
+}
+
+QwStatus qw_replay(QWorld *w, const QwCall *calls, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        const QwCall *c = &calls[i];
+        if (c->kind != QW_CALL_RUN && c->time != w->now)
+            return fail(w, QW_ETIME, "the record has a call at the time %lld, and the world is at the time %lld",
+                        (long long) c->time, (long long) w->now);
+        QwPhen p = 0;
+        bool phen = c->kind == QW_CALL_START || c->kind == QW_CALL_END || c->kind == QW_CALL_SWITCH || c->kind == QW_CALL_CONDITION;
+        if (phen && (!c->target || !find_phen(w, c->target, strlen(c->target), &p)))
+            return fail(w, QW_ENAME, "the record names the phenomenon '%s', and the world has none with that name",
+                        c->target ? c->target : "");
+        QwStatus st = QW_OK;
+        switch (c->kind) {
+        case QW_CALL_RUN: st = qw_run(w, c->time); break;
+        case QW_CALL_INPUT: st = qw_input(w, c->target, c->value); break;
+        case QW_CALL_INPUT_SET: st = qw_input_set(w, c->target, c->mask); break;
+        case QW_CALL_START: st = qw_start(w, p); break;
+        case QW_CALL_END: st = qw_end(w, p); break;
+        case QW_CALL_SWITCH: st = qw_switch_to(w, p, c->name); break;
+        case QW_CALL_CONDITION:
+            st = c->clear ? qw_clear_condition(w, p, c->name) : qw_override_condition(w, p, c->name, &c->cond);
+            break;
+        case QW_CALL_TYPE_CONDITION:
+            st = c->clear ? qw_clear_type_condition(w, c->target, c->name) : qw_override_type_condition(w, c->target, c->name, &c->cond);
+            break;
+        }
+        if (st) return st;
+    }
+    return QW_OK;
+}
+
 /* --- inputs and inspection ------------------------------------------------------------ */
 
 QwStatus qw_input(QWorld *w, const char *path, QInterval v)
@@ -2050,6 +2452,7 @@ QwStatus qw_input(QWorld *w, const char *path, QInterval v)
     log_stamp(w, logged);
     QwStatus st = settle(w);
     invalidate(w);
+    if (!st) record(w, QW_CALL_INPUT, path, NULL, v, 0, false, NULL);
     return st;
 }
 
@@ -2070,6 +2473,7 @@ QwStatus qw_input_set(QWorld *w, const char *path, uint64_t mask)
     log_stamp(w, logged);
     QwStatus st = settle(w);
     invalidate(w);
+    if (!st) record(w, QW_CALL_INPUT_SET, path, NULL, qi_top(), mask, false, NULL);
     return st;
 }
 
@@ -2115,6 +2519,16 @@ static uint64_t fnv(uint64_t h, uint64_t v)
     return h;
 }
 
+static uint64_t name_hash(const char *s) { return qr_name_hash(s, strlen(s)); }
+
+static uint64_t cond_hash(const Cond *c)
+{
+    uint64_t h = fnv(0xcbf29ce484222325ULL, c->path ? name_hash(c->path) : 0);
+    h = fnv(h, (uint64_t) c->range.lo);
+    h = fnv(h, (uint64_t) c->range.hi);
+    return fnv(h, c->mask);
+}
+
 /* --- snapshot and restore (ADR 0004 rule 8) -------------------------------------------- */
 
 typedef struct { uint8_t *p; size_t n, cap; bool oom; } Out;
@@ -2143,7 +2557,50 @@ static uint64_t get(In *in)
     return v;
 }
 
-#define SNAP_MAGIC 0x3130504e53575151ULL       /* "QQWSNP01" */
+#define SNAP_MAGIC 0x3230504e53575151ULL       /* "QQWSNP02" */
+
+static void put_str(Out *o, const char *s)
+{
+    size_t n = s ? strlen(s) : 0;
+    put(o, n);
+    put_bytes(o, s, n);
+}
+
+/* A string of a snapshot, or NULL with in->bad. The caller frees it. */
+static char *get_str(In *in)
+{
+    uint64_t n = get(in);
+    if (in->bad || n > in->n - in->at) { in->bad = true; return NULL; }
+    char *s = malloc((size_t) n + 1);
+    if (!s) { in->bad = true; return NULL; }
+    memcpy(s, in->p + in->at, (size_t) n);
+    s[n] = 0;
+    in->at += (size_t) n;
+    return s;
+}
+
+static void put_cond(Out *o, const Cond *c)
+{
+    put(o, c->path != NULL);
+    put_str(o, c->path);
+    put(o, (uint64_t) c->range.lo);
+    put(o, (uint64_t) c->range.hi);
+    put(o, c->mask);
+}
+
+/* A condition of a snapshot. The caller frees its path. */
+static Cond get_cond(In *in)
+{
+    bool has = get(in) != 0;
+    char *path = get_str(in);
+    Cond c = { path, { (int64_t) get(in), (int64_t) get(in) }, 0 };
+    c.mask = get(in);
+    if (!has) {
+        free(c.path);
+        c.path = NULL;
+    }
+    return c;
+}
 
 /* A hash of the structure of the world: a snapshot fits only a world with the same one. */
 static uint64_t structure_hash(const QWorld *w)
@@ -2157,6 +2614,13 @@ static uint64_t structure_hash(const QWorld *w)
         for (int m = NO_MODEL; m < (int) p->nmodels; m++) {
             const Att *a = m == NO_MODEL ? &p->base : &p->models[m].att;
             h = fnv(h, a->k ? qr_name_hash(a->k->name, strlen(a->k->name)) : 0);
+        }
+        /* the type, the transitions, and the conditions of the content */
+        h = fnv(fnv(h, p->type ? name_hash(p->type) : 0), (uint64_t) p->ntrans);
+        for (size_t t = 0; t < p->ntrans; t++) {
+            const Transition *tr = &p->trans[t];
+            h = fnv(fnv(fnv(h, name_hash(tr->name)), (uint64_t) tr->from), (uint64_t) tr->to);
+            h = fnv(h, tr->has_src ? cond_hash(&tr->src) : 0);
         }
     }
     for (size_t c = 0; c < w->ncells; c++) h = fnv(fnv(h, w->cells[c].hash), (uint64_t) w->cells[c].derived);
@@ -2221,6 +2685,24 @@ QwStatus qw_snapshot(QWorld *w, void **bytes, size_t *len)
             }
         }
     }
+    /* the conditions of the application (ADR 0022): of the instances, then of the types */
+    uint64_t ninst = 0;
+    for (size_t i = 0; i < w->nphens; i++)
+        for (size_t t = 0; t < w->phens[i].ntrans; t++) ninst += w->phens[i].trans[t].has_inst;
+    put(&o, ninst);
+    for (size_t i = 0; i < w->nphens; i++)
+        for (size_t t = 0; t < w->phens[i].ntrans; t++) {
+            if (!w->phens[i].trans[t].has_inst) continue;
+            put(&o, i);
+            put(&o, t);
+            put_cond(&o, &w->phens[i].trans[t].inst);
+        }
+    put(&o, w->ntconds);
+    for (size_t k = 0; k < w->ntconds; k++) {
+        put_str(&o, w->tconds[k].type);
+        put_str(&o, w->tconds[k].name);
+        put_cond(&o, &w->tconds[k].cond);
+    }
     if (o.oom) {
         free(o.p);
         return fail(w, QW_ENOMEM, "out of memory");
@@ -2284,6 +2766,21 @@ static bool snapshot_whole(const QWorld *w, const void *bytes, size_t len)
             if (in.bad || need > in.n - in.at) return false;
             in.at += (size_t) need;
         }
+    }
+    /* the conditions of the application: each names a transition of the world */
+    uint64_t ninst = get(&in);
+    for (uint64_t k = 0; k < ninst && !in.bad; k++) {
+        uint64_t phen = get(&in), tr = get(&in);
+        Cond c = get_cond(&in);
+        free(c.path);
+        if (in.bad || phen >= w->nphens || tr >= w->phens[phen].ntrans) return false;
+    }
+    uint64_t ntype = get(&in);
+    for (uint64_t k = 0; k < ntype && !in.bad; k++) {
+        free(get_str(&in));
+        free(get_str(&in));
+        Cond c = get_cond(&in);
+        free(c.path);
     }
     return !in.bad && in.at == in.n;
 }
@@ -2382,7 +2879,37 @@ QwStatus qw_restore(QWorld *w, const void *bytes, size_t len)
             }
         }
     }
-    return QW_OK;
+    /* the conditions of the application: the ones of the snapshot replace the ones of the world */
+    for (size_t i = 0; i < w->nphens; i++)
+        for (size_t t = 0; t < w->phens[i].ntrans; t++) {
+            Transition *tr = &w->phens[i].trans[t];
+            tr->has_inst = false;
+            free(tr->inst.path);
+            tr->inst.path = NULL;
+        }
+    for (size_t k = 0; k < w->ntconds; k++) {
+        free(w->tconds[k].type);
+        free(w->tconds[k].name);
+        free(w->tconds[k].cond.path);
+    }
+    w->ntconds = 0;
+    uint64_t ninst = get(&in);
+    for (uint64_t k = 0; k < ninst; k++) {
+        uint64_t phen = get(&in), t = get(&in);
+        Transition *tr = &w->phens[phen].trans[t];
+        tr->inst = get_cond(&in);
+        tr->has_inst = true;
+    }
+    uint64_t ntype = get(&in);
+    if (!grow((void **) &w->tconds, &w->captconds, (size_t) ntype, sizeof *w->tconds)) return fail(w, QW_ENOMEM, "out of memory");
+    for (uint64_t k = 0; k < ntype; k++) {
+        TypeCond *tc = &w->tconds[w->ntconds++];
+        tc->type = get_str(&in);
+        tc->name = get_str(&in);
+        tc->cond = get_cond(&in);
+    }
+    refresh_conditions(w);
+    return in.bad ? fail(w, QW_ESNAPSHOT, "the snapshot is cut or damaged") : QW_OK;
 }
 
 uint64_t qw_hash(const QWorld *w)
@@ -2403,6 +2930,14 @@ uint64_t qw_hash(const QWorld *w)
         QInterval b = qn_base(w->net, (QnCell) c);
         sum += fnv(fnv(fnv(seed, w->cells[c].hash), (uint64_t) b.lo), (uint64_t) b.hi);
     }
+    /* the conditions of the application are state (ADR 0022 section 4) */
+    for (size_t i = 0; i < w->nphens; i++)
+        for (size_t t = 0; t < w->phens[i].ntrans; t++) {
+            const Transition *tr = &w->phens[i].trans[t];
+            if (tr->has_inst) sum += fnv(fnv(fnv(seed, w->phens[i].ident), name_hash(tr->name)), cond_hash(&tr->inst));
+        }
+    for (size_t k = 0; k < w->ntconds; k++)
+        sum += fnv(fnv(fnv(seed ^ 1, name_hash(w->tconds[k].type)), name_hash(w->tconds[k].name)), cond_hash(&w->tconds[k].cond));
     uint64_t h = fnv(seed, (uint64_t) w->now);
     h = fnv(h, qn_epoch(w->net));
     return fnv(h, sum);

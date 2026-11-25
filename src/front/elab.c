@@ -49,6 +49,7 @@ typedef struct {
     uint32_t          tinter, fsource, fsink, frate, ftol, fcons;    /* #Interaction and its fields (ADR 0020) */
     uint32_t          tmodel, tmap, fmodel, ffrom, fto;              /* #Model, #Map and their fields (ADR 0021) */
     uint32_t          treact, fratio;                                /* #Reaction, and the ratio of a flow (ADR 0021) */
+    uint32_t          fwhen;                                         /* the condition of a map (ADR 0022) */
     VEC(ModelRef)     models;       /* the models of each phenomenon, in the order of their names */
     U32Vec            model0;       /* for each phenomenon: its first model in `models`, and one entry more */
     U32Vec            mstart;       /* for each phenomenon: its model at the start, or QI_NONE */
@@ -1350,6 +1351,9 @@ static void phen_laws(Elab *e, uint32_t phen, size_t conn0, size_t conn1)
         bool copied = false;
         for (size_t c = conn0; c < conn1; c++) copied |= starts_with(at.v, at.n, &e->conns.v[c].path);
         uint32_t own = path_model(e, phen, at.v, at.n);
+        /* the condition of a map is not a law: phen_maps reads it (ADR 0022) */
+        const QfNode *holder = at.n == 2 && at.v[1] == e->fwhen && e->tmap != QF_BOTTOM ? node_at(in->node, at.v, 1) : NULL;
+        if (holder && !(holder->flags & NF_VALUE) && is_subtype(e->f, holder->type, e->tmap)) copied = true;
         VEC_FREE(at);
         if (!copied) lower(e, phen, u, own);
     }
@@ -1873,6 +1877,195 @@ static void phen_interactions(Elab *e, uint32_t phen, size_t conn0, size_t conn1
 
 static int cmp_map(const void *a, const void *b) { return strcmp(((const QiMap *) a)->name, ((const QiMap *) b)->name); }
 
+/* The quanta of a literal for a cell: floor and ceiling of its value in the
+ * scale of the cell. False with a reason. */
+static bool literal_quanta(Elab *e, const XNum *num, uint32_t cell, int64_t *lo, int64_t *hi, char *why, size_t len)
+{
+    QDim dim;
+    int64_t value;
+    int exp;
+    if (!qf_literal(e->f, num, &dim, &value, &exp, why, len)) return false;
+    if (!qdim_eq(&dim, &e->ctypes.v[cell].dim)) {
+        Buf has = { 0 }, needs = { 0 };
+        dim_unit(e, &has, &dim);
+        dim_unit(e, &needs, &e->ctypes.v[cell].dim);
+        snprintf(why, len, "the number is in %s, and %s is in %s", has.len ? has.s : "1", e->cells.v[cell].path,
+                 needs.len ? needs.s : "1");
+        qf_buf_free(&has);
+        qf_buf_free(&needs);
+        return false;
+    }
+    int shift = exp - e->ctypes.v[cell].scale;
+    __extension__ typedef __int128 i128;
+    i128 v = value;
+    if (shift >= 0) {
+        for (int i = 0; i < shift; i++) {
+            v *= 10;
+            if (v > Q_FMAX || v < Q_FMIN) { snprintf(why, len, "the number is too large for %s", e->cells.v[cell].path); return false; }
+        }
+        *lo = *hi = (int64_t) v;
+        return true;
+    }
+    i128 d = 1;
+    for (int i = 0; i < -shift && d <= (i128) INT64_MAX * 10; i++) d *= 10;
+    i128 q = v / d, r = v % d;
+    if (r < 0) { q -= 1; r += d; }                   /* floor */
+    *lo = (int64_t) q;
+    *hi = (int64_t) (r ? q + 1 : q);
+    return true;
+}
+
+/* The condition of a map (ADR 0022 section 1): a statement about one cell of
+ * the phenomenon. `when` is a path to a field with the type bool, or a
+ * comparison of one path with an atom or a quantity. The result has a NULL
+ * path if the map has no condition. False with a diagnostic. */
+static bool map_condition(Elab *e, uint32_t phen, uint32_t mapfeat, const QfNode *map, const char *name, QiCondition *out)
+{
+    Front *f = e->f;
+    const InstInfo *in = &f->insts.v[e->insts.v[phen]];
+    Loc loc = inst_loc(in);
+    memset(out, 0, sizeof *out);
+    out->cell = QI_NONE;
+    const QfNode *wn = e->fwhen == QF_BOTTOM ? NULL : node_arc(map, e->fwhen);
+    static const char *const forms = "A condition is a path to a field with the type bool, as in `when: .visible`, or a "
+                                     "comparison of one path with an atom or a quantity, as in `when: .temperature > 300K`";
+    /* a comparison is a constraint record at the path of the field */
+    QfRecUses uses = { 0 };
+    qf_records(f, in->node, &in->ariths, &uses);
+    const QfRecUse *use = NULL;
+    for (size_t i = 0; i < uses.n && !use; i++) {
+        const QfRecUse *u = &uses.v[i];
+        size_t n = u->prefix.n + u->rec->path.n;
+        uint32_t first = n ? (u->prefix.n ? u->prefix.v[0] : u->rec->path.v[0]) : QF_BOTTOM;
+        uint32_t second = n == 2 ? (u->prefix.n == 2 ? u->prefix.v[1] : u->rec->path.v[u->rec->path.n - 1]) : QF_BOTTOM;
+        if (n == 2 && first == mapfeat && second == e->fwhen) use = u;
+    }
+    bool ok = true;
+    uint32_t cell = QI_NONE;
+    Buf rel = { 0 }, text = { 0 };
+    if (use) {
+        const X *x = use->rec->expr, *ref = NULL, *val = NULL;
+        char *xt = x_text(x);
+        qf_buf_puts(&text, xt);
+        free(xt);
+        int op = x->k == X_CMP ? x->u.ar.op : 0;
+        if (op && x->u.ar.a->k == X_TAG) { ref = x->u.ar.a; val = x->u.ar.b; }
+        else if (op && x->u.ar.b->k == X_TAG) {
+            /* the path is on the right: turn the comparison */
+            ref = x->u.ar.b;
+            val = x->u.ar.a;
+            op = op == '<' ? '>' : op == '>' ? '<' : op == 'l' ? 'g' : op == 'g' ? 'l' : op;
+        }
+        if (!ref || (val->k != X_NUM && val->k != X_ATOM)) {
+            err(e, loc, "the condition of the map %s.%s is %s. %s", in->name, name, text.s, forms);
+            ok = false;
+        }
+        /* the cell of the path */
+        for (size_t t = 0; ok && t < use->rec->tags.n; t++) {
+            if (use->rec->tags.v[t].name != ref->u.name) continue;
+            rel_text(e, &rel, use->prefix.v, use->prefix.n);
+            if (rel.len && use->rec->tags.v[t].path.n) qf_buf_putc(&rel, '.');
+            rel_text(e, &rel, use->rec->tags.v[t].path.v, use->rec->tags.v[t].path.n);
+            cell = find_cell(e, phen, rel.s ? rel.s : "", NULL);
+        }
+        if (ok && cell == QI_NONE) {
+            err(e, loc, "the condition of the map %s.%s reads %s.%s, which is not a cell of %s", in->name, name, in->name,
+                rel.s ? rel.s : "", in->name);
+            ok = false;
+        }
+        if (ok && e->cells.v[cell].domain == QI_SET) {
+            const QiEnum *en = &e->enums.v[e->cells.v[cell].kind];
+            uint64_t bit = 0, all = 0;
+            const char *atom = val->k == X_ATOM ? atom_name(e, val->u.name) : "";
+            for (uint32_t a = 0; a < en->natoms; a++) {
+                all |= (uint64_t) 1 << a;
+                if (!strcmp(en->atoms[a], atom)) bit = (uint64_t) 1 << a;
+            }
+            if (val->k != X_ATOM || (op != 'e' && op != 'n')) {
+                err(e, loc, "the condition of the map %s.%s is %s, and %s is a set of atoms: compare it with an atom, with "
+                    "== or !=", in->name, name, text.s, e->cells.v[cell].path);
+                ok = false;
+            } else if (!bit) {
+                Buf atoms = { 0 };
+                for (uint32_t a = 0; a < en->natoms; a++) qf_buf_printf(&atoms, "%s%s", a ? ", " : "", en->atoms[a]);
+                err(e, loc, "the condition of the map %s.%s is %s, and %s is not an atom of %s. Its atoms: %s", in->name, name,
+                    text.s, atom, e->cells.v[cell].path, atoms.s);
+                qf_buf_free(&atoms);
+                ok = false;
+            } else out->mask = op == 'e' ? bit : all & ~bit;
+            if (ok && !out->mask) {
+                err(e, loc, "the condition of the map %s.%s is %s, and %s has no other atom: the condition is never true",
+                    in->name, name, text.s, e->cells.v[cell].path);
+                ok = false;
+            }
+        } else if (ok) {
+            char why[240];
+            int64_t lo = 0, hi = 0;
+            if (val->k != X_NUM) {
+                err(e, loc, "the condition of the map %s.%s is %s, and %s is a quantity: compare it with a quantity", in->name,
+                    name, text.s, e->cells.v[cell].path);
+                ok = false;
+            } else if (!literal_quanta(e, &val->u.num, cell, &lo, &hi, why, sizeof why)) {
+                err(e, loc, "the condition of the map %s.%s is %s: %s", in->name, name, text.s, why);
+                ok = false;
+            } else if (op == 'n' || (op == 'e' && lo != hi)) {
+                err(e, loc, "the condition of the map %s.%s is %s: %s", in->name, name, text.s,
+                    op == 'n' ? "a quantity has no condition with !=. Use < or >"
+                              : "the number is between two steps of the field. Use <= or >=");
+                ok = false;
+            } else {
+                out->range = op == 'e'   ? (QInterval) { lo, lo }
+                             : op == '<' ? (QInterval) { Q_NINF, hi - 1 }
+                             : op == 'l' ? (QInterval) { Q_NINF, lo }
+                             : op == '>' ? (QInterval) { lo + 1, Q_INF }
+                                         : (QInterval) { hi, Q_INF };
+            }
+        }
+    } else if (!unstated(f, wn)) {
+        /* a path to a field: the same value stands at the field and at `when` */
+        const char *open;
+        cell = node_cell(e, phen, wn, NULL, &rel, &open);
+        qf_buf_puts(&text, ".");
+        qf_buf_puts(&text, rel.s ? rel.s : "");
+        /* a truth value: a set cell with the atoms true and false, or one of them */
+        bool truth = cell != QI_NONE && e->cells.v[cell].domain == QI_SET;
+        for (uint32_t a = 0; truth && a < e->enums.v[e->cells.v[cell].kind].natoms; a++) {
+            const char *atom = e->enums.v[e->cells.v[cell].kind].atoms[a];
+            truth = !strcmp(atom, "true") || !strcmp(atom, "false");
+        }
+        if (!truth) {
+            err(e, loc, "the condition of the map %s.%s is not a truth value. %s", in->name, name, forms);
+            ok = false;
+        } else {
+            const QiEnum *en = &e->enums.v[e->cells.v[cell].kind];
+            for (uint32_t a = 0; a < en->natoms; a++)
+                if (!strcmp(en->atoms[a], "true")) out->mask = (uint64_t) 1 << a;
+            if (!out->mask) {
+                err(e, loc, "the condition of the map %s.%s is always false: remove it, and the map has no condition", in->name,
+                    name);
+                ok = false;
+            }
+        }
+    }
+    if (ok && cell != QI_NONE) {
+        if (e->cells.v[cell].phen != phen) {
+            err(e, loc, "the condition of the map %s.%s reads %s, a field of another phenomenon: a condition reads a field "
+                "of its own phenomenon. Give %s a field with a law for the value", in->name, name, e->cells.v[cell].path,
+                in->name);
+            ok = false;
+        } else {
+            /* through the port of the active model: the path as written. Else the path of the cell */
+            out->path = keep(e, e->via != QI_NONE ? rel.s : e->cells.v[cell].path + strlen(in->name) + 1);
+            out->cell = cell;
+            out->text = keep(e, text.s ? text.s : "");
+        }
+    }
+    qf_buf_free(&rel);
+    qf_buf_free(&text);
+    qf_records_free(&uses);
+    return ok;
+}
+
 /* The maps of a phenomenon: each field with a type below #Map. A map names
  * two models and a map kernel. The slot "from.x" of the kernel is a cell of
  * the model `from`, "to.x" a cell of the model `to`, and another slot a cell
@@ -1932,8 +2125,9 @@ static void phen_maps(Elab *e, uint32_t phen)
             err(e, loc, "the map %s.%s: the evaluator \"%s\" is not a map kernel", in->name, name, ev.s);
         else {
             QiMap mp = { phen, keep(e, name), mf, mt, keep(e, k->name), made ? size : 0,
-                         qf_alloc(e->mem, (k->nslots ? k->nslots : 1) * sizeof(QiBind)), k->nslots };
-            bool ok = true;
+                         qf_alloc(e->mem, (k->nslots ? k->nslots : 1) * sizeof(QiBind)), k->nslots,
+                         { NULL, QI_NONE, { 0, 0 }, 0, NULL } };
+            bool ok = map_condition(e, phen, in->node->arcs[i].feat, v, name, &mp.when);
             for (uint32_t s = 0; s < k->nslots; s++) {
                 const char *slot = k->slots[s].name;
                 Buf rel = { 0 };
@@ -2219,8 +2413,10 @@ static QIr *finish(Elab *e)
     for (size_t i = 0; i < e->aliases.n; i++) REMAP(e->aliases.v[i].cell);
     for (size_t i = 0; i < e->props.n; i++)
         for (int k = 0; k < 3; k++) REMAP(e->props.v[i].cell[k]);
-    for (size_t i = 0; i < e->maps.n; i++)
+    for (size_t i = 0; i < e->maps.n; i++) {
         for (uint32_t s = 0; s < e->maps.v[i].nbinds; s++) REMAP(e->maps.v[i].binds[s].cell);
+        REMAP(e->maps.v[i].when.cell);
+    }
     for (size_t i = 0; i < e->kernels.n; i++) {
         for (uint32_t s = 0; s < e->kernels.v[i].nbinds; s++) {
             QiBind *bd = &e->kernels.v[i].binds[s];
@@ -2361,6 +2557,7 @@ QIr *qf_elaborate(Front *f, const QiOptions *opt)
     e.fto = feat_lookup(f, qf_sym(f, "quad.to"));
     e.treact = prelude_type(f, "#Reaction");
     e.fratio = feat_lookup(f, qf_sym(f, "quad.ratio"));
+    e.fwhen = feat_lookup(f, qf_sym(f, "quad.when"));
     e.assume = e.via = QI_NONE;
 
     /* the phenomena, in the order of their names */

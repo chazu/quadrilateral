@@ -170,6 +170,7 @@ This example sends the heat straight to the room. If the model includes a stove 
 - **The world keeps a map as a transition.** `qw_transition` gives the world the name, the two models and the map kernel. `qw_switch_to` switches with the map from the active model, and `qi_switch` calls it. `qw_switch` with an explicit kernel stays.
 - **The state hash has the active model by its name.** It had the number of the model, so two worlds with the same state and another order of the models had different hashes. In the C API the first declared model is active (ADR 0010). `qi_instantiate` declares the model of the start first.
 - **A port with no view that no model gives stays open.** It is an error only if a connection, a law or a kernel uses it, as before. If one model gives the port, each model must give it.
+- **A map in source has an issue.** The consequence "a switch needs a map kernel in C" names a new issue. It is `quad-50j`.
 - **The tool can switch.** `quad run --switch study=fine@5min` switches at a time, with the map that the content gives. `examples/detail-room.quad` shows it.
 - A value that two models share has its cell in one model: the one with the first path. An interaction of the other model cannot move it. We know no use for such a value.
 
@@ -203,4 +204,8 @@ This example sends the heat straight to the room. If the model includes a stove 
 - The step follows the rate of the reaction. It does not follow a ratio that changes during the run. The fix is a step that also reads each ratio. Time: with the group solver, `quad-h21.4`.
 - An amount that the kernel cannot hold stops the run with a message that names the interaction. Before, the message was only "kernel error".
 - `examples/fire.quad` has a stove that burns wood and heats a room.
+
+### Transition conditions (`quad-ijx.4.4`)
+
+Section 5 does not state the syntax of a condition, the result of two true conditions, and the form of the record for replay. ADR 0022 proposes those details, and it has the notes of that work. The project owner did not accept ADR 0022 yet.
 
