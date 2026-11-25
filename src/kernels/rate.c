@@ -61,21 +61,37 @@ static QkResult create(const QkKernel *self, const QkHost *host, QkCall *call, Q
 
 static void destroy(QkInstance *inst) { free(inst); }
 
-/* The rate of a transfer now: the middle of its range. False with a message
- * for the host if the range has no bound. */
-static bool rate_now(QkInstance *inst, QkCall *call, uint32_t t, int64_t *out)
+/* The value of a slot of a transfer now: the middle of its range. False with
+ * a message for the host if the range has no bound. what: "rate" or "ratio". */
+static bool slot_now(QkInstance *inst, QkCall *call, uint32_t t, uint32_t slot, const char *what, int64_t *out)
 {
     const Gen *g = inst->g;
-    QInterval v = inst->host->read(call, g->uses[t].rate);
+    QInterval v = inst->host->read(call, slot);
     if (v.lo == Q_NINF || v.hi == Q_INF) {
         char msg[200];
-        snprintf(msg, sizeof msg, "the rate of the interaction %s has no bound: a law or a value must give it",
+        snprintf(msg, sizeof msg, "the %s of the interaction %s has no bound: a law or a value must give it", what,
                  g->transfers[t].name);
         inst->host->log(call, msg);
         return false;
     }
     *out = km_mid(v);
     return true;
+}
+
+static bool rate_now(QkInstance *inst, QkCall *call, uint32_t t, int64_t *out)
+{
+    return slot_now(inst, call, t, inst->g->uses[t].rate, "rate", out);
+}
+
+/* An amount that the kernel cannot compute or that the stock cannot take:
+ * a message for the host, and the error. */
+static QkResult too_large(QkInstance *inst, QkCall *call, uint32_t t)
+{
+    char msg[200];
+    snprintf(msg, sizeof msg, "the amount of the interaction %s in one step is too large for the arithmetic of the kernel",
+             inst->g->transfers[t].name);
+    inst->host->log(call, msg);
+    return QK_ERROR;
 }
 
 static int64_t abs64(int64_t v) { return v < 0 ? -v : v; }
@@ -161,16 +177,23 @@ static QkResult advance(QkInstance *inst, QkCall *call, int64_t to)
         int stock = g->slots[tr->from != QK_NONE ? tr->from : tr->to].scale;
         int e = g->slots[g->uses[t].rate].scale + h->tick_scale(call) - stock;
         km_i128 n = (km_i128) r * dt, q;
+        if (g->uses[t].ratio != QK_NONE) {
+            /* a flow of a reaction: the amount of the reaction, r × dt, times the ratio of the flow */
+            int64_t ratio;
+            if (!slot_now(inst, call, t, g->uses[t].ratio, "ratio", &ratio)) return QK_ERROR;
+            if (!km_mul3(r, ratio, dt, &n)) return too_large(inst, call, t);
+            e += g->slots[g->uses[t].ratio].scale;
+        }
         if (e >= 0) {
-            if (e > 38 || (n != 0 && km_abs(n) > KM_I128_MAX / km_pow10(e))) return QK_ERROR;
+            if (e > 38 || (n != 0 && km_abs(n) > KM_I128_MAX / km_pow10(e))) return too_large(inst, call, t);
             q = n * km_pow10(e);
         } else {
-            if (-e > 36) return QK_ERROR;
+            if (-e > 36) return too_large(inst, call, t);
             km_i128 d = km_pow10(-e), total = n + carry_get(f);
             q = total / d;
             carry_set(f, total - q * d);
         }
-        if (q > Q_FMAX || q < Q_FMIN) return QK_ERROR;
+        if (q > Q_FMAX || q < Q_FMIN) return too_large(inst, call, t);
         if (q && h->transfer(call, t, (int64_t) q) != QK_HOST_OK) return QK_ERROR;
     }
     return QK_OK;
@@ -232,7 +255,8 @@ QkKernel *qk_rate_new(const QkSlot *slots, uint32_t nslots, const QkRateTransfer
         /* a rate and a tolerance that the kernel reads, and one stock at least.
          * The rate can be a stock of the phenomenon: a speed is the rate of a position */
         bool ok = u->rate < nslots && u->tolerance < nslots && (slots[u->rate].role == QK_IN || slots[u->rate].role == QK_STOCK) &&
-                  slots[u->tolerance].role == QK_IN && (from || to) && (!from || u->from < nslots) && (!to || u->to < nslots);
+                  slots[u->tolerance].role == QK_IN && (from || to) && (!from || u->from < nslots) && (!to || u->to < nslots) &&
+                  (u->ratio == QK_NONE || (u->ratio < nslots && slots[u->ratio].role == QK_IN));
         if (!ok) {
             qk_rate_free(&g->k);
             return NULL;

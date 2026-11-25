@@ -2188,4 +2188,39 @@ void test_examples(void)
     }
     qw_free(w);
     qi_free(ir);
+
+    /* a room with two models: the switches conserve the energy (ADR 0021) */
+    ir = example("thermal.quad", "detail-room.quad");
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        const char *const cells[4] = { "study.fine.c0.energy", "study.fine.c1.energy", "study.fine.c2.energy",
+                                       "study.fine.c3.energy" };
+        int64_t total = qw_get(w, "hall.energy").lo + qw_get(w, "study.coarse.energy").lo, fine = 0;
+        OK(qw_run(w, 300000000));
+        OK(qi_switch(ir, w, "study", "fine"));
+        OK(qw_run(w, 900000000));
+        for (int i = 0; i < 4; i++) fine += qw_get(w, cells[i]).lo;
+        CHECK_I64(qw_get(w, "hall.energy").lo + fine, total);
+        CHECK(qw_get(w, "study.fine.c0.temperature").lo > qw_get(w, "study.fine.c3.temperature").hi);
+        OK(qi_switch(ir, w, "study", "coarse"));
+        OK(qw_run(w, 1200000000));
+        CHECK_I64(qw_get(w, "hall.energy").lo + qw_get(w, "study.coarse.energy").lo, total);
+        CHECK(qw_get(w, "door.power").lo > 12000 && qw_get(w, "door.power").hi < 13000);   /* the README has ~12.529 W */
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* a fire: the wood that burns gives the heat (ADR 0021 section 7) */
+    ir = example("thermal.quad", "fire.quad");
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 7200000000LL));
+        int64_t wood = qw_get(w, "stove.wood").lo;
+        CHECK(wood > 240000 && wood < 252000);                   /* 5 kg × e^-3 is 0.249 kg */
+        /* the cabin and the air have the heat of the wood that burned, to one quantum of the wood */
+        int64_t heat = qw_get(w, "cabin.energy").lo + qw_get(w, "air.energy").lo - (139075000000LL + 268150000000000LL);
+        CHECK(heat >= 15000 * (5000000 - wood) && heat < 15000 * (5000000 - wood + 1));
+    }
+    qw_free(w);
+    qi_free(ir);
 }

@@ -1,0 +1,41 @@
+// A fire in a stove burns wood and heats a room. Use this file with
+// thermal.quad:
+//
+//   build/quad run examples/thermal.quad examples/fire.quad --until 2h --every 20min \
+//       --show stove.wood,stove.burning,cabin.temperature
+//
+// One amount decides two changes: the mass of wood that burns gives the
+// wood that the stove loses, and the heat that the room gets. A reaction
+// has the rate one time, and each flow has a ratio.
+
+%mass: { dimension: "kg", scale: -6, conserved: true }
+
+// What a fire does with one kilogram of wood: the wood goes, and heat comes.
+// The stove gives the stocks and the heat of its wood.
+#Burn: #Reaction & {
+    fuel: #Interaction & { ratio: 1, conserved: false }
+    heat: #Interaction & { conserved: false }
+}
+
+#Stove: #Phenomenon & {
+    room:    #ThermalPort
+    wood:    %mass                    // the wood in the stove
+    life:    %time                    // the time in which the fire burns 63 % of the wood
+    burning: %mass / %time            // the wood that burns in each second
+    heating: %energy / %mass          // the heat from each kilogram of wood
+
+    // a fire with more wood burns faster
+    speed: .burning == .wood / .life
+
+    burn: #Burn & {
+        rate: .burning
+        fuel: { source: .wood }
+        heat: { sink: .room.energy, ratio: .heating }
+    }
+}
+
+cabin: #Room & { temperature: 278.15K, capacity: 500000J/K }
+air:   #Room & { temperature: 268.15K, capacity: 1000000000J/K }
+
+stove: #Stove & { room: cabin.west, wood: 5kg, life: 40min, heating: 15MJ/kg }
+walls: #Wall & { hot: cabin.west, cold: air.west, conductance: 150W/K }

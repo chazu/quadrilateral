@@ -260,7 +260,7 @@ static QWorld *tank(bool with_save, QkKernel **kernel)
         { "tolerance", QK_IN, "", -9, { 1, 1000000000 } },
         { "volume", QK_STOCK, "m^3", -9, ANY },
     };
-    const QkRateTransfer moves[] = { { "tap", 0, 2, QK_NONE, 3 }, { "leak", 1, 2, 3, QK_NONE } };
+    const QkRateTransfer moves[] = { { "tap", 0, 2, QK_NONE, 3, QK_NONE }, { "leak", 1, 2, 3, QK_NONE, QK_NONE } };
     *kernel = qk_rate_new(slots, 4, moves, 2);
     CHECK(*kernel != NULL);
     if (*kernel) {
