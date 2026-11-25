@@ -1,0 +1,128 @@
+// A toy coal power plant. Use this file with thermal.quad:
+//
+//   build/quad run examples/thermal.quad examples/plant.quad --until 4h --every 30min \
+//       --set bunker.feed=0.5@0s --set turbine.valve=22500@40min \
+//       --show bunker.coal,fire.firing,furnace.temperature,boiler.temperature,turbine.electric
+//
+// The plant starts cold, with no coal on the grate and a closed steam valve.
+// The operator gives the feed of coal and opens the valve with --set.
+//
+// The heat goes one way: the feeder puts coal on the grate, the fire burns
+// it in the furnace, the tubes heat the boiler, the steam goes through the
+// turbine to the condenser, and two cooling towers give the rest of the heat
+// to the air. The turbine changes a part of the heat of the steam into
+// electricity.
+//
+// examples/plant-view.sh runs ten hours at the plant and makes a page that shows it.
+
+%mass: { dimension: "kg", scale: -6, conserved: true }
+
+// What the feeder shows of the grate: the coal that lies on it.
+#CoalPort: #Port & { coal: %mass }
+
+// The feeder moves coal from the bunker to the grate at the rate that the
+// operator asks for. It gives less when the bunker is almost empty, so the
+// coal does not go below zero.
+#Bunker: #Phenomenon & {
+    grate:   #CoalPort
+    coal:    %mass                    // the coal in the bunker
+    feed:    %mass / %time            // the rate that the operator asks for
+    reserve: %mass                    // with this much coal, the feeder gives half of `feed`
+    level:   %ratio                   // the coal, as a multiple of the reserve
+    fed:     %mass / %time            // the coal that the feeder gives in each second
+
+    fill:   .level == .coal / .reserve
+    feeder: .fed == .feed * .level / (.level + 1)
+    move:   #Interaction & { source: .coal, sink: .grate.coal, rate: .fed }
+}
+
+// One kilogram of coal that burns goes from the grate, and its heat goes
+// into the furnace. A reaction has the rate one time.
+#Burn: #Reaction & {
+    fuel: #Interaction & { ratio: 1, conserved: false }
+    heat: #Interaction & { conserved: false }
+}
+
+// The fire burns the coal on the grate. In a cold furnace only the part
+// `pilot` of the bed can burn, so the fire starts small. A warmer furnace
+// lights more of the bed, and the fire grows. The coal that does not burn
+// yet stays on the grate.
+#Fire: #Phenomenon & {
+    furnace: #ThermalPort
+    bed:     %mass                    // the coal on the grate
+    grate:   #CoalPort & { coal: .bed }
+    life:    %time                    // a bed that burns everywhere loses 63 % of its coal in this time
+    cold:    %temperature             // at this temperature only the pilot part burns
+    kindle:  %temperature             // this much above `cold`, about half of the bed burns
+    pilot:   %ratio                   // the part of the bed that burns in a cold furnace
+    warm:    %ratio                   // how warm the furnace is: 0 at `cold`, 1 at `kindle` above it
+    alight:  %ratio                   // the part of the bed that burns
+    firing:  %mass / %time            // the coal that burns in each second
+    heating: %energy / %mass          // the heat from each kilogram of coal
+    thermal: %energy / %time          // the heat that the fire gives in each second
+
+    warmth:   .warm == (.furnace.temperature - .cold) / .kindle
+    ignition: .alight == (.pilot + .warm) / (1 + .warm)
+    speed:    .firing == .alight * .bed / .life
+    output:   .thermal == .firing * .heating
+
+    burn: #Burn & {
+        rate: .firing
+        fuel: { source: .bed }
+        heat: { sink: .furnace.energy, ratio: .heating }
+    }
+}
+
+// The steam takes heat from the boiler. The turbine changes the part
+// `efficiency` of that heat into electricity, and the rest goes to the
+// condenser. The two flows have the same source, and their ratios are 1
+// together, so the turbine makes no energy and loses none.
+#Expand: #Reaction & {
+    work:    #Interaction
+    exhaust: #Interaction
+}
+
+#Turbine: #Phenomenon & {
+    hot:  #ThermalPort                // the boiler
+    cold: #ThermalPort                // the condenser
+    valve:      %conductance          // how much steam the valve lets through. 0 is closed
+    quality:    %ratio                // the part of the ideal efficiency that the machine reaches
+    efficiency: %ratio
+    rejected:   %ratio
+    steam:      %energy / %time       // the heat that the steam takes from the boiler
+    electric:   %energy / %time       // the electrical power
+    generated:  %energy               // the electricity since the start
+
+    // more steam flows when the boiler is hotter than the condenser
+    flow:   .steam == .valve * (.hot.temperature - .cold.temperature)
+    // a heat engine is better when its cold side is colder
+    carnot: .efficiency == .quality * (1 - .cold.temperature / .hot.temperature)
+    rest:   .rejected == 1 - .efficiency
+    power:  .electric == .steam * .efficiency
+
+    expand: #Expand & {
+        rate:    .steam
+        work:    { source: .hot.energy, sink: .generated,   ratio: .efficiency }
+        exhaust: { source: .hot.energy, sink: .cold.energy, ratio: .rejected }
+    }
+}
+
+// The parts that hold heat. Each starts at the temperature of the air.
+furnace:   #Room & { temperature: 290K, capacity: 20MJ/K }
+boiler:    #Room & { temperature: 290K, capacity: 60MJ/K }
+condenser: #Room & { temperature: 290K, capacity: 20MJ/K }
+tower1:    #Room & { temperature: 290K, capacity: 50MJ/K }
+tower2:    #Room & { temperature: 290K, capacity: 50MJ/K }
+air:       #Room & { temperature: 290K, capacity: 10TJ/K }
+
+bunker:  #Bunker & { grate: fire.grate, coal: 12000kg, feed: 0kg/s, reserve: 100kg }
+fire:    #Fire & { furnace: furnace.west, bed: 0kg, life: 60s, cold: 290K, kindle: 200K, pilot: 5pct, heating: 24MJ/kg }
+turbine: #Turbine & { hot: boiler.west, cold: condenser.west, valve: 0W/K, quality: 60pct, generated: 0J }
+
+// The paths of the heat with no machine: tubes, a stack, pipes and the draft.
+tubes:  #Wall & { hot: furnace.west,   cold: boiler.west, conductance: 27kW/K }
+stack:  #Wall & { hot: furnace.west,   cold: air.west,    conductance: 1300W/K }
+loop1:  #Wall & { hot: condenser.west, cold: tower1.west, conductance: 230kW/K }
+loop2:  #Wall & { hot: condenser.west, cold: tower2.west, conductance: 230kW/K }
+draft1: #Wall & { hot: tower1.west,    cold: air.west,    conductance: 230kW/K }
+draft2: #Wall & { hot: tower2.west,    cold: air.west,    conductance: 230kW/K }

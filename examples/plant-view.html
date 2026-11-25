@@ -1,0 +1,716 @@
+<title>Toy Coal Plant</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<!--
+  The page of examples/plant-view.sh. The script puts three texts into this
+  file: the table that `quad run` prints, the list of the inputs, and the
+  command. The page computes nothing about the plant. It only draws the table.
+-->
+<style>
+/* Layout: a control-room mimic panel. One wide process diagram, the time
+   control below it, four figures, and then the trends as small charts. */
+:root {
+  --bg: #eceff1;
+  --panel: #fbfcfc;
+  --ink: #111c24;
+  --ink-2: #4b5862;
+  --muted: #7b868e;
+  --grid: #e0e5e8;
+  --axis: #c2cace;
+  --edge: rgba(17, 28, 36, .13);
+  --steel: #dfe5e9;
+  --steel-edge: #5c6a75;
+  --coal: #262d33;
+  --accent: #0d5f7d;
+  --heat: #eb6834;
+  --elec: #d99200;
+  --s1: #2a78d6;
+  --s2: #eb6834;
+  --s3: #1baf7a;
+  --s4: #eda100;
+  --s5: #e87ba4;
+  --critical: #d03b3b;
+  --display: "Barlow Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d1317; --panel: #171d22; --ink: #e8eef1; --ink-2: #b7c2c9; --muted: #84909a;
+    --grid: #262f36; --axis: #3a454d; --edge: rgba(255, 255, 255, .12);
+    --steel: #27313a; --steel-edge: #8d9ba6; --coal: #56616a; --accent: #6cc0de;
+    --heat: #d95926; --elec: #c98500;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+    --critical: #e66767;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d1317; --panel: #171d22; --ink: #e8eef1; --ink-2: #b7c2c9; --muted: #84909a;
+  --grid: #262f36; --axis: #3a454d; --edge: rgba(255, 255, 255, .12);
+  --steel: #27313a; --steel-edge: #8d9ba6; --coal: #56616a; --accent: #6cc0de;
+  --heat: #d95926; --elec: #c98500;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+  --critical: #e66767;
+  color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 var(--body);
+}
+.page {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding-block: 28px 48px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+h1, h2, h3 { font-family: var(--display); font-weight: 600; margin: 0; text-wrap: balance; }
+h1 { font-size: 40px; line-height: 1.05; letter-spacing: .01em; text-transform: uppercase; }
+h2 { font-size: 22px; letter-spacing: .04em; text-transform: uppercase; }
+h3 { font-size: 19px; letter-spacing: .02em; }
+p { margin: 0; }
+.lede { color: var(--ink-2); max-width: 65ch; margin-top: 6px; }
+code, .mono { font-family: var(--mono); font-size: .92em; }
+
+.panel { background: var(--panel); border: 1px solid var(--edge); border-radius: 6px; }
+
+/* the diagram */
+.mimic-scroll { overflow-x: auto; }
+.mimic { display: block; width: 100%; min-width: 820px; height: auto; }
+.mimic text { font-family: var(--display); fill: var(--ink-2); font-size: 13px; letter-spacing: .06em; }
+.mimic .val { font-family: var(--mono); font-size: 15px; font-weight: 500; fill: var(--ink); letter-spacing: 0; }
+.mimic .big { font-family: var(--mono); font-size: 21px; font-weight: 500; fill: var(--ink); letter-spacing: 0; }
+.mimic .flowlabel { font-family: var(--mono); font-size: 12.5px; fill: var(--ink-2); letter-spacing: 0; }
+.mimic .vessel { fill: var(--steel); stroke: var(--steel-edge); stroke-width: 1.5; }
+.mimic .frame { fill: none; stroke: var(--steel-edge); stroke-width: 1.5; }
+.mimic .ground { stroke: var(--axis); stroke-width: 1; }
+.mimic .pipe { fill: none; stroke: var(--axis); stroke-linejoin: round; stroke-linecap: round; }
+.mimic .flow { fill: none; stroke-linejoin: round; stroke-dasharray: 7 11; }
+.mimic .flow.heat { stroke: var(--heat); }
+.mimic .flow.elec { stroke: var(--elec); }
+.mimic .flow.coal { stroke: var(--coal); }
+.mimic .coalfill { fill: var(--coal); }
+.mimic .flame { fill: var(--heat); }
+.mimic .flame-core { fill: var(--s4); }
+.mimic .plume { fill: var(--muted); }
+.mimic .alarm text { fill: var(--critical); font-size: 13px; }
+.mimic .alarm polygon { fill: var(--critical); }
+.mimic .rotor { stroke: var(--steel-edge); stroke-width: 2; fill: none; }
+
+/* the time control */
+.transport { padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 12px; }
+.transport-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+button {
+  font: 600 15px var(--display); letter-spacing: .08em; text-transform: uppercase;
+  color: var(--panel); background: var(--accent); border: 0; border-radius: 4px;
+  padding: 8px 16px; min-width: 84px; cursor: pointer;
+}
+button.quiet { color: var(--accent); background: transparent; border: 1px solid var(--accent); min-width: 56px; }
+button:focus-visible, input:focus-visible, .events button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.clock { font: 500 22px var(--mono); min-width: 5.5ch; font-variant-numeric: tabular-nums; }
+.clock small { font-size: 13px; color: var(--muted); font-weight: 400; }
+.scrub { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.scrub input { width: 100%; margin: 0; accent-color: var(--accent); }
+.ticks { position: relative; height: 8px; margin: 0 8px; }
+.ticks i { position: absolute; top: 0; width: 2px; height: 8px; margin-left: -1px; background: var(--ink-2); border-radius: 1px; }
+.ticks i.result { background: var(--critical); }
+.events { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 6px 16px; }
+.events button {
+  all: unset; box-sizing: border-box; cursor: pointer; display: grid; grid-template-columns: 4.2ch 1fr; gap: 10px;
+  width: 100%; padding: 6px 8px; border-radius: 4px; border-left: 3px solid transparent; font: 14px/1.35 var(--body); color: var(--ink-2);
+}
+.events button:hover { background: var(--bg); }
+.events li.past button { color: var(--ink); }
+.events li.current button { border-left-color: var(--accent); background: var(--bg); color: var(--ink); }
+.events time { font: 500 13px var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+.events small { display: block; font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+
+/* the four figures */
+.figures { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.figure { padding: 12px 14px; }
+.figure dt { font: 500 14px var(--display); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); }
+.figure dd { margin: 2px 0 0; font: 500 28px/1.15 var(--mono); }
+.figure dd span { font-size: 14px; color: var(--muted); margin-left: 4px; }
+dl { margin: 0; }
+
+/* charts */
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 430px), 1fr)); gap: 12px; }
+.chart { padding: 14px 14px 10px; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.chart p { color: var(--ink-2); font-size: 13px; }
+.legend { list-style: none; margin: 2px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; color: var(--ink-2); }
+.legend li { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { width: 14px; height: 0; border-top: 2px solid; border-radius: 1px; }
+.legend b { font: 500 13px var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+.plot { position: relative; }
+.plot svg { display: block; width: 100%; height: 220px; cursor: crosshair; touch-action: pan-y; }
+.plot text { font: 11px var(--body); fill: var(--muted); font-variant-numeric: tabular-nums; }
+.plot .gridline { stroke: var(--grid); stroke-width: 1; }
+.plot .base { stroke: var(--axis); stroke-width: 1; }
+.plot .evline { stroke: var(--axis); stroke-width: 1; }
+.plot .series { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.plot .now { stroke: var(--ink); stroke-width: 1.5; }
+.plot .hover { stroke: var(--muted); stroke-width: 1; }
+.tip {
+  position: absolute; top: 6px; pointer-events: none; background: var(--panel); border: 1px solid var(--edge);
+  border-radius: 4px; padding: 6px 8px; font-size: 12px; box-shadow: 0 2px 10px rgba(0, 0, 0, .14); white-space: nowrap; z-index: 2;
+}
+.tip div { display: flex; align-items: center; gap: 6px; }
+.tip i { width: 12px; border-top: 2px solid; }
+.tip b { font: 500 12px var(--mono); color: var(--ink); min-width: 6ch; text-align: right; }
+.tip span { color: var(--ink-2); }
+.tip .when { font: 500 12px var(--mono); color: var(--muted); margin-bottom: 2px; }
+
+/* the table and the note */
+details { padding: 12px 14px; }
+summary { cursor: pointer; font: 600 17px var(--display); letter-spacing: .06em; text-transform: uppercase; color: var(--accent); }
+.table-scroll { overflow-x: auto; margin-top: 10px; }
+table { border-collapse: collapse; font: 13px var(--mono); font-variant-numeric: tabular-nums; width: 100%; }
+th, td { padding: 4px 10px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+th { font: 500 13px var(--display); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); vertical-align: bottom; }
+.source { color: var(--ink-2); font-size: 14px; display: flex; flex-direction: column; gap: 8px; }
+.source pre { margin: 0; padding: 10px 12px; overflow-x: auto; font: 12.5px/1.5 var(--mono); background: var(--panel); border: 1px solid var(--edge); border-radius: 6px; color: var(--ink); }
+.source p { max-width: 75ch; }
+</style>
+
+<div class="page">
+  <header>
+    <h1>Toy coal plant</h1>
+    <p class="lede">Ten hours at a small coal power plant. Quadrilateral computed each number from <code>examples/plant.quad</code>. Start the run, or move the time.</p>
+  </header>
+
+  <figure class="panel mimic-scroll" style="margin:0">
+    <svg class="mimic" viewBox="0 0 1100 520" role="img" aria-label="Diagram of the plant. Coal burns in the furnace. The furnace heats the boiler. Steam drives the turbine and the generator. The condenser gives the rest of the heat to two cooling towers, and the towers give it to the air.">
+      <defs>
+        <clipPath id="hopper"><polygon points="40,285 150,285 150,335 115,372 75,372 40,335"/></clipPath>
+        <marker id="tip-heat" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--heat)"/></marker>
+      </defs>
+
+      <line class="ground" x1="20" y1="440" x2="1080" y2="440"/>
+      <!-- legs of the bunker -->
+      <path class="frame" d="M56,345 L56,440 M134,345 L134,440"/>
+
+      <g id="pipes"></g>
+
+      <!-- bunker -->
+      <polygon class="vessel" points="40,285 150,285 150,335 115,372 75,372 40,335"/>
+      <rect id="coalfill" class="coalfill" x="40" y="285" width="110" height="87" clip-path="url(#hopper)"/>
+      <polygon class="frame" points="40,285 150,285 150,335 115,372 75,372 40,335"/>
+      <text x="95" y="256" text-anchor="middle">BUNKER</text>
+      <text id="v-coal" class="val" x="95" y="275" text-anchor="middle">12.0 t</text>
+
+      <!-- stack and furnace -->
+      <rect class="vessel" x="300" y="96" width="30" height="156"/>
+      <rect id="furnace" class="vessel" x="215" y="250" width="130" height="190"/>
+      <g id="flame" transform="translate(280 432)">
+        <path class="flame" d="M0,0 C-34,0 -44,-30 -24,-52 C-22,-38 -12,-36 -10,-48 C-8,-70 6,-78 4,-96 C30,-72 14,-56 26,-44 C30,-52 30,-58 28,-62 C50,-36 36,0 0,0 Z"/>
+        <path class="flame-core" d="M0,-4 C-16,-4 -20,-20 -10,-30 C-8,-22 -2,-24 0,-40 C14,-26 6,-22 12,-16 C22,-8 12,-4 0,-4 Z"/>
+      </g>
+      <text x="280" y="274" text-anchor="middle">FURNACE</text>
+      <text id="v-furnace" class="val" x="280" y="294" text-anchor="middle">17 °C</text>
+      <text x="280" y="318" text-anchor="middle">ON THE GRATE</text>
+      <text id="v-bed" class="flowlabel" x="280" y="334" text-anchor="middle">0 kg</text>
+      <text x="342" y="64" text-anchor="start">STACK</text>
+
+      <!-- boiler -->
+      <rect id="boiler" class="vessel" x="430" y="250" width="140" height="120" rx="18"/>
+      <text x="500" y="304" text-anchor="middle">BOILER</text>
+      <text id="v-boiler" class="val" x="500" y="324" text-anchor="middle">17 °C</text>
+
+      <!-- valve -->
+      <g id="valve">
+        <polygon class="vessel" points="563,110 575,120 563,130"/>
+        <polygon class="vessel" points="587,110 575,120 587,130"/>
+      </g>
+      <text id="v-valve" x="575" y="150" text-anchor="middle">VALVE CLOSED</text>
+
+      <!-- turbine, shaft and generator -->
+      <path class="frame" style="stroke-width:5" d="M740,120 L800,120"/>
+      <polygon class="vessel" points="640,90 740,60 740,180 640,150"/>
+      <g id="rotor" transform="translate(694 120)">
+        <g id="rotor-spin" class="rotor">
+          <circle r="24"/>
+          <path d="M0,-24 L0,24 M-24,0 L24,0 M-17,-17 L17,17 M-17,17 L17,-17"/>
+        </g>
+      </g>
+      <text x="690" y="44" text-anchor="middle">TURBINE</text>
+      <text id="v-eff" class="flowlabel" x="678" y="204" text-anchor="end">0 % to electricity</text>
+      <circle class="vessel" cx="835" cy="120" r="36"/>
+      <text x="835" y="127" text-anchor="middle" style="font-size:22px">G</text>
+      <text x="835" y="176" text-anchor="middle">GENERATOR</text>
+
+      <!-- grid -->
+      <path class="frame" d="M985,152 L1000,92 L1015,152 M991,130 L1009,130 M978,106 L1022,106 M972,120 L1028,120"/>
+      <text x="1000" y="172" text-anchor="middle">GRID</text>
+      <text id="v-electric" class="big" x="922" y="100" text-anchor="middle">0.00 MW</text>
+
+      <!-- condenser -->
+      <rect id="condenser" class="vessel" x="620" y="300" width="140" height="70" rx="14"/>
+      <text x="690" y="330" text-anchor="middle">CONDENSER</text>
+      <text id="v-condenser" class="val" x="690" y="352" text-anchor="middle">17 °C</text>
+
+      <!-- cooling towers -->
+      <g id="plume1" class="plume"><ellipse cx="866" cy="262" rx="20" ry="11"/><ellipse cx="894" cy="252" rx="24" ry="13"/><ellipse cx="872" cy="238" rx="18" ry="10"/></g>
+      <g id="plume2" class="plume"><ellipse cx="996" cy="262" rx="20" ry="11"/><ellipse cx="1024" cy="252" rx="24" ry="13"/><ellipse cx="1002" cy="238" rx="18" ry="10"/></g>
+      <path id="tower1" class="vessel" d="M830,440 Q850,390 852,340 Q852,310 844,290 L916,290 Q908,310 908,340 Q910,390 930,440 Z"/>
+      <path id="tower2" class="vessel" d="M960,440 Q980,390 982,340 Q982,310 974,290 L1046,290 Q1038,310 1038,340 Q1040,390 1060,440 Z"/>
+      <text x="880" y="392" text-anchor="middle">TOWER 1</text>
+      <text id="v-tower1" class="val" x="880" y="412" text-anchor="middle">17 °C</text>
+      <text x="1010" y="392" text-anchor="middle">TOWER 2</text>
+      <text id="v-tower2" class="val" x="1010" y="412" text-anchor="middle">17 °C</text>
+      <g id="alarm" class="alarm" hidden>
+        <polygon points="966,196 973,183 980,196"/>
+        <text x="986" y="196" text-anchor="start">FAN FAILED</text>
+      </g>
+      <text x="945" y="322" text-anchor="middle">AIR</text>
+      <text id="v-air" class="val" x="945" y="342" text-anchor="middle">17 °C</text>
+
+      <g id="labels"></g>
+    </svg>
+  </figure>
+
+  <section class="panel transport" aria-label="Time of the run">
+    <div class="transport-row">
+      <button id="play" type="button">Play</button>
+      <button id="speed" type="button" class="quiet" aria-label="Speed">1×</button>
+      <div class="clock" aria-live="off"><span id="clock">0:00</span> <small>h:min</small></div>
+      <div class="scrub">
+        <div class="ticks" id="ticks" aria-hidden="true"></div>
+        <input id="time" type="range" min="0" max="36000" step="60" value="0" aria-label="Time of the run">
+      </div>
+    </div>
+    <ol class="events" id="events"></ol>
+  </section>
+
+  <dl class="figures">
+    <div class="panel figure"><dt>Electricity</dt><dd><b id="f-electric">0.00</b><span>MW</span></dd></div>
+    <div class="panel figure"><dt>Coal to electricity</dt><dd><b id="f-eff">0</b><span>%</span></dd></div>
+    <div class="panel figure"><dt>Coal in the bunker</dt><dd><b id="f-coal">12.0</b><span>t</span></dd></div>
+    <div class="panel figure"><dt>Generated since the start</dt><dd><b id="f-gen">0.0</b><span>MWh</span></dd></div>
+  </dl>
+
+  <section aria-label="Trends">
+    <div class="charts" id="charts"></div>
+  </section>
+
+  <details class="panel">
+    <summary>Table of the run, each 30 minutes</summary>
+    <div class="table-scroll"><table id="table"></table></div>
+  </details>
+
+  <section class="source">
+    <h2>Where the numbers come from</h2>
+    <p><code>examples/plant-view.sh</code> runs this command and puts the table that it prints into the page. A dark mark on the time line is an input of the operator, given with <code>--set</code>. A red mark is a result of the run. The fire starts small, because a cold furnace lights only a small part of the coal on the grate. The fire ends when the bunker is almost empty, because a law of the bunker then gives less coal.</p>
+    <pre id="command"></pre>
+    <p>The page shows a temperature in °C and a power in MW. The run has them in K and W. Between two rows of the table, the page draws a straight line.</p>
+  </section>
+</div>
+
+<script type="text/plain" id="run">
+@RUN@
+</script>
+<script type="text/plain" id="inputs">
+@EVENTS@
+</script>
+<script type="text/plain" id="cmd">
+@COMMAND@
+</script>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var SVG = 'http://www.w3.org/2000/svg';
+  function el(name, attrs, parent) {
+    var e = document.createElementNS(SVG, name);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+
+  /* --- the table of `quad run` ------------------------------------------------ */
+
+  // One value of the table: 12000, ~679.64, a range "1.5 .. 1.6" (the middle), or unknown (null).
+  function number(text) {
+    var parts = text.replace(/~/g, '').split(' .. ');
+    var a = parseFloat(parts[0]), b = parseFloat(parts[parts.length - 1]);
+    return isFinite(a) && isFinite(b) ? (a + b) / 2 : null;
+  }
+  function parseRun(text) {
+    var lines = text.split('\n').filter(function (l) { return l.trim(); });
+    var head = lines[0].trim().split(/\s{2,}/).map(function (h) { return h.split(' ')[0]; });
+    var cols = {};
+    head.forEach(function (h) { cols[h] = []; });
+    lines.slice(1).forEach(function (line) {
+      var cells = line.trim().split(/\s{2,}/);
+      head.forEach(function (h, i) { cols[h].push(i < cells.length ? number(cells[i]) : null); });
+    });
+    cols.time = cols[head[0]];
+    return cols;
+  }
+  function seconds(text) {
+    var v = parseFloat(text), u = text.replace(/^[0-9.]+/, '');
+    return v * (u === 'h' ? 3600 : u === 'min' ? 60 : u === 'd' ? 86400 : 1);
+  }
+
+  var run = parseRun($('run').textContent);
+  var T = run.time, N = T.length, END = T[N - 1] || 1;
+  if (N < 2) {
+    document.querySelector('.lede').textContent = 'The page has no table of a run. Make it with examples/plant-view.sh.';
+    return;
+  }
+
+  // The value of a cell at a time, on a straight line between two rows.
+  function at(path, t) {
+    var c = run[path];
+    if (!c) return 0;
+    var step = END / (N - 1), i = Math.min(N - 2, Math.max(0, Math.floor(t / step)));
+    var a = c[i], b = c[i + 1];
+    if (a === null) return b === null ? 0 : b;
+    if (b === null) return a;
+    return a + (b - a) * Math.min(1, Math.max(0, (t - T[i]) / (T[i + 1] - T[i])));
+  }
+  var celsius = function (path, t) { return at(path, t) - 273.15; };
+  var mw = function (path, t) { return at(path, t) / 1e6; };
+
+  /* --- the events ---------------------------------------------------------------- */
+
+  var events = $('inputs').textContent.split('\n').filter(function (l) { return l.indexOf('|') > 0; }).map(function (l) {
+    var p = l.split('|');
+    return { t: seconds(p[0].trim()), set: p[1].trim(), text: p[2].trim(), result: false };
+  });
+  // Two results of the run. The fire first burns the coal as fast as the feeder
+  // gives it. Later the feeder gives less than half of what the operator asks for.
+  function firstRow(test) { for (var i = 1; i < N; i++) if (test(i)) return i; return -1; }
+  function cell(path, i) { return run[path] ? run[path][i] : null; }
+  var lit = firstRow(function (i) { return cell('bunker.fed', i) > 0 && cell('fire.firing', i) >= cell('bunker.fed', i); });
+  if (lit > 0) events.push({ t: T[lit], set: 'a result of the run', result: true,
+    text: 'The furnace is hot. The fire burns the coal as fast as the feeder gives it.' });
+  var empty = firstRow(function (i) { return cell('bunker.feed', i) > 0 && cell('bunker.fed', i) !== null && cell('bunker.fed', i) < cell('bunker.feed', i) / 2; });
+  if (empty > 0) events.push({ t: T[empty], set: 'a result of the run', result: true,
+    text: 'The bunker is almost empty, and the fire goes out.' });
+  events.sort(function (a, b) { return a.t - b.t; });
+
+  function hm(t) {
+    var m = Math.round(t / 60);
+    return Math.floor(m / 60) + ':' + ('0' + (m % 60)).slice(-2);
+  }
+
+  /* --- the diagram --------------------------------------------------------------- */
+
+  var rejected = function (t) { return mw('turbine.steam', t) - mw('turbine.electric', t); };
+  var pipes = [
+    { d: 'M95,372 L95,400 L215,400', kind: 'coal', v: function (t) { return at('bunker.fed', t) * at('fire.heating', t) / 1e6; },
+      label: function (t) { return at('bunker.fed', t).toFixed(2) + ' kg/s'; }, x: 170, y: 421, a: 'middle' },
+    { d: 'M345,310 L430,310', kind: 'heat', v: function (t) { return mw('tubes.power', t); }, x: 387, y: 298, a: 'middle' },
+    { d: 'M315,250 L315,62', kind: 'heat', v: function (t) { return mw('stack.power', t); }, x: 342, y: 82, a: 'start', arrow: true },
+    { d: 'M500,250 L500,120 L640,120', kind: 'heat', v: function (t) { return mw('turbine.steam', t); }, x: 512, y: 103, a: 'start', name: 'steam ' },
+    { d: 'M871,120 L972,120', kind: 'elec', v: function (t) { return mw('turbine.electric', t); } },
+    { d: 'M690,172 L690,300', kind: 'heat', v: rejected, x: 700, y: 250, a: 'start' },
+    { d: 'M670,370 L670,470 L880,470 L880,440', kind: 'heat', v: function (t) { return mw('loop1.power', t); }, x: 790, y: 463, a: 'middle' },
+    { d: 'M720,370 L720,495 L1010,495 L1010,440', kind: 'heat', v: function (t) { return mw('loop2.power', t); }, x: 930, y: 488, a: 'middle' },
+    { d: 'M880,290 L880,224', kind: 'heat', v: function (t) { return mw('draft1.power', t); }, x: 880, y: 212, a: 'middle', arrow: true },
+    { d: 'M1010,290 L1010,224', kind: 'heat', v: function (t) { return mw('draft2.power', t); }, x: 1010, y: 212, a: 'middle', arrow: true }
+  ];
+  pipes.forEach(function (p) {
+    p.base = el('path', { d: p.d, 'class': 'pipe' }, $('pipes'));
+    p.flow = el('path', { d: p.d, 'class': 'flow ' + p.kind }, $('pipes'));
+    if (p.arrow) p.flow.setAttribute('marker-end', 'url(#tip-heat)');
+    if (p.x) p.text = el('text', { x: p.x, y: p.y, 'text-anchor': p.a, 'class': 'flowlabel' }, $('labels'));
+    p.offset = 0;
+  });
+
+  // The tint of a part that holds heat: more of the heat colour for a hotter part.
+  // The scale is a square root, so the cooler parts show a change also.
+  function tint(id, c, air) {
+    var f = Math.sqrt(Math.min(1, Math.max(0, (c - air) / 950)));
+    $(id).style.fill = 'color-mix(in srgb, var(--heat) ' + (f * 55).toFixed(1) + '%, var(--steel))';
+  }
+  var maxDraft = 0, maxCoal = run['bunker.coal'] ? run['bunker.coal'][0] : 1;
+  for (var i = 0; i < N; i++) maxDraft = Math.max(maxDraft, run['draft1.power'][i] || 0, run['draft2.power'][i] || 0);
+  var fanNormal = run['draft2.conductance'] ? run['draft2.conductance'][0] : 0;
+
+  function drawDiagram(t, wobble) {
+    var air = celsius('air.temperature', t);
+    [['furnace', 'furnace.temperature'], ['boiler', 'boiler.temperature'], ['condenser', 'condenser.temperature'],
+     ['tower1', 'tower1.temperature'], ['tower2', 'tower2.temperature']].forEach(function (p) {
+      var c = celsius(p[1], t);
+      tint(p[0], c, air);
+      $('v-' + p[0]).textContent = c.toFixed(0) + ' °C';
+    });
+    $('v-air').textContent = air.toFixed(0) + ' °C';
+
+    var coal = Math.max(0, at('bunker.coal', t));
+    $('v-coal').textContent = (coal / 1000).toFixed(1) + ' t';
+    $('v-bed').textContent = Math.max(0, at('fire.bed', t)).toFixed(0) + ' kg';
+    var level = 87 * coal / maxCoal;
+    $('coalfill').setAttribute('y', (372 - level).toFixed(1));
+    $('coalfill').setAttribute('height', level.toFixed(1));
+
+    var fire = Math.min(1.4, at('fire.firing', t) / 0.5);
+    var s = fire < 0.004 ? 0 : 0.2 + 0.6 * fire;       // the flame stays below the texts of the furnace
+    $('flame').setAttribute('transform', 'translate(280 432) scale(' + (s * (1 + 0.04 * wobble)).toFixed(3) + ' ' + (s * (1 - 0.07 * wobble)).toFixed(3) + ')');
+
+    var open = at('turbine.valve', t) > 0;
+    $('v-valve').textContent = open ? 'VALVE OPEN' : 'VALVE CLOSED';
+    Array.prototype.forEach.call($('valve').children, function (half) { half.style.fill = open ? 'var(--panel)' : 'var(--steel-edge)'; });
+    $('v-eff').textContent = (open ? at('turbine.efficiency', t) * 100 : 0).toFixed(0) + ' % to electricity';
+    $('v-electric').textContent = mw('turbine.electric', t).toFixed(2) + ' MW';
+
+    $('plume1').style.opacity = (0.5 * Math.max(0, at('draft1.power', t)) / (maxDraft || 1)).toFixed(3);
+    $('plume2').style.opacity = (0.5 * Math.max(0, at('draft2.power', t)) / (maxDraft || 1)).toFixed(3);
+    $('alarm').hidden = !(at('draft2.conductance', t) < fanNormal * 0.5);
+
+    pipes.forEach(function (p) {
+      var v = Math.max(0, p.v(t));
+      p.now = v;
+      var w = 2 + 6 * Math.sqrt(Math.min(1, v / 12));
+      p.base.setAttribute('stroke-width', (w + 3).toFixed(1));
+      p.flow.setAttribute('stroke-width', w.toFixed(1));
+      p.flow.style.opacity = v < 0.01 ? 0 : 1;
+      if (p.text) p.text.textContent = p.label ? p.label(t) : (p.name || '') + v.toFixed(v < 9.95 ? 2 : 1) + ' MW';
+    });
+  }
+  // The marks of a flow move faster for a larger flow. The rotor turns with the steam.
+  var spin = 0;
+  function moveFlows(dt) {
+    pipes.forEach(function (p) {
+      if (p.now < 0.01) return;
+      p.offset = (p.offset - dt * (10 + 70 * Math.min(1, p.now / 12))) % 18;
+      p.flow.setAttribute('stroke-dashoffset', p.offset.toFixed(2));
+    });
+    spin = (spin + dt * 40 * (pipes[3].now || 0)) % 360;
+    $('rotor-spin').setAttribute('transform', 'rotate(' + spin.toFixed(1) + ')');
+  }
+
+  /* --- the charts ------------------------------------------------------------------ */
+
+  function niceStep(span, count) {
+    var raw = span / count, mag = Math.pow(10, Math.floor(Math.log10(raw))), r = raw / mag;
+    return (r <= 1 ? 1 : r <= 2 ? 2 : r <= 5 ? 5 : 10) * mag;
+  }
+  var charts = [];
+  function makeChart(spec) {
+    var card = document.createElement('article');
+    card.className = 'panel chart';
+    var h = document.createElement('h3'); h.textContent = spec.title; card.appendChild(h);
+    var sub = document.createElement('p'); sub.textContent = spec.sub; card.appendChild(sub);
+    var legend = document.createElement('ul'); legend.className = 'legend';
+    spec.series.forEach(function (s) {
+      var li = document.createElement('li'), key = document.createElement('i'), name = document.createElement('span');
+      key.style.borderColor = 'var(' + s.color + ')';
+      name.textContent = s.label;
+      s.readout = document.createElement('b');
+      li.appendChild(key); li.appendChild(name); li.appendChild(s.readout);
+      legend.appendChild(li);
+    });
+    if (spec.series.length > 1) card.appendChild(legend);
+    else { s0(spec).readout.className = ''; sub.appendChild(document.createTextNode(' Now: ')); sub.appendChild(s0(spec).readout); }
+    var plot = document.createElement('div'); plot.className = 'plot';
+    var svg = el('svg', { role: 'img', 'aria-label': spec.title + '. ' + spec.sub }, null);
+    var tip = document.createElement('div'); tip.className = 'tip'; tip.hidden = true;
+    plot.appendChild(svg); plot.appendChild(tip); card.appendChild(plot);
+    $('charts').appendChild(card);
+
+    var data = spec.series.map(function (s) { return T.map(function (t) { return s.get(t); }); });
+    var lo = spec.zero ? 0 : Infinity, hi = -Infinity;
+    data.forEach(function (d) { d.forEach(function (v) { lo = Math.min(lo, v); hi = Math.max(hi, v); }); });
+    if (spec.zero && lo > -0.02 * (hi - lo)) lo = 0;
+    var step = niceStep(hi - lo || 1, 5);
+    lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step;
+
+    var c = { spec: spec, W: 0, H: 220, m: { l: 40, r: 12, t: 8, b: 22 } };
+    c.x = function (t) { return c.m.l + (c.W - c.m.l - c.m.r) * t / END; };
+    c.y = function (v) { return c.m.t + (c.H - c.m.t - c.m.b) * (1 - (v - lo) / (hi - lo)); };
+    c.draw = function () {
+      c.W = plot.clientWidth || 400;
+      svg.setAttribute('viewBox', '0 0 ' + c.W + ' ' + c.H);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      for (var v = lo; v <= hi + step / 2; v += step) {
+        el('line', { x1: c.m.l, x2: c.W - c.m.r, y1: c.y(v), y2: c.y(v), 'class': v === lo ? 'base' : 'gridline' }, svg);
+        el('text', { x: c.m.l - 6, y: c.y(v) + 4, 'text-anchor': 'end' }, svg).textContent = +v.toFixed(6);
+      }
+      var hours = END / 3600, every = c.W < 380 ? 2 : 1;
+      for (var k = 0; k <= hours; k += every)
+        el('text', { x: c.x(k * 3600), y: c.H - 6, 'text-anchor': k === 0 ? 'start' : 'middle' }, svg).textContent = k + ' h';
+      events.forEach(function (e) {
+        if (e.t > 0) el('line', { x1: c.x(e.t), x2: c.x(e.t), y1: c.m.t, y2: c.H - c.m.b, 'class': 'evline' }, svg);
+      });
+      data.forEach(function (d, i) {
+        var path = d.map(function (v, j) { return (j ? 'L' : 'M') + c.x(T[j]).toFixed(1) + ',' + c.y(v).toFixed(1); }).join('');
+        el('path', { d: path, 'class': 'series', stroke: 'var(' + spec.series[i].color + ')' }, svg);
+      });
+      c.hover = el('line', { y1: c.m.t, y2: c.H - c.m.b, 'class': 'hover', visibility: 'hidden' }, svg);
+      c.now = el('line', { y1: c.m.t, y2: c.H - c.m.b, 'class': 'now' }, svg);
+      c.setNow(time);
+    };
+    c.setNow = function (t) {
+      if (c.now) { c.now.setAttribute('x1', c.x(t)); c.now.setAttribute('x2', c.x(t)); }
+      spec.series.forEach(function (s) { s.readout.textContent = fixed(s.get(t), spec.digits) + ' ' + spec.unit; });
+    };
+    function pointerTime(ev) {
+      var box = svg.getBoundingClientRect();
+      var t = (ev.clientX - box.left - c.m.l) / (c.W - c.m.l - c.m.r) * END;
+      var j = Math.min(N - 1, Math.max(0, Math.round(t / (END / (N - 1)))));
+      return { t: T[j], px: ev.clientX - box.left };
+    }
+    svg.addEventListener('pointermove', function (ev) {
+      var p = pointerTime(ev);
+      c.hover.setAttribute('x1', c.x(p.t)); c.hover.setAttribute('x2', c.x(p.t));
+      c.hover.setAttribute('visibility', 'visible');
+      while (tip.firstChild) tip.removeChild(tip.firstChild);
+      var when = document.createElement('div'); when.className = 'when'; when.textContent = hm(p.t) + ' h:min'; tip.appendChild(when);
+      spec.series.forEach(function (s) {
+        var row = document.createElement('div'), key = document.createElement('i'), val = document.createElement('b'), name = document.createElement('span');
+        key.style.borderColor = 'var(' + s.color + ')';
+        val.textContent = fixed(s.get(p.t), spec.digits) + ' ' + spec.unit;
+        name.textContent = s.label;
+        row.appendChild(key); row.appendChild(val); row.appendChild(name); tip.appendChild(row);
+      });
+      tip.hidden = false;
+      var left = c.x(p.t) + 10;
+      if (left + tip.offsetWidth > c.W) left = c.x(p.t) - 10 - tip.offsetWidth;
+      tip.style.left = Math.max(0, left) + 'px';
+    });
+    svg.addEventListener('pointerleave', function () { tip.hidden = true; c.hover.setAttribute('visibility', 'hidden'); });
+    svg.addEventListener('click', function (ev) { seek(pointerTime(ev).t); });
+    charts.push(c);
+    return c;
+  }
+  function s0(spec) { return spec.series[0]; }
+  function fixed(v, digits) { var text = v.toFixed(digits); return +text === 0 ? (0).toFixed(digits) : text; }
+
+  /* --- the time ------------------------------------------------------------------ */
+
+  var reduced = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var time = reduced ? Math.min(END, 2.5 * 3600) : 0, playing = !reduced, speed = 1, last = null, wob = 0;
+  var slider = $('time');
+  slider.max = END;
+
+  function render() {
+    drawDiagram(time, reduced ? 0 : Math.sin(wob * 11) * 0.6 + Math.sin(wob * 17) * 0.4);
+    charts.forEach(function (c) { c.setNow(time); });
+    slider.value = time;
+    $('clock').textContent = hm(time);
+    var thermal = mw('fire.thermal', time), electric = mw('turbine.electric', time);
+    $('f-electric').textContent = electric.toFixed(2);
+    $('f-eff').textContent = thermal > 0.05 ? (100 * electric / thermal).toFixed(0) : '0';
+    $('f-coal').textContent = (Math.max(0, at('bunker.coal', time)) / 1000).toFixed(1);
+    $('f-gen').textContent = (at('turbine.generated', time) / 3.6e9).toFixed(1);
+    var current = -1;
+    events.forEach(function (e, i) { if (e.t <= time) current = i; });
+    Array.prototype.forEach.call($('events').children, function (li, i) {
+      li.className = i === current ? 'current past' : i < current ? 'past' : '';
+    });
+  }
+  function seek(t) { time = Math.min(END, Math.max(0, t)); render(); }
+  function setPlaying(on) {
+    playing = on;
+    $('play').textContent = on ? 'Pause' : 'Play';
+    last = null;
+  }
+  function frame(now) {
+    var dt = last === null ? 0 : Math.min(0.1, (now - last) / 1000);
+    last = now;
+    if (playing) {
+      time += dt * speed * END / 60;      // the whole run in one minute at 1×
+      if (time >= END) { time = END; setPlaying(false); }
+      wob += dt;
+      render();
+    }
+    if (!reduced && (playing || dt)) moveFlows(playing ? dt : 0);
+    requestAnimationFrame(frame);
+  }
+
+  $('play').addEventListener('click', function () {
+    if (!playing && time >= END) time = 0;
+    setPlaying(!playing);
+  });
+  $('speed').addEventListener('click', function () {
+    speed = speed === 1 ? 2 : speed === 2 ? 4 : 1;
+    $('speed').textContent = speed + '×';
+  });
+  slider.addEventListener('input', function () { seek(+slider.value); });
+
+  events.forEach(function (e) {
+    var li = document.createElement('li'), b = document.createElement('button'), when = document.createElement('time');
+    var body = document.createElement('span'), note = document.createElement('small');
+    b.type = 'button';
+    when.textContent = hm(e.t);
+    body.textContent = e.text;
+    note.textContent = e.set;
+    body.appendChild(note);
+    b.appendChild(when); b.appendChild(body); li.appendChild(b);
+    b.addEventListener('click', function () { seek(e.t); });
+    $('events').appendChild(li);
+    var tick = document.createElement('i');
+    tick.style.left = (100 * e.t / END) + '%';
+    if (e.result) tick.className = 'result';
+    $('ticks').appendChild(tick);
+  });
+
+  /* --- the content of the charts and the table ----------------------------------- */
+
+  makeChart({ title: 'Where the heat goes', sub: 'Power of each flow, in MW.', unit: 'MW', digits: 2, zero: true, series: [
+    { label: 'Steam to the turbine', color: '--s1', get: function (t) { return mw('turbine.steam', t); } },
+    { label: 'Heat from the burning coal', color: '--s2', get: function (t) { return mw('fire.thermal', t); } },
+    { label: 'Towers to the air', color: '--s3', get: function (t) { return mw('draft1.power', t) + mw('draft2.power', t); } },
+    { label: 'Electricity', color: '--s4', get: function (t) { return mw('turbine.electric', t); } },
+    { label: 'Stack to the air', color: '--s5', get: function (t) { return mw('stack.power', t); } }
+  ] });
+  makeChart({ title: 'Hot side', sub: 'Temperature of the furnace and the boiler, in °C.', unit: '°C', digits: 0, zero: true, series: [
+    { label: 'Boiler', color: '--s1', get: function (t) { return celsius('boiler.temperature', t); } },
+    { label: 'Furnace', color: '--s2', get: function (t) { return celsius('furnace.temperature', t); } }
+  ] });
+  makeChart({ title: 'Cold side', sub: 'Temperature of the condenser and the towers, in °C. The air stays at 17 °C.', unit: '°C', digits: 1, series: [
+    { label: 'Condenser', color: '--s1', get: function (t) { return celsius('condenser.temperature', t); } },
+    { label: 'Tower 2', color: '--s2', get: function (t) { return celsius('tower2.temperature', t); } },
+    { label: 'Tower 1', color: '--s3', get: function (t) { return celsius('tower1.temperature', t); } }
+  ] });
+  makeChart({ title: 'Coal in the bunker', sub: 'Mass of the coal, in tonnes.', unit: 't', digits: 2, zero: true, series: [
+    { label: 'Coal', color: '--s1', get: function (t) { return Math.max(0, at('bunker.coal', t)) / 1000; } }
+  ] });
+
+  var columns = [
+    ['Time', function (t) { return hm(t); }],
+    ['Coal t', function (t) { return (Math.max(0, at('bunker.coal', t)) / 1000).toFixed(2); }],
+    ['Fed kg/s', function (t) { return at('bunker.fed', t).toFixed(3); }],
+    ['On the grate kg', function (t) { return Math.max(0, at('fire.bed', t)).toFixed(1); }],
+    ['Burns kg/s', function (t) { return at('fire.firing', t).toFixed(3); }],
+    ['Furnace °C', function (t) { return celsius('furnace.temperature', t).toFixed(0); }],
+    ['Boiler °C', function (t) { return celsius('boiler.temperature', t).toFixed(0); }],
+    ['Condenser °C', function (t) { return celsius('condenser.temperature', t).toFixed(1); }],
+    ['Tower 1 °C', function (t) { return celsius('tower1.temperature', t).toFixed(1); }],
+    ['Tower 2 °C', function (t) { return celsius('tower2.temperature', t).toFixed(1); }],
+    ['Steam MW', function (t) { return mw('turbine.steam', t).toFixed(2); }],
+    ['Electricity MW', function (t) { return mw('turbine.electric', t).toFixed(2); }],
+    ['Towers MW', function (t) { return (mw('draft1.power', t) + mw('draft2.power', t)).toFixed(2); }],
+    ['Stack MW', function (t) { return mw('stack.power', t).toFixed(2); }]
+  ];
+  var table = $('table'), headRow = table.insertRow();
+  columns.forEach(function (c) { var th = document.createElement('th'); th.textContent = c[0]; headRow.appendChild(th); });
+  for (var t = 0; t <= END; t += 1800) {
+    var row = table.insertRow();
+    columns.forEach(function (c) { row.insertCell().textContent = c[1](t); });
+  }
+  $('command').textContent = $('cmd').textContent.trim();
+
+  var resize = null;
+  window.addEventListener('resize', function () {
+    clearTimeout(resize);
+    resize = setTimeout(function () { charts.forEach(function (c) { c.draw(); }); }, 120);
+  });
+  charts.forEach(function (c) { c.draw(); });
+  setPlaying(playing);
+  render();
+  requestAnimationFrame(frame);
+})();
+</script>
