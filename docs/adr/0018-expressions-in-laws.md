@@ -12,7 +12,7 @@ ADR 0016 section 4 lowered a law of one shape: `a == b` or `a == b op c`, with r
 
 - A law is an equation (`==`) or an inequality (`<`, `<=`, `>`, `>=`). Each side is a reference, a number with its unit, or an expression of those with `+`, `-`, `*`, `/` and parentheses.
 - Each operation gives one propagator. A reference on one side and one operation on the other side give one propagator with no new cell, as in ADR 0016.
-- `!=`, the logic operators, and function calls in a law are errors. A relation that is not an equation or an order belongs to the relation layer of stage 5.
+- `!=`, the logic operators, and function calls in a law are errors. A relation that is not an equation or an order belongs to the relation layer of stage 5. ADR 0022 section 4 allows one form with logic operators: a law that gives a condition to a field with the type `bool`.
 
 ### 2. An inner value is a derived cell
 

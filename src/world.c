@@ -874,6 +874,16 @@ QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, Qn
     return add_cell(w, path, kind, true, qi_top(), base, false, out);
 }
 
+QwStatus qw_derived_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out)
+{
+    QnCell c;
+    QwStatus s = add_cell(w, path, kind, true, qi_top(), base, false, &c);
+    if (s) return s;
+    w->cells[c].derived = true;
+    if (out) *out = c;
+    return QW_OK;
+}
+
 QwStatus qw_alias(QWorld *w, const char *path, const char *cell)
 {
     QnCell c, dup;
@@ -2462,6 +2472,7 @@ QwStatus qw_input_set(QWorld *w, const char *path, uint64_t mask)
     if (qw_find(w, path, &c) != QW_OK) return fail(w, QW_ENAME, "no cell '%s'", path);
     if (!set_cell(w, c)) return fail(w, QW_ETYPE, "'%s' is not a set cell", path);
     if (w->cells[c].host_only) return fail(w, QW_EOWNER, "only the host writes '%s'", path);
+    if (w->cells[c].derived) return fail(w, QW_EOWNER, "'%s' is derived: a law gives its value", path);
     QInterval base = qn_base(w->net, c);
     uint64_t universe = word(base.hi);
     if (!mask || (mask & ~universe)) return fail(w, QW_ETYPE, "invalid atoms for '%s'", path);

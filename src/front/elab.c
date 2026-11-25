@@ -1052,8 +1052,9 @@ typedef struct {
 
 static uint32_t mirror(Law *l, uint32_t cell, const uint32_t *mcells, uint32_t mphen);
 
-/* The cell of a reference in a law. QI_NONE with a diagnostic. */
-static uint32_t operand(Law *l, const X *x)
+/* The cell of a reference in a law. sets: the cell can be a set cell, for a
+ * truth value (ADR 0022). QI_NONE with a diagnostic. */
+static uint32_t ref_cell(Law *l, const X *x, bool sets)
 {
     Elab *e = l->e;
     const ArithRec *rec = l->use->rec;
@@ -1078,7 +1079,7 @@ static uint32_t operand(Law *l, const X *x)
             VEC_FREE(full);
         }
         size_t errors = e->f->nerrors;
-        if (c != QI_NONE && e->via != QI_NONE && e->cells.v[c].domain != QI_SET) {
+        if (c != QI_NONE && e->via != QI_NONE && (sets || e->cells.v[c].domain != QI_SET)) {
             /* the cell depends on the active model of a phenomenon: the law reads a copy */
             uint32_t mphen, *mcells = model_cells(e, l->phen, rel.s, &mphen);
             c = mirror(l, c, mcells, mphen);
@@ -1091,7 +1092,7 @@ static uint32_t operand(Law *l, const X *x)
             else
                 err(e, l->loc, "the law %s reads %s.%s, which is not a cell", l->law, e->phens.v[l->phen].name,
                     b.s ? b.s : "");
-        } else if (c != QI_NONE && e->cells.v[c].domain == QI_SET) {
+        } else if (c != QI_NONE && !sets && e->cells.v[c].domain == QI_SET) {
             err(e, l->loc, "the law %s uses %s, which is a set of atoms: arithmetic needs quantities", l->law,
                 e->cells.v[c].path);
             c = QI_NONE;
@@ -1102,6 +1103,8 @@ static uint32_t operand(Law *l, const X *x)
     err(e, l->loc, "the law %s: %s is not bound to a field", l->law, x->u.name);
     return QI_NONE;
 }
+
+static uint32_t operand(Law *l, const X *x) { return ref_cell(l, x, false); }
 
 static void unsupported(Law *l)
 {
@@ -1123,6 +1126,7 @@ static bool fits(const QType *z, const QType *x, const QType *y, QiOp op, QStatu
         return !(*why = qtype_mul_plan(x, y, z, &k)) && !(*why = qtype_div_plan(z, y, x, &k)) &&
                !(*why = qtype_div_plan(z, x, y, &k));
     case QI_QUOTIENT: return fits(x, z, y, QI_PRODUCT, why);               /* x = z * y */
+    case QI_IN_RANGE: case QI_IN_SET: case QI_AND: case QI_OR: case QI_NOT: break;   /* truth values have no kind */
     }
     return false;
 }
@@ -1150,7 +1154,7 @@ static void misfit(Law *l, QStatus why, uint32_t z, uint32_t a, uint32_t b)
  * a constant. It is a derived cell with no field in source. Its path is the
  * name of the law and a number, in the order in which the expression makes
  * the cells. */
-static uint32_t inner(Law *l, const QType *qt, QInterval base)
+static Sym inner_path(Law *l)
 {
     Elab *e = l->e;
     uint64_t key = (uint64_t) (uintptr_t) qf_sym(e->f, l->name), n = 0;
@@ -1162,8 +1166,16 @@ static uint32_t inner(Law *l, const QType *qt, QInterval base)
     qf_buf_free(&b);
     if (u64map_get(&e->paths, (uint64_t) (uintptr_t) path, NULL)) {
         err(e, l->loc, "the law %s needs the path %s for an inner value, and a field has that path", l->law, path);
-        return QI_NONE;
+        return NULL;
     }
+    return path;
+}
+
+static uint32_t inner(Law *l, const QType *qt, QInterval base)
+{
+    Elab *e = l->e;
+    Sym path = inner_path(l);
+    if (!path) return QI_NONE;
     QiCell c = { keep(e, path), l->phen, l->own, QI_INTERVAL, use_qtype(e, qt), base, 0, false, true, true };
     VEC_PUSH(e->cells, c);
     VEC_PUSH(e->ctypes, *qt);
@@ -1172,13 +1184,36 @@ static uint32_t inner(Law *l, const QType *qt, QInterval base)
     return (uint32_t) e->cells.n - 1;
 }
 
+/* A set cell with the path `path`: the cell of a condition, or an inner
+ * value with atoms (ADR 0022 section 3). The laws give its value in each
+ * epoch. */
+static uint32_t derived_set(Elab *e, Sym path, uint32_t phen, uint32_t model, uint32_t en, uint64_t mask, bool is_inner)
+{
+    QiCell c = { keep(e, path), phen, model, QI_SET, en, { 0, 0 }, mask, false, true, is_inner };
+    QType none;
+    memset(&none, 0, sizeof none);
+    VEC_PUSH(e->cells, c);
+    VEC_PUSH(e->ctypes, none);
+    VEC_PUSH(e->start, c.base);
+    u64map_put(&e->paths, (uint64_t) (uintptr_t) path, e->cells.n);
+    return (uint32_t) e->cells.n - 1;
+}
+
+static uint32_t inner_set(Law *l, uint32_t en, uint64_t mask)
+{
+    Sym path = inner_path(l);
+    return path ? derived_set(l->e, path, l->phen, l->own, en, mask, true) : QI_NONE;
+}
+
+static uint64_t all_atoms(const QiEnum *en) { return en->natoms >= 64 ? ~(uint64_t) 0 : ((uint64_t) 1 << en->natoms) - 1; }
+
 /* A law of a model is a propagator of that model: it works only while the
  * model is active (ADR 0021 section 1). */
 static void emit(Law *l, QiOp op, uint32_t z, uint32_t a, uint32_t b)
 {
     Elab *e = l->e;
     QiProp p = { l->phen, l->own == QI_NONE ? QI_NONE : l->phen, l->own, op, { z, a, b }, keep(e, l->name), keep(e, l->law),
-                 l->loc.file ? keep(e, l->loc.file) : NULL, l->loc.line, l->loc.col };
+                 l->loc.file ? keep(e, l->loc.file) : NULL, l->loc.line, l->loc.col, { 0, 0 }, 0 };
     VEC_PUSH(e->props, p);
 }
 
@@ -1192,7 +1227,8 @@ static uint32_t mirror(Law *l, uint32_t cell, const uint32_t *mcells, uint32_t m
     Elab *e = l->e;
     QType qt = e->ctypes.v[cell];
     qt.kind = 0;                                     /* the copy is not state, so it has no conserved kind */
-    uint32_t z = inner(l, &qt, qi_top());
+    uint32_t en = e->cells.v[cell].kind;
+    uint32_t z = e->cells.v[cell].domain == QI_SET ? inner_set(l, en, all_atoms(&e->enums.v[en])) : inner(l, &qt, qi_top());
     for (uint32_t m = 0; z != QI_NONE && m < nmodels(e, mphen); m++) {
         if (mcells[m] == QI_NONE) {
             err(e, l->loc, "the law %s reads %s through a port of %s, and the model %s gives no cell for it", l->law,
@@ -1200,7 +1236,7 @@ static uint32_t mirror(Law *l, uint32_t cell, const uint32_t *mcells, uint32_t m
             return QI_NONE;
         }
         QiProp p = { l->phen, mphen, m, QI_EQUAL, { z, mcells[m], QI_NONE }, keep(e, l->name), keep(e, l->law),
-                     l->loc.file ? keep(e, l->loc.file) : NULL, l->loc.line, l->loc.col };
+                     l->loc.file ? keep(e, l->loc.file) : NULL, l->loc.line, l->loc.col, { 0, 0 }, 0 };
         VEC_PUSH(e->props, p);
     }
     return z;
@@ -1280,6 +1316,11 @@ static uint32_t cell_of(Law *l, const X *x)
     return QI_NONE;
 }
 
+static bool is_truth(const Elab *e, uint32_t c);
+static bool truth_expr(const X *x) { return x->k == X_LOGIC || x->k == X_NOT || x->k == X_CMP; }
+static uint32_t truth(Law *l, const X *x, uint32_t z);
+static void truth_equal(Law *l, uint32_t z, uint32_t c);
+
 static void lower(Elab *e, uint32_t phen, const QfRecUse *use, uint32_t own)
 {
     const X *x = use->rec->expr;
@@ -1300,7 +1341,36 @@ static void lower(Elab *e, uint32_t phen, const QfRecUse *use, uint32_t own)
         if (x->k == X_CMP && x->u.ar.op == 'e') {
             const X *lhs = x->u.ar.a, *rhs = x->u.ar.b;
             if (lhs->k != X_TAG && rhs->k == X_TAG) { const X *t = lhs; lhs = rhs; rhs = t; }
-            if (lhs->k == X_TAG && rhs->k == X_ARITH) {
+            if (truth_expr(lhs) || truth_expr(rhs)) {
+                /* a field with the type bool gets the value of a condition (ADR 0022 section 4) */
+                uint32_t z = lhs->k == X_TAG ? ref_cell(&l, lhs, true) : truth(&l, lhs, QI_NONE);
+                if (z != QI_NONE && !is_truth(e, z))
+                    err(e, l.loc, "the law %s gives the value of a condition to %s, which does not have the type bool", text,
+                        e->cells.v[z].path);
+                else if (z != QI_NONE) truth(&l, rhs, z);
+            } else if (lhs->k == X_TAG && rhs->k == X_TAG) {
+                uint32_t a = ref_cell(&l, lhs, true), b = a == QI_NONE ? QI_NONE : ref_cell(&l, rhs, true);
+                bool sa = b != QI_NONE && e->cells.v[a].domain == QI_SET, sb = b != QI_NONE && e->cells.v[b].domain == QI_SET;
+                if (b == QI_NONE) {
+                } else if (sa || sb) {
+                    /* two truth values are equal */
+                    uint32_t bad = !is_truth(e, a) ? a : !is_truth(e, b) ? b : QI_NONE;
+                    if (sa != sb)
+                        err(e, l.loc, "the law %s has %s, which is a quantity, and %s, which is a set of atoms. An equation "
+                            "has two quantities, or two fields with the type bool", text, e->cells.v[sa ? b : a].path,
+                            e->cells.v[sa ? a : b].path);
+                    else if (bad != QI_NONE)
+                        err(e, l.loc, "the law %s has %s, which does not have the type bool. A law with atoms makes two "
+                            "fields with the type bool equal, or gives a field with the type bool the value of a condition",
+                            text, e->cells.v[bad].path);
+                    else truth_equal(&l, a, b);
+                } else {
+                    QType ta = e->ctypes.v[a], tb = e->ctypes.v[b];
+                    QStatus why = Q_OK;
+                    if (!fits(&ta, &tb, NULL, QI_EQUAL, &why)) misfit(&l, why, QI_NONE, a, b);
+                    else emit(&l, QI_EQUAL, a, b, QI_NONE);
+                }
+            } else if (lhs->k == X_TAG && rhs->k == X_ARITH) {
                 /* a reference and one operation: the operation writes the cell of the reference */
                 uint32_t z = operand(&l, lhs);
                 if (z != QI_NONE) lower_arith(&l, rhs, z);
@@ -1328,6 +1398,9 @@ static void lower(Elab *e, uint32_t phen, const QfRecUse *use, uint32_t own)
             if (z == QI_NONE)
                 err(e, l.loc, "%s has the value %s, and it is not a cell: give the field a kind", nb.s, text);
             else lower_arith(&l, x, z);
+        } else if (x->k == X_LOGIC || x->k == X_NOT) {
+            err(e, l.loc, "the law %s is a condition with a logic operator. A law can give a condition to a field with the "
+                "type bool, as in `.busy == (%s)`", text, text);
         } else {
             unsupported(&l);
         }
@@ -1875,6 +1948,320 @@ static void phen_interactions(Elab *e, uint32_t phen, size_t conn0, size_t conn1
 
 /* --- maps (ADR 0021 section 5) ---------------------------------------------------------------- */
 
+/* --- truth values (ADR 0022) ------------------------------------------------------------------- */
+
+static const char *const truth_forms =
+    "A condition has a path to a field with the type bool, a comparison of a path with an atom (== or !=), a comparison "
+    "of two quantities, and the operators !, && and ||";
+
+enum { ATOM_FALSE = 1, ATOM_TRUE = 2, ATOM_BOTH = 3 };
+
+/* The enumeration of the type bool: false, true. */
+static uint32_t use_bool(Elab *e)
+{
+    Front *f = e->f;
+    for (size_t i = 0; i < e->usedenums.n; i++)
+        if (e->usedenums.v[i] == f->tbool) return (uint32_t) i;
+    QiEnum en = { keep(e, f->types.v[f->tbool].name), qf_alloc(e->mem, 2 * sizeof(char *)), 2 };
+    en.atoms[0] = keep(e, "false");
+    en.atoms[1] = keep(e, "true");
+    VEC_PUSH(e->usedenums, f->tbool);
+    VEC_PUSH(e->enums, en);
+    return (uint32_t) e->usedenums.n - 1;
+}
+
+/* A cell with the type bool: a set cell with the atoms false and true. */
+static bool is_truth(const Elab *e, uint32_t c)
+{
+    if (e->cells.v[c].domain != QI_SET) return false;
+    const QiEnum *en = &e->enums.v[e->cells.v[c].kind];
+    return en->natoms == 2 && !strcmp(en->atoms[0], "false") && !strcmp(en->atoms[1], "true");
+}
+
+static void emit_truth(Law *l, QiOp op, uint32_t z, uint32_t a, uint32_t b, QInterval range, uint64_t mask)
+{
+    emit(l, op, z, a, b);
+    l->e->props.v[l->e->props.n - 1].range = range;
+    l->e->props.v[l->e->props.n - 1].mask = mask;
+}
+
+static void emit_logic(Law *l, QiOp op, uint32_t z, uint32_t a, uint32_t b) { emit_truth(l, op, z, a, b, (QInterval) { 0, 0 }, 0); }
+
+/* The cell of a result: z, or a new inner value. */
+static uint32_t truth_result(Law *l, uint32_t z) { return z != QI_NONE ? z : inner_set(l, use_bool(l->e), ATOM_BOTH); }
+
+/* z <=> c, for two cells with the type bool. Two cells of one enumeration
+ * are equal. If not, two negations make them equal. */
+static void truth_equal(Law *l, uint32_t z, uint32_t c)
+{
+    Elab *e = l->e;
+    if (e->cells.v[z].kind == e->cells.v[c].kind) {
+        emit_logic(l, QI_EQUAL, z, c, QI_NONE);
+        return;
+    }
+    uint32_t t = inner_set(l, use_bool(e), ATOM_BOTH);
+    if (t == QI_NONE) return;
+    emit_logic(l, QI_NOT, t, c, QI_NONE);
+    emit_logic(l, QI_NOT, z, t, QI_NONE);
+}
+
+/* A condition with a value that the elaborator knows. */
+static uint32_t truth_constant(Law *l, bool value, uint32_t z)
+{
+    if (z == QI_NONE) return inner_set(l, use_bool(l->e), value ? ATOM_TRUE : ATOM_FALSE);
+    uint32_t c = inner_set(l, use_bool(l->e), value ? ATOM_FALSE : ATOM_TRUE);
+    if (c == QI_NONE) return QI_NONE;
+    emit_logic(l, QI_NOT, z, c, QI_NONE);
+    return z;
+}
+
+/* A part of a sum: an expression with its factor, after the same text on
+ * the two sides of a comparison is one part. */
+typedef struct { const X *x; char *text; int coef; uint32_t cell; } Term;
+typedef VEC(Term) TermVec;
+
+static void sum_terms(const X *x, int sign, TermVec *out)
+{
+    if (x->k == X_ARITH && (x->u.ar.op == '+' || x->u.ar.op == '-')) {
+        sum_terms(x->u.ar.a, sign, out);
+        sum_terms(x->u.ar.b, x->u.ar.op == '+' ? sign : -sign, out);
+        return;
+    }
+    char *text = x_text(x);
+    for (size_t i = 0; i < out->n; i++)
+        if (!strcmp(out->v[i].text, text)) {
+            out->v[i].coef += sign;
+            free(text);
+            return;
+        }
+    Term t = { x, text, sign, QI_NONE };
+    VEC_PUSH(*out, t);
+}
+
+/* z = a op b for two cells, where z is a new inner value with no kind. */
+static uint32_t sum_cells(Law *l, QiOp op, uint32_t a, uint32_t b)
+{
+    Elab *e = l->e;
+    QType ta = e->ctypes.v[a], tb = e->ctypes.v[b], t;
+    QStatus why = qtype_sum(&ta, &tb, &t);
+    if (why) { misfit(l, why, QI_NONE, a, b); return QI_NONE; }
+    t.kind = 0;                                      /* not state */
+    uint32_t z = inner(l, &t, qi_top());
+    if (z == QI_NONE) return QI_NONE;
+    if (!fits(&t, &ta, &tb, op, &why)) { misfit(l, why, z, a, b); return QI_NONE; }
+    emit(l, op, z, a, b);
+    return z;
+}
+
+/* The sum of the parts whose factor has the sign `sign`. QI_NONE if there is
+ * no such part, or with a diagnostic: then *bad is true. */
+static uint32_t sum_side(Law *l, const TermVec *ts, int sign, bool *bad)
+{
+    uint32_t acc = QI_NONE;
+    for (size_t i = 0; i < ts->n && !*bad; i++)
+        for (int k = 0; k < ts->v[i].coef * sign && !*bad; k++) {
+            acc = acc == QI_NONE ? ts->v[i].cell : sum_cells(l, QI_SUM, acc, ts->v[i].cell);
+            *bad = acc == QI_NONE;
+        }
+    return *bad ? QI_NONE : acc;
+}
+
+/* The range of "x op 0" in quanta, for an order or an equation. */
+static QInterval sign_range(int op)
+{
+    return op == 'e'   ? (QInterval) { 0, 0 }
+           : op == '<' ? (QInterval) { Q_NINF, -1 }
+           : op == 'l' ? (QInterval) { Q_NINF, 0 }
+           : op == '>' ? (QInterval) { 1, Q_INF }
+                       : (QInterval) { 0, Q_INF };
+}
+
+static bool literal_quanta(Elab *e, const XNum *num, uint32_t cell, int64_t *lo, int64_t *hi, char *why, size_t len);
+
+/* r <=> d is in the range, or for `!=`, r <=> d is not in the range. */
+static uint32_t truth_range(Law *l, int op, uint32_t d, QInterval range, uint32_t z)
+{
+    uint32_t r = truth_result(l, z);
+    if (r == QI_NONE) return QI_NONE;
+    if (op != 'n') {
+        emit_truth(l, QI_IN_RANGE, r, d, QI_NONE, range, 0);
+        return r;
+    }
+    uint32_t t = inner_set(l, use_bool(l->e), ATOM_BOTH);
+    if (t == QI_NONE) return QI_NONE;
+    emit_truth(l, QI_IN_RANGE, t, d, QI_NONE, range, 0);
+    emit_logic(l, QI_NOT, r, t, QI_NONE);
+    return r;
+}
+
+/* A comparison of two quantities (ADR 0022 section 1). The same text on the
+ * two sides goes away first: `.t > .t - 1K` is `1K > 0`. A comparison of one
+ * cell with one number is a range of that cell. Each other comparison is a
+ * range of the difference of the two sides. */
+static uint32_t truth_compare(Law *l, const X *x, uint32_t z)
+{
+    Elab *e = l->e;
+    int op = x->u.ar.op;
+    TermVec ts = { 0 };
+    sum_terms(x->u.ar.a, 1, &ts);
+    sum_terms(x->u.ar.b, -1, &ts);
+    uint32_t r = QI_NONE;
+    bool bad = false;
+    char why[240];
+    /* Each part has a cell, also a part that goes away: its dimension must
+     * fit. A number gets its cell later, and only if the comparison needs it. */
+    QDim dim0 = qdim_none();
+    for (size_t i = 0; i < ts.n && !bad; i++) {
+        QDim dim;
+        if (ts.v[i].x->k == X_NUM) {
+            int64_t value;
+            int exp;
+            if (!qf_literal(e->f, &ts.v[i].x->u.num, &dim, &value, &exp, why, sizeof why)) {
+                err(e, l->loc, "the condition %s: %s", l->law, why);
+                bad = true;
+            }
+        } else {
+            ts.v[i].cell = ts.v[i].x->k == X_TAG ? ref_cell(l, ts.v[i].x, true) : cell_of(l, ts.v[i].x);
+            bad = ts.v[i].cell == QI_NONE;
+            if (!bad && e->cells.v[ts.v[i].cell].domain == QI_SET) {
+                err(e, l->loc, "the condition %s has a comparison with %s, which is a set of atoms. A set of atoms stands in "
+                    "a comparison with an atom, with == or !=", l->law, e->cells.v[ts.v[i].cell].path);
+                bad = true;
+            }
+            if (!bad) dim = e->ctypes.v[ts.v[i].cell].dim;
+        }
+        if (!bad && !i) dim0 = dim;
+        if (!bad && i && !qdim_eq(&dim0, &dim)) {
+            Buf has = { 0 }, needs = { 0 };
+            dim_unit(e, &has, &dim);
+            dim_unit(e, &needs, &dim0);
+            err(e, l->loc, "the condition %s compares %s, in %s, with %s, in %s", l->law, ts.v[0].text,
+                needs.len ? needs.s : "1", ts.v[i].text, has.len ? has.s : "1");
+            qf_buf_free(&has);
+            qf_buf_free(&needs);
+            bad = true;
+        }
+    }
+    const Term *num = NULL, *ref = NULL;
+    size_t live = 0;
+    for (size_t i = 0; i < ts.n; i++) {
+        if (!ts.v[i].coef) continue;
+        live++;
+        if (ts.v[i].x->k == X_NUM) num = &ts.v[i];
+        else ref = &ts.v[i];
+    }
+    int64_t lo = 0, hi = 0;
+    if (bad) {
+    } else if (live == 2 && num && ref && num->coef == -ref->coef && (ref->coef == 1 || ref->coef == -1)) {
+        /* cell op number: a range of the cell. With the cell on the right, the order turns */
+        int o = ref->coef > 0 ? op : op == '<' ? '>' : op == '>' ? '<' : op == 'l' ? 'g' : op == 'g' ? 'l' : op;
+        if (!literal_quanta(e, &num->x->u.num, ref->cell, &lo, &hi, why, sizeof why)) {
+            err(e, l->loc, "the condition %s: %s", l->law, why);
+        } else if (lo != hi && (op == 'e' || op == 'n')) {
+            err(e, l->loc, "the condition %s compares %s with %s: the number is between two steps of the field, so the two are "
+                "never equal. Use %s", l->law, ref->text, num->text, op == 'e' ? "<= or >=" : "< or >");
+        } else {
+            QInterval range = o == '<'   ? (QInterval) { Q_NINF, hi - 1 }
+                              : o == 'l' ? (QInterval) { Q_NINF, lo }
+                              : o == '>' ? (QInterval) { lo + 1, Q_INF }
+                              : o == 'g' ? (QInterval) { hi, Q_INF }
+                                         : (QInterval) { lo, lo };
+            r = truth_range(l, op, ref->cell, range, z);
+        }
+    } else {
+        for (size_t i = 0; i < ts.n && !bad; i++)
+            if (ts.v[i].coef && ts.v[i].x->k == X_NUM) bad = (ts.v[i].cell = cell_of(l, ts.v[i].x)) == QI_NONE;
+        uint32_t p = sum_side(l, &ts, 1, &bad), n = sum_side(l, &ts, -1, &bad);
+        if (bad) {
+        } else if (p == QI_NONE && n == QI_NONE) {
+            /* each part went away: 0 op 0 */
+            r = truth_constant(l, op == 'e' || op == 'l' || op == 'g', z);
+        } else {
+            /* p - n op 0. With no p, n has the other order */
+            uint32_t d = p == QI_NONE ? n : n == QI_NONE ? p : sum_cells(l, QI_DIFFERENCE, p, n);
+            int o = p != QI_NONE ? op : op == '<' ? '>' : op == '>' ? '<' : op == 'l' ? 'g' : op == 'g' ? 'l' : op;
+            if (d != QI_NONE) r = truth_range(l, op, d, sign_range(o == 'n' ? 'e' : o), z);
+        }
+    }
+    for (size_t i = 0; i < ts.n; i++) free(ts.v[i].text);
+    VEC_FREE(ts);
+    return r;
+}
+
+/* A comparison of a path with an atom: r <=> the set cell is in the atoms. */
+static uint32_t truth_atom(Law *l, const X *x, uint32_t z)
+{
+    Elab *e = l->e;
+    int op = x->u.ar.op;
+    const X *ref = x->u.ar.a->k == X_ATOM ? x->u.ar.b : x->u.ar.a, *val = x->u.ar.a->k == X_ATOM ? x->u.ar.a : x->u.ar.b;
+    char *xt = x_text(x);
+    uint32_t r = QI_NONE, s = QI_NONE;
+    if (ref->k != X_TAG || (op != 'e' && op != 'n'))
+        err(e, l->loc, "the condition %s has the comparison %s. An atom stands in a comparison with one path, with == or !=",
+            l->law, xt);
+    else s = ref_cell(l, ref, true);
+    if (s != QI_NONE && e->cells.v[s].domain != QI_SET) {
+        err(e, l->loc, "the condition %s has the comparison %s, and %s is a quantity: compare it with a quantity", l->law, xt,
+            e->cells.v[s].path);
+    } else if (s != QI_NONE) {
+        const QiEnum *en = &e->enums.v[e->cells.v[s].kind];
+        const char *atom = atom_name(e, val->u.name);
+        uint64_t bit = 0, all = all_atoms(en);
+        for (uint32_t a = 0; a < en->natoms; a++)
+            if (!strcmp(en->atoms[a], atom)) bit = (uint64_t) 1 << a;
+        uint64_t mask = op == 'e' ? bit : all & ~bit;
+        if (!bit) {
+            Buf atoms = { 0 };
+            for (uint32_t a = 0; a < en->natoms; a++) qf_buf_printf(&atoms, "%s%s", a ? ", " : "", en->atoms[a]);
+            err(e, l->loc, "the condition %s has the comparison %s, and %s is not an atom of %s. Its atoms: %s", l->law, xt,
+                atom, e->cells.v[s].path, atoms.s);
+            qf_buf_free(&atoms);
+        } else if (!mask || mask == all) {
+            r = truth_constant(l, mask == all, z);   /* the field has one atom */
+        } else if ((r = truth_result(l, z)) != QI_NONE) {
+            emit_truth(l, QI_IN_SET, r, s, QI_NONE, (QInterval) { 0, 0 }, mask);
+        }
+    }
+    free(xt);
+    return r;
+}
+
+/* The cell with the value of a condition (ADR 0022 sections 1 to 3). z: the
+ * cell that gets the result, or QI_NONE: then the result is the cell of a
+ * path, or a new inner value. QI_NONE with a diagnostic. */
+static uint32_t truth(Law *l, const X *x, uint32_t z)
+{
+    Elab *e = l->e;
+    if (x->k == X_TAG) {
+        uint32_t c = ref_cell(l, x, true);
+        if (c == QI_NONE) return QI_NONE;
+        if (!is_truth(e, c)) {
+            err(e, l->loc, "the condition %s reads %s as a truth value, and it %s. %s", l->law, e->cells.v[c].path,
+                e->cells.v[c].domain == QI_SET ? "does not have the type bool" : "is a quantity", truth_forms);
+            return QI_NONE;
+        }
+        if (z == QI_NONE) return c;
+        truth_equal(l, z, c);
+        return z;
+    }
+    if (x->k == X_NOT) {
+        uint32_t a = truth(l, x->u.sub, QI_NONE), r = a == QI_NONE ? QI_NONE : truth_result(l, z);
+        if (r != QI_NONE) emit_logic(l, QI_NOT, r, a, QI_NONE);
+        return r;
+    }
+    if (x->k == X_LOGIC) {
+        uint32_t a = truth(l, x->u.ar.a, QI_NONE), b = a == QI_NONE ? QI_NONE : truth(l, x->u.ar.b, QI_NONE);
+        uint32_t r = b == QI_NONE ? QI_NONE : truth_result(l, z);
+        if (r != QI_NONE) emit_logic(l, x->u.ar.op == '&' ? QI_AND : QI_OR, r, a, b);
+        return r;
+    }
+    if (x->k == X_CMP) return x->u.ar.a->k == X_ATOM || x->u.ar.b->k == X_ATOM ? truth_atom(l, x, z) : truth_compare(l, x, z);
+    char *xt = x_text(x);
+    err(e, l->loc, "the condition %s has the part %s, which is not a truth value. %s", l->law, xt, truth_forms);
+    free(xt);
+    return QI_NONE;
+}
+
 static int cmp_map(const void *a, const void *b) { return strcmp(((const QiMap *) a)->name, ((const QiMap *) b)->name); }
 
 /* The quanta of a literal for a cell: floor and ceiling of its value in the
@@ -1915,6 +2302,37 @@ static bool literal_quanta(Elab *e, const XNum *num, uint32_t cell, int64_t *lo,
     return true;
 }
 
+/* A condition that is not a statement about one cell of the phenomenon
+ * (ADR 0022 section 3): a cell with the type bool at the field `when` of the
+ * map has its value, and propagators compute the cell. The condition of the
+ * world is then "the cell is true". False with a diagnostic. */
+static bool when_cell(Elab *e, uint32_t phen, const char *name, const QfRecUse *use, const char *text, QiCondition *out)
+{
+    Front *f = e->f;
+    const InstInfo *in = &f->insts.v[e->insts.v[phen]];
+    const X *x = use->rec->expr;
+    Loc loc = x->loc.file ? x->loc : inst_loc(in);
+    Buf nb = { 0 };
+    qf_buf_printf(&nb, "%s.%s.when", in->name, name);
+    Sym path = qf_sym(f, nb.s);
+    qf_buf_free(&nb);
+    size_t errors = f->nerrors;
+    if (u64map_get(&e->paths, (uint64_t) (uintptr_t) path, NULL)) {
+        err(e, loc, "the condition of the map %s.%s needs the path %s for its value, and a field has that path", in->name, name,
+            path);
+        return false;
+    }
+    uint32_t z = derived_set(e, path, phen, QI_NONE, use_bool(e), ATOM_BOTH, false);
+    Law l = { e, phen, use, text, path, loc, QI_NONE };
+    if (truth(&l, x, z) != QI_NONE && f->nerrors == errors) {
+        out->path = keep(e, path + strlen(in->name) + 1);
+        out->cell = z;
+        out->mask = ATOM_TRUE;
+        out->text = keep(e, text);
+    }
+    return f->nerrors == errors;
+}
+
 /* The condition of a map (ADR 0022 section 1): a statement about one cell of
  * the phenomenon. `when` is a path to a field with the type bool, or a
  * comparison of one path with an atom or a quantity. The result has a NULL
@@ -1927,8 +2345,8 @@ static bool map_condition(Elab *e, uint32_t phen, uint32_t mapfeat, const QfNode
     memset(out, 0, sizeof *out);
     out->cell = QI_NONE;
     const QfNode *wn = e->fwhen == QF_BOTTOM ? NULL : node_arc(map, e->fwhen);
-    static const char *const forms = "A condition is a path to a field with the type bool, as in `when: .visible`, or a "
-                                     "comparison of one path with an atom or a quantity, as in `when: .temperature > 300K`";
+    static const char *const forms = "A condition is a path to a field with the type bool, as in `when: .visible`, a "
+                                     "comparison, as in `when: .temperature > 300K`, or conditions with !, && and ||";
     /* a comparison is a constraint record at the path of the field */
     QfRecUses uses = { 0 };
     qf_records(f, in->node, &in->ariths, &uses);
@@ -1956,9 +2374,14 @@ static bool map_condition(Elab *e, uint32_t phen, uint32_t mapfeat, const QfNode
             val = x->u.ar.a;
             op = op == '<' ? '>' : op == '>' ? '<' : op == 'l' ? 'g' : op == 'g' ? 'l' : op;
         }
-        if (!ref || (val->k != X_NUM && val->k != X_ATOM)) {
-            err(e, loc, "the condition of the map %s.%s is %s. %s", in->name, name, text.s, forms);
-            ok = false;
+        /* Not one path with one constant: a cell at `when` has the value. A
+         * quantity with != is two ranges, so it has a cell too. */
+        if (!ref || (val->k != X_NUM && val->k != X_ATOM) || (val->k == X_NUM && op == 'n')) {
+            ok = when_cell(e, phen, name, use, text.s, out);
+            qf_buf_free(&rel);
+            qf_buf_free(&text);
+            qf_records_free(&uses);
+            return ok;
         }
         /* the cell of the path */
         for (size_t t = 0; ok && t < use->rec->tags.n; t++) {
@@ -2008,10 +2431,9 @@ static bool map_condition(Elab *e, uint32_t phen, uint32_t mapfeat, const QfNode
             } else if (!literal_quanta(e, &val->u.num, cell, &lo, &hi, why, sizeof why)) {
                 err(e, loc, "the condition of the map %s.%s is %s: %s", in->name, name, text.s, why);
                 ok = false;
-            } else if (op == 'n' || (op == 'e' && lo != hi)) {
-                err(e, loc, "the condition of the map %s.%s is %s: %s", in->name, name, text.s,
-                    op == 'n' ? "a quantity has no condition with !=. Use < or >"
-                              : "the number is between two steps of the field. Use <= or >=");
+            } else if (op == 'e' && lo != hi) {
+                err(e, loc, "the condition of the map %s.%s is %s: the number is between two steps of the field. Use <= or >=",
+                    in->name, name, text.s);
                 ok = false;
             } else {
                 out->range = op == 'e'   ? (QInterval) { lo, lo }
@@ -2048,7 +2470,12 @@ static bool map_condition(Elab *e, uint32_t phen, uint32_t mapfeat, const QfNode
         }
     }
     if (ok && cell != QI_NONE) {
-        if (e->cells.v[cell].phen != phen) {
+        if (e->cells.v[cell].phen != phen && use) {
+            /* through a connection: the world has no path for it in this phenomenon, so the cell at `when` has the value */
+            memset(out, 0, sizeof *out);
+            out->cell = QI_NONE;
+            ok = when_cell(e, phen, name, use, text.s, out);
+        } else if (e->cells.v[cell].phen != phen) {
             err(e, loc, "the condition of the map %s.%s reads %s, a field of another phenomenon: a condition reads a field "
                 "of its own phenomenon. Give %s a field with a law for the value", in->name, name, e->cells.v[cell].path,
                 in->name);
@@ -2168,6 +2595,18 @@ static void put_value(Elab *e, Buf *b, uint32_t cell, QInterval v)
     qf_buf_printf(b, "%s%s%s", text, *unit ? " " : "", unit);
 }
 
+static void put_atoms(Elab *e, Buf *b, uint32_t cell, uint64_t mask)
+{
+    const QiEnum *en = &e->enums.v[e->cells.v[cell].kind];
+    bool first = true;
+    for (uint32_t a = 0; a < en->natoms; a++)
+        if (mask >> a & 1) {
+            qf_buf_printf(b, "%s%s", first ? "" : " or ", en->atoms[a]);
+            first = false;
+        }
+    if (first) qf_buf_puts(b, "no atom");
+}
+
 /* A network of the runtime with the cells and the propagators of the laws.
  * values: the value of each cell. id: gets the cell of the network for each
  * cell. which: gets, for each propagator of the network, its index in
@@ -2179,7 +2618,10 @@ static QNet *law_net(Elab *e, const QInterval *values, QnCell *id, uint32_t *whi
     bool ok = net != NULL;
     size_t added = 0;
     for (size_t i = 0; ok && i < e->cells.n; i++)
-        if (e->cells.v[i].domain == QI_INTERVAL) ok = qn_cell(net, &e->ctypes.v[i], values[i], &id[i]) == QN_OK;
+        ok = (e->cells.v[i].domain == QI_INTERVAL
+                  ? qn_cell(net, &e->ctypes.v[i], values[i], &id[i])
+                  : qn_set_cell(net, e->cells.v[i].kind + 1, e->enums.v[e->cells.v[i].kind].natoms, e->cells.v[i].mask, &id[i])) ==
+             QN_OK;
     for (size_t i = 0; i < e->props.n; i++) which[i] = QI_NONE;
     for (size_t i = 0; ok && i < e->props.n; i++) {
         const QiProp *p = &e->props.v[i];
@@ -2188,12 +2630,7 @@ static QNet *law_net(Elab *e, const QInterval *values, QnCell *id, uint32_t *whi
         which[added++] = (uint32_t) i;
         QnCell z = id[p->cell[0]], x = id[p->cell[1]], y = p->cell[2] == QI_NONE ? 0 : id[p->cell[2]];
         QStatus q = Q_OK;
-        ok = (p->op == QI_EQUAL        ? qn_equal(net, z, x, &q)
-              : p->op == QI_SUM        ? qn_sum(net, z, x, y, &q)
-              : p->op == QI_DIFFERENCE ? qn_difference(net, z, x, y, &q)
-              : p->op == QI_PRODUCT    ? qn_product(net, z, x, y, &q)
-              : p->op == QI_QUOTIENT   ? qn_quotient(net, z, x, y, &q)
-                                       : qn_less_equal(net, z, x, p->op == QI_LESS, &q)) == QN_OK;
+        ok = qi_add_prop(net, p, e->cells.v[p->cell[0]].domain == QI_SET, z, x, y, &q) == QN_OK;
     }
     if (ok) return net;
     qn_free(net);
@@ -2214,7 +2651,8 @@ static bool settle(Elab *e, QNet *net, const QnCell *id, const uint32_t *which)
             if (p->cell[k] == QI_NONE) continue;
             if (vals.len) qf_buf_puts(&vals, ", ");
             qf_buf_printf(&vals, "%s = ", e->cells.v[p->cell[k]].inner ? "an inner value" : e->cells.v[p->cell[k]].path);
-            put_value(e, &vals, p->cell[k], qn_get(net, id[p->cell[k]]));
+            if (e->cells.v[p->cell[k]].domain == QI_SET) put_atoms(e, &vals, p->cell[k], qn_get_set(net, id[p->cell[k]]));
+            else put_value(e, &vals, p->cell[k], qn_get(net, id[p->cell[k]]));
         }
         err(e, inst_loc(&f->insts.v[e->insts.v[p->phen]]), "the values of %s at the start contradict the law %s: %s (%s)",
             e->phens.v[p->phen].name, p->name, p->law, vals.s);

@@ -207,5 +207,5 @@ This example sends the heat straight to the room. If the model includes a stove 
 
 ### Transition conditions (`quad-ijx.4.4`)
 
-Section 5 does not state the syntax of a condition, the result of two true conditions, and the form of the record for replay. ADR 0022 proposes those details, and it has the notes of that work. The project owner did not accept ADR 0022 yet.
+Section 5 does not state the syntax of a condition, the result of two true conditions, and the form of the record for replay. ADR 0022 has those details, and it has the notes of that work.
 

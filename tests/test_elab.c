@@ -2041,7 +2041,17 @@ void test_elab_errors(void)
            "world.quad:1:73: error: the law .e == (.c + .t) does not fit the kinds of its quantities: dimension "
            "mismatch (w.e is a %energy, w.c is a %capacity, w.t is a %temperature)\n");
     STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, door: \"open\" | \"closed\", rule: .t == .door }\nw: #W\n"),
-           "world.quad:1:72: error: the law .t == .door uses w.door, which is a set of atoms: arithmetic needs quantities\n");
+           "world.quad:1:72: error: the law .t == .door has w.t, which is a quantity, and w.door, which is a set of atoms. An "
+           "equation has two quantities, or two fields with the type bool\n");
+    STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, door: \"open\" | \"closed\", rule: .door == .t }\nw: #W\n"),
+           "world.quad:1:75: error: the law .door == .t has w.t, which is a quantity, and w.door, which is a set of atoms. An "
+           "equation has two quantities, or two fields with the type bool\n");
+    STR_EQ(compile_error("#W: #Phenomenon & { on: bool, door: \"open\" | \"closed\", rule: .on == .door }\nw: #W\n"),
+           "world.quad:1:66: error: the law .on == .door has w.door, which does not have the type bool. A law with atoms "
+           "makes two fields with the type bool equal, or gives a field with the type bool the value of a condition\n");
+    STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, door: \"open\" | \"closed\", rule: .t == .door + 1K }\nw: #W\n"),
+           "world.quad:1:72: error: the law .t == (.door + 1K) uses w.door, which is a set of atoms: arithmetic needs "
+           "quantities\n");
     STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, note: text, rule: .t == .note }\nw: #W\n"),
            "world.quad:1:59: error: the law .t == .note reads w.note, which is not a cell\n");
     STR_EQ(compile_error("#W: #Phenomenon & { t: %temperature, in: #ThermalPort, rule: .t == .in.temperature }\nw: #W\n"),
@@ -2208,6 +2218,20 @@ void test_examples(void)
         CHECK_I64((int64_t) qw_switches(w), 2);
         CHECK_I64(qw_get(w, "hall.energy").lo + qw_get(w, "study.coarse.energy").lo, total);
         CHECK(qw_get(w, "door.power").lo > 12000 && qw_get(w, "door.power").hi < 13000);   /* the README has ~12.529 W */
+    }
+    qw_free(w);
+    /* the same room with a lower limit: it becomes fine when it is warm, with no input (ADR 0022) */
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_input(w, "study.limit", qi_point(296000000)));
+        OK(qw_run(w, 300000000));
+        CHECK_I64((int64_t) qw_switches(w), 0);
+        CHECK(qw_get_set(w, "study.refine.when") == 1);
+        OK(qw_run(w, 600000000));
+        CHECK_I64((int64_t) qw_switches(w), 1);
+        CHECK(qw_get_set(w, "study.refine.when") == 2);
+        CHECK(qw_get(w, "study.fine.c0.temperature").lo > 297300000 &&
+              qw_get(w, "study.fine.c0.temperature").hi < 297400000);                    /* the README has ~297.373659 K */
     }
     qw_free(w);
     qi_free(ir);

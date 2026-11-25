@@ -94,6 +94,9 @@ QwStatus qw_anonymous_kind(QWorld *w, const char *dim, int scale, QwKind *out);
  * bound, or a point for a constant. A derived cell is not state: qw_hash
  * does not cover it, it takes no input, and a kernel cannot write it. */
 QwStatus qw_derived_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out);
+/* A derived set cell: a truth value that the laws give, such as the
+ * condition of a transition (ADR 0022 section 3). */
+QwStatus qw_derived_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out);
 /* A second path for the cell `cell`, in the same phenomenon. A port that is a
  * view of the phenomenon's own state uses it: after
  * qw_alias(w, "roomA.west.energy", "roomA.energy"), a connection to

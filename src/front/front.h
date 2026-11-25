@@ -707,6 +707,9 @@ const QkKernel *qi_find_kernel(const QiOptions *opt, const char *name);
  * native.room.refine or native.room.abstract. NULL for another name or for
  * n == 0. The caller frees it with qk_free. */
 QkKernel *qi_room_kernel(const char *name, unsigned n);
+/* Adds the propagator of the IR to a network. set: cell[0] is a set cell.
+ * z, x, y: the cells of the network for cell[0], cell[1] and cell[2]. */
+QnStatus qi_add_prop(QNet *net, const QiProp *p, bool set, QnCell z, QnCell x, QnCell y, QStatus *q);
 
 QfNode  *type_expansion(QfOp *c, uint32_t t);            /* NULL while t is being expanded */
 QfNode  *type_instance(QfOp *c, uint32_t t, QfStore *a); /* a copy, or a lazy node */

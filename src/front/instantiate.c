@@ -82,6 +82,26 @@ static QkKernel *rate_kernel(const QIr *ir, const QiKernelUse *ku)
     return k;
 }
 
+/* Adds the propagator of the IR to a network. set: cell[0] is a set cell. */
+QnStatus qi_add_prop(QNet *net, const QiProp *p, bool set, QnCell z, QnCell x, QnCell y, QStatus *q)
+{
+    switch (p->op) {
+    case QI_EQUAL:      return set ? qn_set_equal(net, z, x) : qn_equal(net, z, x, q);
+    case QI_SUM:        return qn_sum(net, z, x, y, q);
+    case QI_DIFFERENCE: return qn_difference(net, z, x, y, q);
+    case QI_PRODUCT:    return qn_product(net, z, x, y, q);
+    case QI_QUOTIENT:   return qn_quotient(net, z, x, y, q);
+    case QI_LESS_EQUAL: return qn_less_equal(net, z, x, false, q);
+    case QI_LESS:       return qn_less_equal(net, z, x, true, q);
+    case QI_IN_RANGE:   return qn_reify_in(net, z, x, p->range);
+    case QI_IN_SET:     return qn_reify_set(net, z, x, p->mask);
+    case QI_AND:        return qn_and(net, z, x, y);
+    case QI_OR:         return qn_or(net, z, x, y);
+    case QI_NOT:        return qn_not(net, z, x);
+    }
+    return QN_EVALUE;
+}
+
 QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWorld **out, char **error)
 {
     *out = NULL;
@@ -136,7 +156,8 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
     }
     for (uint32_t i = 0; i < ir->ncells && !s; i++) {
         const QiCell *c = &ir->cells[i];
-        s = c->domain == QI_SET ? qw_set_cell(w, c->path, kinds[ir->nkinds + c->kind], c->mask, &cells[i])
+        s = c->domain == QI_SET && c->derived ? qw_derived_set_cell(w, c->path, kinds[ir->nkinds + c->kind], c->mask, &cells[i])
+            : c->domain == QI_SET ? qw_set_cell(w, c->path, kinds[ir->nkinds + c->kind], c->mask, &cells[i])
             : c->derived        ? qw_derived_cell(w, c->path, kinds[c->kind], c->base, &cells[i])
                                 : qw_cell(w, c->path, kinds[c->kind], c->base, &cells[i]);
     }
@@ -149,12 +170,7 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
         QStatus q = Q_OK;
         /* a propagator of a model runs only while the model is active */
         if (p->model != QI_NONE && (s = qw_model_begin(w, phens[p->mphen], ir->phens[p->mphen].models[p->model]))) break;
-        QnStatus n = p->op == QI_EQUAL        ? qn_equal(net, z, x, &q)
-                     : p->op == QI_SUM        ? qn_sum(net, z, x, y, &q)
-                     : p->op == QI_DIFFERENCE ? qn_difference(net, z, x, y, &q)
-                     : p->op == QI_PRODUCT    ? qn_product(net, z, x, y, &q)
-                     : p->op == QI_QUOTIENT   ? qn_quotient(net, z, x, y, &q)
-                                              : qn_less_equal(net, z, x, p->op == QI_LESS, &q);
+        QnStatus n = qi_add_prop(net, p, ir->cells[p->cell[0]].domain == QI_SET, z, x, y, &q);
         if (p->model != QI_NONE) qw_model_end(w);
         if (n != QN_OK) {
             Buf b = { 0 };

@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # A transition has a condition, and the application can replace it
@@ -20,7 +20,7 @@ The project owner agreed to four points on 2026-11-25, in this short form:
 3. A phenomenon makes one switch at most at a boundary. If two transitions from the active model are true, the run stops with an error.
 4. The world gets a record of the calls of the application, for replay.
 
-This ADR gives the details of those points. The details are a proposal. The section "What this ADR adds to the four points" lists each detail that the short form did not have.
+This ADR gives the details of those points. The section "What this ADR adds to the four points" lists each detail that the short form did not have.
 
 The first version of this ADR allowed a condition on one cell only. The project owner asked on 2026-11-25 why a condition has no "and", "or" and "not", and no comparison of two fields. The design needs each of them:
 
@@ -28,7 +28,7 @@ The first version of this ADR allowed a condition on one cell only. The project 
 - A fire becomes detailed when a character enters the building or when its prediction becomes unreliable (design section 7.1).
 - A combustion exists for each combustible whose temperature is above its ignition temperature (ADR 0011 section 7).
 
-So this version makes a condition a truth-value expression. The project owner chose the operators of CUE: `&&`, `||` and `!`. The section "The state of the implementation" tells which part is in the code.
+So this version makes a condition a truth-value expression. The project owner chose the operators of CUE: `&&`, `||` and `!`.
 
 ## Decision
 
@@ -70,9 +70,9 @@ So `!` is not "the condition has no proof". No operator changes an unknown resul
 ### 3. A condition with an operator is a cell
 
 - The world keeps the form of a condition from story `quad-ijx.4.4`: the value of one cell is in a set. The set is a range of a quantity or a set of atoms.
-- A condition from source with one path and one constant has that form. Examples are `.visible`, `.door != "open"` and `.temperature > 300K`. The elaborator gives it to the world as it is.
+- A condition from source with one path of the phenomenon and one constant has that form. Examples are `.visible`, `.door != "open"` and `.temperature > 300K`. The elaborator gives it to the world as it is.
 - For each other condition, the elaborator makes a cell with the type `bool` at the field `when` of the map, such as `roomB.refine.when`. It makes propagators that compute the cell from the fields in the expression. The condition of the world is then "the cell `roomB.refine.when` is true".
-- The cell is a derived field (ADR 0019). Propagation gives it a value in each epoch. The IR, the change log and the inspection tools show it as each other cell.
+- The cell is a derived field (ADR 0019). Propagation gives it a value in each epoch. The IR and the inspection tools show it as each other cell. The change log has no entry for it, as for each derived field. The log has the changes of state, and the cell is a function of state.
 - The world reads the cell at a boundary, after the fixed point of propagation. That is the rule for each condition.
 
 ### 4. A law can give a name to a truth value
@@ -86,7 +86,7 @@ So `!` is not "the condition has no proof". No operator changes an unknown resul
 ```
 
 - A law can be an equation of a path to a `bool` field and a condition. The condition is in parentheses if it has an operator, because `==` binds more than `&&` and `||`.
-- The elaborator makes the same propagators as for a `when`. The field is then a derived field.
+- The elaborator makes the same propagators as for a `when`. The field then gets its value from the law in each epoch.
 - Such a law is a relation, as each law. If the field has a value from another source, propagation can narrow the fields of the condition.
 - A condition that is alone in `laws` is still an error, for example `laws: [ .visible || .people > 0 ]`. That is a statement that a disjunction is true, and it belongs to the relation layer (ADR 0018).
 - An existence condition (ADR 0013) names a cell with the type `bool`. So this law also gives source the condition for a phenomenon that starts and ends (`quad-ijx.7`).
@@ -134,24 +134,16 @@ ADR 0011 section 6 has the rules that keep incremental and differential evaluati
 - **The step that is not monotonic is at a boundary (rule 2).** The switch reads the cell after the fixed point. A decision from an unknown result does not exist, because an unknown condition changes nothing.
 - **No result depends on an order (rule 3).** The propagators of a condition have no order.
 - **No condition reads a previous value (rule 4).** "The oxygen changed by more than five percent" needs a field that holds the reference value.
-- **The change log is sufficient (rule 6).** The cell of a condition changes only if a field of its expression changes. A later differential engine reads that change from the log.
+- **The change log is sufficient (rule 6).** The cell of a condition is a function of the fields of its expression. The log has each change of those fields, so a later differential engine can maintain the cell from the log.
 
 ## What this ADR adds to the four points
 
-- **The form of a condition.** The short form said "an expression". This ADR makes it a truth-value expression with comparisons, `&&`, `||` and `!`. The project owner chose those three operators. The other details of sections 1 to 4 are a proposal. They are the forms of a comparison, the three results, the cell at `when`, and the law for a named truth value.
+- **The form of a condition.** The short form said "an expression". This ADR makes it a truth-value expression with comparisons, `&&`, `||` and `!`. The project owner chose those three operators. Sections 1 to 4 add the forms of a comparison, the three results, the cell at `when`, and the law for a named truth value.
 - **A condition from the application is a statement about one cell.** It is less than a condition from source.
 - **The time of the decision.** The world decides each switch of a boundary first, and then makes the switches in the order of the names.
 - **The names of the functions**, and the condition "never".
 - **The conditions of the application are state**, in the state hash and in a snapshot.
 - **The record also has each run to a time**, a start and an end of an instance, and a switch. The short form named inputs, switches and changes of conditions.
-
-## The state of the implementation
-
-- Story `quad-ijx.4.4` is in the code. It has the conditions with one path and one constant, and sections 5 to 8. A condition with `&&`, `||`, `!` or two fields is an error today, and the message gives the forms that load.
-- `quad-esj` adds the rest of sections 1 to 4, after the project owner accepts this ADR. The parser has the operators already, from Triangle (ADR 0014). The work is in three parts:
-  1. The network gets propagators for "and", "or" and "not" on truth-value cells. It has the propagator for "a quantity is in a range" (ADR 0012).
-  2. The IR gets operations for those propagators and for the one of ADR 0012.
-  3. The elaborator lowers a condition. A comparison of two quantities becomes a cell for their difference and "the difference is in a range".
 
 ## Acceptance tests
 
@@ -160,7 +152,7 @@ ADR 0011 section 6 has the rules that keep incremental and differential evaluati
 3. A room with `when: .visible || .inside > .outside + 20K` makes its switch at the first boundary where one of the two parts is true. While `inside` has no value and `visible` is false, the room makes no switch.
 4. The application replaces a condition with one that names a `bool` field from a law. The switch follows that field.
 5. A replay of a run with such conditions has the same state hash after each call.
-6. The cell `when` of a transition changes in the change log only at a boundary where a field of its expression changed.
+6. A change of a cell that a condition does not read runs no propagator of that condition.
 
 ## Considered options
 
@@ -175,8 +167,8 @@ ADR 0011 section 6 has the rules that keep incremental and differential evaluati
 
 - The application cannot build a new condition with operators at run time. It names a `bool` field that source computes. The fix is a C function that makes a truth-value cell from other cells at a boundary. Time: `quad-hu6`, when an application needs it.
 - A named truth value takes two lines: the field and its law. The fix is an expression as the value of a field. Time: `quad-pr0`.
-- A comparison can be unknown where a reader sees the result, because the network computes with ranges. For example, `.t > .t - 1K` is unknown while `.t` has a range wider than 1K. The fix is a simpler form of the expression before the elaborator lowers it. Time: with `quad-esj`, for an expression with the same path on its two sides.
-- ADR 0018 states that a logic operator in a law is an error. Section 4 changes that for one form of a law. ADR 0018 gets a pointer to this ADR when the project owner accepts this ADR.
+- A comparison can be unknown where a reader sees the result, because the network computes with ranges. The elaborator removes the same text from the two sides of a comparison, so `.t > .t - 1K` is true. It does no other algebra: `2 * .t >= .t + .t` is unknown while `.t` has a range. The author then writes each path on one side only.
+- ADR 0018 states that a logic operator in a law is an error. Section 4 changes that for one form of a law, and ADR 0018 has a pointer to this ADR.
 - The record has one entry for each call of `qw_run`. An application that calls `qw_run` for each frame gets a long record. The fix is a run that stops at a time and makes no boundary. Time: with the asynchronous clocks of `quad-h21.3`.
 - Automatic selection by cost (`quad-ft5.3`) can use the same step at a boundary and the same switch. Its applicability conditions can be cells of the same kind.
 
@@ -192,3 +184,18 @@ ADR 0011 section 6 has the rules that keep incremental and differential evaluati
 - **A switch from `qw_switch` in the record.** The record has the phenomenon and the model. The replay finds the transition between the two models. So a switch with a kernel that is not a transition of the world does not replay.
 - **The tool.** `quad run --set study.visible=true@5min` gives a cell a value at a time. `examples/detail-room.quad` has a room that is fine while `visible` is true.
 - A condition `when: false` is an error, because the map then has no use for a condition. `when: true` is always true.
+
+## Notes from the implementation (`quad-esj`)
+
+- **Two statements of the accepted text were wrong, and this text has the correction.** Section 3 and the section on incremental evaluation said that the change log shows the cell of a condition. The change log has only the changes of state: an input, a write of a kernel and a transfer. A derived field has no entry. Acceptance test 6 used the change log, so it is now a test of the network. A change of a cell that the condition does not read runs no propagator of the condition.
+- **The network.** `include/quad/network.h` has `qn_and`, `qn_or` and `qn_not` for truth-value cells, and `qn_reify_set` for "a set cell is in some of its atoms". Each one works in each direction: a result that is true or false can make an input smaller.
+- **The IR.** A propagator has five new operations: `QI_IN_RANGE`, `QI_IN_SET`, `QI_AND`, `QI_OR` and `QI_NOT`. `QI_EQUAL` also makes two set cells of one enumeration equal. The text form writes `roomB.refine.when <=> roomB.visible || roomB.refine.when.5`.
+- **The world.** `qw_derived_set_cell` makes the cell of a condition. It takes no input, and the state hash and a snapshot do not have it.
+- **A comparison of two quantities.** The elaborator moves each part to one side and removes the same text from the two sides. One cell and one number are a range of that cell. Each other comparison is a range of an inner difference. `!=` is the negation of `==`.
+- **A number between two steps.** `.temperature == 300.0000005K` on a field with 6 decimals is an error, also with `!=`: the two are never equal.
+- **Two forms on one cell that were errors now load.** `when: .temperature != 300K` loads. A condition that reads a field of another phenomenon through a connection loads too. Each one gets a cell at `when`.
+- **A comparison of two truth values is an error in a condition.** `.a == .b` in a condition gets a message. The law `.r == .a` makes two `bool` fields equal.
+- **A set of atoms through the port of the active model.** A condition or a law for a truth value reads a copy, as a law does for a quantity (ADR 0021). One propagator for each model gives the copy its value.
+- **The start.** The propagators of a truth value run at the start too. If the values of an instance contradict the law, the load stops with a message that names the law and the values.
+- **A law is a relation.** In `box: #Box & { r: false }` with the law `.r == (.a || .t > 300K)`, propagation makes `a` false and `t` at most 300 K.
+- **The example.** `examples/detail-room.quad` has a limit: the room is fine while somebody looks at it, or while it is warmer than the limit.

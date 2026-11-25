@@ -285,3 +285,288 @@ void test_prop_domains_soundness(void)
         qn_free(net);
     }
 }
+
+/* --- logic on truth values (ADR 0022 section 2) ------------------------------ */
+
+static const uint64_t TRUTHS[3] = { F, T, F | T };   /* false, true, unknown */
+
+/* Each operator, for each pair of false, true and unknown. No operator
+ * changes an unknown value into false, and no input changes. */
+void test_logic_tables(void)
+{
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+            uint64_t a = TRUTHS[i], b = TRUTHS[j];
+            QNet *net = qn_new();
+            QnCell ca = set(net, 2, 2, a), cb = set(net, 2, 2, b);
+            QnCell both = set(net, 2, 2, F | T), either = set(net, 2, 2, F | T), nota = set(net, 2, 2, F | T);
+            CHECK(qn_and(net, both, ca, cb) == QN_OK);
+            CHECK(qn_or(net, either, ca, cb) == QN_OK);
+            CHECK(qn_not(net, nota, ca) == QN_OK);
+            CHECK(qn_propagate(net) == QN_OK);
+            CHECK(qn_get_set(net, both) == (a == F || b == F ? F : a == T && b == T ? T : (F | T)));
+            CHECK(qn_get_set(net, either) == (a == T || b == T ? T : a == F && b == F ? F : (F | T)));
+            CHECK(qn_get_set(net, nota) == (a == F ? T : a == T ? F : (F | T)));
+            CHECK(qn_get_set(net, ca) == a && qn_get_set(net, cb) == b);
+            qn_free(net);
+        }
+}
+
+/* One propagator with the given values of r, a and b. *out gets the cells
+ * after propagation. */
+static QnStatus logic3(int op, uint64_t r, uint64_t a, uint64_t b, uint64_t out[3])
+{
+    QNet *net = qn_new();
+    QnCell cr = set(net, 2, 2, r), ca = set(net, 2, 2, a), cb = set(net, 2, 2, b);
+    CHECK((op == 0 ? qn_and(net, cr, ca, cb) : op == 1 ? qn_or(net, cr, ca, cb) : qn_not(net, cr, ca)) == QN_OK);
+    QnStatus s = qn_propagate(net);
+    out[0] = qn_get_set(net, cr);
+    out[1] = qn_get_set(net, ca);
+    out[2] = qn_get_set(net, cb);
+    qn_free(net);
+    return s;
+}
+
+/* From the result to the inputs. */
+void test_logic_backward(void)
+{
+    const uint64_t U = F | T;
+    uint64_t v[3];
+    /* and: a true result makes the two inputs true */
+    CHECK(logic3(0, T, U, U, v) == QN_OK && v[1] == T && v[2] == T);
+    /* a false result with one true input makes the other input false */
+    CHECK(logic3(0, F, T, U, v) == QN_OK && v[1] == T && v[2] == F);
+    CHECK(logic3(0, F, U, T, v) == QN_OK && v[1] == F && v[2] == T);
+    /* a false result alone says nothing about one input */
+    CHECK(logic3(0, F, U, U, v) == QN_OK && v[1] == U && v[2] == U);
+    CHECK(logic3(0, T, F, U, v) == QN_CONTRADICTION);
+    CHECK(logic3(0, F, T, T, v) == QN_CONTRADICTION);
+    /* or: the same with the other truth value */
+    CHECK(logic3(1, F, U, U, v) == QN_OK && v[1] == F && v[2] == F);
+    CHECK(logic3(1, T, F, U, v) == QN_OK && v[1] == F && v[2] == T);
+    CHECK(logic3(1, T, U, F, v) == QN_OK && v[1] == T && v[2] == F);
+    CHECK(logic3(1, T, U, U, v) == QN_OK && v[1] == U && v[2] == U);
+    CHECK(logic3(1, F, T, U, v) == QN_CONTRADICTION);
+    CHECK(logic3(1, T, F, F, v) == QN_CONTRADICTION);
+    /* not */
+    CHECK(logic3(2, T, U, U, v) == QN_OK && v[1] == F);
+    CHECK(logic3(2, F, U, U, v) == QN_OK && v[1] == T);
+    CHECK(logic3(2, U, U, U, v) == QN_OK && v[0] == U && v[1] == U);
+    CHECK(logic3(2, T, T, U, v) == QN_CONTRADICTION);
+    CHECK(logic3(2, F, F, U, v) == QN_CONTRADICTION);
+
+    /* one cell twice: r <=> a && a is r <=> a */
+    QNet *net = qn_new();
+    QnCell r = set(net, 2, 2, U), a = set(net, 2, 2, U);
+    CHECK(qn_and(net, r, a, a) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK(qn_get_set(net, r) == U);
+    CHECK(qn_tell_set(net, a, T) == QN_OK);
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK(qn_get_set(net, r) == T);
+    qn_free(net);
+}
+
+/* b <=> a set cell is in some of its atoms. */
+void test_reify_set(void)
+{
+    enum { RED = 1, GREEN = 2, BLUE = 4 };
+    static const struct { uint64_t color, b, want_color, want_b; } cases[] = {
+        { RED, F | T, RED, T },                          /* each possible atom is in the atoms */
+        { RED | GREEN, F | T, RED | GREEN, T },
+        { BLUE, F | T, BLUE, F },                        /* no possible atom is in the atoms */
+        { RED | BLUE, F | T, RED | BLUE, F | T },        /* unknown */
+        { RED | GREEN | BLUE, T, RED | GREEN, T },       /* from the truth value to the set */
+        { RED | GREEN | BLUE, F, BLUE, F },
+        { GREEN | BLUE, T, GREEN, T },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        QNet *net = qn_new();
+        QnCell color = set(net, 1, 3, cases[i].color), b = set(net, 2, 2, cases[i].b);
+        CHECK(qn_reify_set(net, b, color, RED | GREEN) == QN_OK);
+        CHECK(qn_propagate(net) == QN_OK);
+        CHECK(qn_get_set(net, color) == cases[i].want_color);
+        CHECK(qn_get_set(net, b) == cases[i].want_b);
+        qn_free(net);
+    }
+    QNet *net = qn_new();
+    QnCell color = set(net, 1, 3, 7), b = set(net, 2, 2, T), x = num(net, qi_top()), two = set(net, 3, 2, 3);
+    CHECK(qn_reify_set(net, b, set(net, 1, 3, BLUE), RED | GREEN) == QN_OK);
+    CHECK(qn_propagate(net) == QN_CONTRADICTION);
+    /* the atoms are a part of the universe, and not all of it */
+    CHECK(qn_reify_set(net, b, color, 0) == QN_EVALUE);
+    CHECK(qn_reify_set(net, b, color, 7) == QN_EVALUE);
+    CHECK(qn_reify_set(net, b, color, 8) == QN_EVALUE);
+    CHECK(qn_reify_set(net, b, two, 3) == QN_EVALUE);
+    CHECK(qn_reify_set(net, b, two, 1) == QN_OK);
+    CHECK(qn_reify_set(net, color, b, 1) == QN_ETYPE);   /* the first cell is not a boolean */
+    CHECK(qn_reify_set(net, b, x, 1) == QN_EDOMAIN);
+    CHECK(qn_reify_set(net, x, color, 1) == QN_EDOMAIN);
+    CHECK(qn_reify_set(net, b, 999, 1) == QN_ECELL);
+    CHECK(qn_reify_set(net, 999, color, 1) == QN_ECELL);
+    qn_free(net);
+}
+
+void test_logic_errors(void)
+{
+    QNet *net = qn_new();
+    QnCell a = set(net, 2, 2, F | T), b = set(net, 2, 2, F | T), r = set(net, 2, 2, F | T);
+    QnCell x = num(net, qi_top()), three = set(net, 1, 3, 7);
+    typedef QnStatus (*Two)(QNet *, QnCell, QnCell, QnCell);
+    Two ops[2] = { qn_and, qn_or };
+    for (int k = 0; k < 2; k++) {
+        CHECK(ops[k](net, x, a, b) == QN_EDOMAIN);
+        CHECK(ops[k](net, r, x, b) == QN_EDOMAIN);
+        CHECK(ops[k](net, r, a, x) == QN_EDOMAIN);
+        CHECK(ops[k](net, three, a, b) == QN_ETYPE);
+        CHECK(ops[k](net, r, three, b) == QN_ETYPE);
+        CHECK(ops[k](net, r, a, three) == QN_ETYPE);
+        CHECK(ops[k](net, 999, a, b) == QN_ECELL);
+        CHECK(ops[k](net, r, 999, b) == QN_ECELL);
+        CHECK(ops[k](net, r, a, 999) == QN_ECELL);
+    }
+    CHECK(qn_not(net, x, a) == QN_EDOMAIN);
+    CHECK(qn_not(net, r, x) == QN_EDOMAIN);
+    CHECK(qn_not(net, three, a) == QN_ETYPE);
+    CHECK(qn_not(net, r, three) == QN_ETYPE);
+    CHECK(qn_not(net, 999, a) == QN_ECELL);
+    CHECK(qn_not(net, r, 999) == QN_ECELL);
+    /* a call that fails adds no propagator */
+    CHECK(qn_propagate(net) == QN_OK);
+    CHECK(qn_runs(net) == 0);
+    qn_free(net);
+}
+
+/* ADR 0022, acceptance test 6: a change of a cell that a condition does not
+ * read runs no propagator of that condition. */
+void test_logic_incremental(void)
+{
+    const uint64_t U = F | T;
+    /* two conditions with no common cell, and the first one alone */
+    QNet *both = qn_new(), *one = qn_new();
+    QnCell a1 = set(both, 2, 2, U), b1 = set(both, 2, 2, T), r1 = set(both, 2, 2, U);
+    QnCell a2 = set(both, 2, 2, U), b2 = set(both, 2, 2, U), n2 = set(both, 2, 2, U), r2 = set(both, 2, 2, U);
+    QnCell x = num(both, iv(0, 100));
+    CHECK(qn_and(both, r1, a1, b1) == QN_OK);
+    CHECK(qn_not(both, n2, a2) == QN_OK);
+    CHECK(qn_or(both, r2, n2, b2) == QN_OK);
+    QnCell oa = set(one, 2, 2, U), ob = set(one, 2, 2, T), orr = set(one, 2, 2, U);
+    CHECK(qn_and(one, orr, oa, ob) == QN_OK);
+    CHECK(qn_propagate(both) == QN_OK && qn_propagate(one) == QN_OK);
+    uint64_t before_both = qn_runs(both), before_one = qn_runs(one);
+
+    /* a cell that no condition reads: no run */
+    CHECK(qn_tell(both, x, iv(10, 20)) == QN_OK);
+    CHECK(qn_propagate(both) == QN_OK);
+    CHECK(qn_runs(both) == before_both);
+
+    /* a cell of the first condition: the runs of the first condition alone */
+    CHECK(qn_tell_set(both, a1, T) == QN_OK && qn_tell_set(one, oa, T) == QN_OK);
+    CHECK(qn_propagate(both) == QN_OK && qn_propagate(one) == QN_OK);
+    CHECK(qn_get_set(both, r1) == T && qn_get_set(both, r2) == U);
+    CHECK(qn_runs(one) > before_one);
+    CHECK(qn_runs(both) - before_both == qn_runs(one) - before_one);
+    qn_free(both);
+    qn_free(one);
+}
+
+typedef struct { int kind, r, a, b; QInterval range; uint64_t atoms; } LSpec;
+enum { LB = 5, LI = 2, LS = 1 };   /* boolean cells 0..LB-1, then interval cells, then one set cell with 3 atoms */
+
+static QnStatus lbuild(QNet *net, const LSpec *p)
+{
+    switch (p->kind) {
+    case 0: return qn_and(net, (QnCell) p->r, (QnCell) p->a, (QnCell) p->b);
+    case 1: return qn_or(net, (QnCell) p->r, (QnCell) p->a, (QnCell) p->b);
+    case 2: return qn_not(net, (QnCell) p->r, (QnCell) p->a);
+    case 3: return qn_reify_in(net, (QnCell) p->r, (QnCell) (LB + p->a % LI), p->range);
+    default: return qn_reify_set(net, (QnCell) p->r, (QnCell) (LB + LI), p->atoms);
+    }
+}
+
+/* ADR 0008 with logic: the fixed point does not depend on the order of the
+ * propagators. */
+void test_prop_logic_order_independence(void)
+{
+    uint64_t st = 31;
+    int settled = 0, contradictions = 0;
+    for (int trial = 0; trial < 600; trial++) {
+        uint64_t bbase[LB], sbase = (uint64_t) t_range(&st, 1, 7);
+        QInterval ibase[LI];
+        for (int i = 0; i < LB; i++) bbase[i] = t_rand(&st) % 3 ? 3 : (uint64_t) t_range(&st, 1, 2);
+        for (int i = 0; i < LI; i++) ibase[i] = t_rand(&st) % 4 ? rand_iv(&st, 30) : qi_top();
+        int np = (int) t_range(&st, 1, 7);
+        LSpec specs[7];
+        for (int i = 0; i < np; i++) {
+            LSpec *p = &specs[i];
+            p->kind = (int) (t_rand(&st) % 5);
+            p->r = (int) t_range(&st, 0, LB - 1);
+            p->a = (int) t_range(&st, 0, LB - 1);
+            p->b = (int) t_range(&st, 0, LB - 1);
+            p->range = rand_iv(&st, 30);
+            if (t_rand(&st) % 2) p->range.hi = Q_INF;
+            else p->range.lo = Q_NINF;
+            p->atoms = (uint64_t) t_range(&st, 1, 6);
+        }
+        QNet *nets[2] = { qn_new(), qn_new() };
+        for (int k = 0; k < 2; k++) {
+            for (int i = 0; i < LB; i++) set(nets[k], 2, 2, bbase[i]);
+            for (int i = 0; i < LI; i++) num(nets[k], ibase[i]);
+            set(nets[k], 1, 3, sbase);
+        }
+        for (int i = 0; i < np; i++) CHECK(lbuild(nets[0], &specs[i]) == QN_OK);
+        for (int i = np - 1; i >= 0; i--) CHECK(lbuild(nets[1], &specs[i]) == QN_OK);
+        QnStatus s0 = qn_propagate(nets[0]), s1 = qn_propagate(nets[1]);
+        CHECK(s0 == s1);
+        if (s0 == QN_OK && s1 == QN_OK) {
+            settled++;
+            for (QnCell c = 0; c < LB + LI + LS; c++) {
+                QInterval a = qn_get(nets[0], c), b = qn_get(nets[1], c);
+                CHECK(a.lo == b.lo && a.hi == b.hi);
+                CHECK(qn_get_set(nets[0], c) == qn_get_set(nets[1], c));
+            }
+        } else contradictions++;
+        qn_free(nets[0]);
+        qn_free(nets[1]);
+    }
+    CHECK(settled > 200 && contradictions > 20);
+}
+
+/* Soundness: the propagators never exclude the values of a real case. */
+void test_prop_logic_soundness(void)
+{
+    uint64_t st = 32;
+    for (int trial = 0; trial < 600; trial++) {
+        /* the real case: three truth values, a quantity and a color */
+        bool p = t_rand(&st) % 2, q = t_rand(&st) % 2, s = t_rand(&st) % 2;
+        int64_t x = t_range(&st, -30, 30);
+        int color = (int) t_range(&st, 0, 2);
+        QInterval range = rand_iv(&st, 30);
+        if (t_rand(&st) % 2) range.hi = Q_INF;
+        else range.lo = Q_NINF;
+        uint64_t atoms = (uint64_t) t_range(&st, 1, 6);
+        bool in = qi_contains(range, x), has = atoms >> color & 1;
+        bool vals[9] = { p, q, s, in, has, p && q, !s, (p && q) || !s, ((p && q) || !s) && (in || has) };
+
+        QNet *net = qn_new();
+        QnCell c[9];
+        /* each cell knows its value, or it is unknown */
+        for (int i = 0; i < 9; i++) c[i] = set(net, 2, 2, t_rand(&st) % 3 ? 3 : (uint64_t) (vals[i] ? T : F));
+        QnCell xc = num(net, t_rand(&st) % 3 ? iv(x - t_range(&st, 0, 10), x + t_range(&st, 0, 10)) : qi_top());
+        QnCell cc = set(net, 1, 3, ((uint64_t) 1 << color) | (t_rand(&st) & 7));
+        QnCell either = set(net, 2, 2, 3);
+        CHECK(qn_reify_in(net, c[3], xc, range) == QN_OK);
+        CHECK(qn_reify_set(net, c[4], cc, atoms) == QN_OK);
+        CHECK(qn_and(net, c[5], c[0], c[1]) == QN_OK);
+        CHECK(qn_not(net, c[6], c[2]) == QN_OK);
+        CHECK(qn_or(net, c[7], c[5], c[6]) == QN_OK);
+        CHECK(qn_or(net, either, c[3], c[4]) == QN_OK);
+        CHECK(qn_and(net, c[8], c[7], either) == QN_OK);
+        CHECK(qn_propagate(net) == QN_OK);
+        for (int i = 0; i < 9; i++) CHECK(qn_get_set(net, c[i]) & (vals[i] ? T : F));
+        CHECK(qn_get_set(net, either) & (in || has ? T : F));
+        CHECK(qi_contains(qn_get(net, xc), x));
+        CHECK(qn_get_set(net, cc) >> color & 1);
+        qn_free(net);
+    }
+}

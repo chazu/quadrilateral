@@ -25,7 +25,7 @@ const char *qn_status_str(QnStatus s)
 
 #define NO_PROP UINT32_MAX
 
-typedef enum { P_SUM, P_PRODUCT, P_EQUAL, P_CUSTOM, P_SETEQ, P_ELEMENT, P_REIFY, P_LE } PKind;
+typedef enum { P_SUM, P_PRODUCT, P_EQUAL, P_CUSTOM, P_SETEQ, P_ELEMENT, P_REIFY, P_LE, P_REIFYSET, P_AND, P_OR, P_NOT } PKind;
 
 typedef struct {
     PKind  kind;
@@ -38,6 +38,7 @@ typedef struct {
     size_t first, n;      /* custom: cells in net->ccells[first .. first + n);
                              element: net->tables[first .. first + n) */
     QInterval range;      /* reify */
+    uint64_t  atoms;      /* reify of a set */
     bool   strict;        /* less-or-equal: a < b */
 } Prop;
 
@@ -495,6 +496,9 @@ static void run_element(QNet *net, const Prop *p)
     qn_tell_set(net, a, keep);   /* keep == 0 is a contradiction */
 }
 
+/* A boolean set cell: atom 0 is false and atom 1 is true. */
+enum { FALSE_ONLY = 1, TRUE_ONLY = 2, BOTH = 3 };
+
 /* b <=> x in range; atom 0 is false and atom 1 is true */
 static void run_reify(QNet *net, const Prop *p)
 {
@@ -518,6 +522,45 @@ static void run_reify(QNet *net, const Prop *p)
     }
 }
 
+/* b <=> a in atoms */
+static void run_reifyset(QNet *net, const Prop *p)
+{
+    QnCell b = p->c[0], a = p->c[1];
+    uint64_t av = qn_get_set(net, a);
+    if (!(av & ~p->atoms)) qn_tell_set(net, b, TRUE_ONLY);
+    else if (!(av & p->atoms)) qn_tell_set(net, b, FALSE_ONLY);
+    uint64_t bv = qn_get_set(net, b);
+    if (bv == TRUE_ONLY) qn_tell_set(net, a, p->atoms);
+    else if (bv == FALSE_ONLY) qn_tell_set(net, a, qn_universe(net, a) & ~p->atoms);
+}
+
+/* r <=> a && b. With `or`, each cell has the other truth value: r <=> a || b
+ * is !r <=> !a && !b. */
+static void run_and(QNet *net, const Prop *p, bool is_or)
+{
+    const uint64_t no = is_or ? TRUE_ONLY : FALSE_ONLY, yes = is_or ? FALSE_ONLY : TRUE_ONLY;
+    QnCell r = p->c[0], a = p->c[1], b = p->c[2];
+    uint64_t av = qn_get_set(net, a), bv = qn_get_set(net, b);
+    if (av == no || bv == no) qn_tell_set(net, r, no);
+    else if (av == yes && bv == yes) qn_tell_set(net, r, yes);
+    uint64_t rv = qn_get_set(net, r);
+    if (rv == yes) {
+        qn_tell_set(net, a, yes);
+        qn_tell_set(net, b, yes);
+    } else if (rv == no) {
+        if (av == yes) qn_tell_set(net, b, no);
+        if (bv == yes) qn_tell_set(net, a, no);
+    }
+}
+
+/* r <=> !a */
+static void run_not(QNet *net, const Prop *p)
+{
+    uint64_t av = qn_get_set(net, p->c[1]), rv = qn_get_set(net, p->c[0]);
+    qn_tell_set(net, p->c[0], (av & TRUE_ONLY ? FALSE_ONLY : 0) | (av & FALSE_ONLY ? TRUE_ONLY : 0));
+    qn_tell_set(net, p->c[1], (rv & TRUE_ONLY ? FALSE_ONLY : 0) | (rv & FALSE_ONLY ? TRUE_ONLY : 0));
+}
+
 static void run(QNet *net, const Prop *p)
 {
     switch (p->kind) {
@@ -529,6 +572,10 @@ static void run(QNet *net, const Prop *p)
     case P_ELEMENT: run_element(net, p); break;
     case P_REIFY:   run_reify(net, p); break;
     case P_LE:      run_le(net, p); break;
+    case P_REIFYSET: run_reifyset(net, p); break;
+    case P_AND:     run_and(net, p, false); break;
+    case P_OR:      run_and(net, p, true); break;
+    case P_NOT:     run_not(net, p); break;
     }
 }
 
@@ -581,6 +628,41 @@ QnStatus qn_reify_in(QNet *net, QnCell b, QnCell x, QInterval range)
     p.range = range;
     return add_prop(net, &p, p.c, 2);
 }
+
+QnStatus qn_reify_set(QNet *net, QnCell b, QnCell a, uint64_t atoms)
+{
+    if (!valid_cell(net, b) || !valid_cell(net, a)) return QN_ECELL;
+    if (!is_set(net, b) || !is_set(net, a)) return QN_EDOMAIN;
+    if (qn_universe(net, b) != BOTH) return QN_ETYPE;
+    /* no atom, an atom that the cell does not have, or each atom: then b is a constant */
+    if (!atoms || (atoms & ~qn_universe(net, a)) || atoms == qn_universe(net, a)) return QN_EVALUE;
+    Prop p;
+    memset(&p, 0, sizeof p);
+    p.kind = P_REIFYSET;
+    p.c[0] = b;
+    p.c[1] = a;
+    p.atoms = atoms;
+    return add_prop(net, &p, p.c, 2);
+}
+
+static QnStatus logic(QNet *net, PKind kind, QnCell r, QnCell a, QnCell b, int n)
+{
+    QnCell c[3] = { r, a, b };
+    for (int i = 0; i < n; i++) {
+        if (!valid_cell(net, c[i])) return QN_ECELL;
+        if (!is_set(net, c[i])) return QN_EDOMAIN;
+        if (qn_universe(net, c[i]) != BOTH) return QN_ETYPE;
+    }
+    Prop p;
+    memset(&p, 0, sizeof p);
+    p.kind = kind;
+    memcpy(p.c, c, sizeof c);
+    return add_prop(net, &p, p.c, (size_t) n);
+}
+
+QnStatus qn_and(QNet *net, QnCell r, QnCell a, QnCell b) { return logic(net, P_AND, r, a, b, 3); }
+QnStatus qn_or(QNet *net, QnCell r, QnCell a, QnCell b) { return logic(net, P_OR, r, a, b, 3); }
+QnStatus qn_not(QNet *net, QnCell r, QnCell a) { return logic(net, P_NOT, r, a, a, 2); }
 
 QnStatus qn_propagate(QNet *net)
 {
