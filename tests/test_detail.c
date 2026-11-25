@@ -1592,6 +1592,9 @@ void test_when_errors(void)
           ".coarse.temperature == true, and roomB.coarse.temperature is a quantity: compare it with a "
           "quantity\n" },
         { ", when: .visible || .coarse.temperature > true", "error: the atom true can stand in an expression only in a comparison with == or !=\n" },
+        { ", when: .visible || .coarse.temperature + 1K == true",
+          "error: the condition .visible || ((.coarse.temperature + 1K) == true) has the comparison (.coarse.temperature + 1K) "
+          "== true. An atom stands in a comparison with one path, with == or !=\n" },
         { ", when: .visible && .door > .door", "error: the condition .visible && (.door > .door) has a comparison with roomB.door, which is a set "
           "of atoms." },
         { ", when: .visible == .visible", "error: the condition .visible == .visible has a comparison with roomB.visible, which is a set of "
@@ -2009,5 +2012,77 @@ void test_truth_paths(void)
     }
     qw_free(w);
     qw_free(copy);
+    qi_free(ir);
+}
+
+/* Truth values and the enumerations of the content. */
+void test_truth_enums(void)
+{
+    /* two fields with the type bool: one propagator makes them equal */
+    QIr *ir = compile("#Box: #Phenomenon & { a: bool, r: bool, laws: [ .r == .a ] }\nbox: #Box\n");
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  propagator P0, in an epoch: box.r = box.a\n");
+        CHECK(!strstr(text, "propagator P1") && !strstr(text, "inner "));
+        free(text);
+    }
+    qi_free(ir);
+
+    /* a field with the atoms of bool and another type: two negations make the two fields equal */
+    ir = compile("#Box: #Phenomenon & { a: bool, r: true | false, laws: [ .r == .a ] }\nbox: #Box\n");
+    QWorld *w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        char *text = qi_text(ir);
+        HAS(text, "enumeration bool: false true\nenumeration false | true: false true\n");
+        HAS(text, "  propagator P0, in an epoch: box.laws.first.1 <=> !box.a\n");
+        HAS(text, "  propagator P1, in an epoch: box.r <=> !box.laws.first.1\n");
+        CHECK(!strstr(text, "propagator P2"));
+        free(text);
+        OK(qw_input_set(w, "box.a", 2));
+        CHECK(qw_get_set(w, "box.r") == 2);
+        OK(qw_input_set(w, "box.a", 1));
+        CHECK(qw_get_set(w, "box.r") == 1);
+        OK(qw_input_set(w, "box.a", 3));
+        CHECK(qw_get_set(w, "box.r") == 3);
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* no field with the type bool: the elaborator makes that enumeration for the inner values of the condition */
+    ir = compile("#Box: #Phenomenon & { t: %temperature, u: %temperature, r: true | false,\n"
+                 "  laws: [ .r == (.t > .u || .t < 0K) ] }\nbox: #Box\n");
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        char *text = qi_text(ir);
+        HAS(text, "enumeration bool: false true\n");
+        HAS(text, "  inner box.laws.first.2: bool = false | true\n");
+        free(text);
+        OK(qw_input(w, "box.t", qi_point(1000000)));
+        OK(qw_input(w, "box.u", qi_point(0)));
+        CHECK(qw_get_set(w, "box.r") == 2);
+        OK(qw_input(w, "box.u", qi_point(2000000)));
+        CHECK(qw_get_set(w, "box.r") == 1);
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* an enumeration with 64 atoms: the largest set cell */
+    char src[1024];
+    int at = snprintf(src, sizeof src, "#Box: #Phenomenon & { r: bool, e: ");
+    for (int i = 0; i < 64; i++) at += snprintf(src + at, sizeof src - (size_t) at, "%s\"a%02d\"", i ? " | " : "", i);
+    snprintf(src + at, sizeof src - (size_t) at, ", laws: [ .r == (.e != \"a63\") ] }\nbox: #Box\n");
+    ir = compile(src);
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 0));
+        CHECK(qw_get_set(w, "box.r") == 3);
+        OK(qw_input_set(w, "box.e", 1));
+        CHECK(qw_get_set(w, "box.r") == 2);
+        OK(qw_input_set(w, "box.e", (uint64_t) 1 << 63));
+        CHECK(qw_get_set(w, "box.r") == 1);
+        OK(qw_input_set(w, "box.e", ((uint64_t) 1 << 63) | 1));
+        CHECK(qw_get_set(w, "box.r") == 3);
+    }
+    qw_free(w);
     qi_free(ir);
 }
