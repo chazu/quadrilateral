@@ -76,6 +76,7 @@ QwStatus qw_kind_type(const QWorld *w, QwKind kind, QType *out);
 QwStatus qw_enum_kind(QWorld *w, const char *name, const char *const *atoms, unsigned n, QwKind *out);
 int      qw_atom(const QWorld *w, QwKind kind, const char *name);   /* the atom's index, or -1 */
 QwStatus qw_phenomenon(QWorld *w, const char *name, QwPhen *out);
+QwStatus qw_find_phenomenon(const QWorld *w, const char *name, QwPhen *out);   /* QW_ENAME if there is none */
 QwStatus qw_cell(QWorld *w, const char *path, QwKind kind, QInterval base, QnCell *out);
 /* A set cell of an enumeration kind, with the mask of its possible atoms */
 QwStatus qw_set_cell(QWorld *w, const char *path, QwKind kind, uint64_t base, QnCell *out);
@@ -126,6 +127,15 @@ QwStatus qw_port(QWorld *w, QwPhen p, const char *port, const char *model, const
  * must be exactly zero afterwards, or the switch fails and nothing changes. */
 QwStatus qw_switch(QWorld *w, QwPhen p, const char *model, const QkKernel *map);
 const char *qw_active_model(const QWorld *w, QwPhen p);   /* NULL without models */
+
+/* A transition (ADR 0021 section 5): a name for the way from the model
+ * `from` to the model `to`, with the map kernel of the switch. A phenomenon
+ * has at most one transition for each pair of models, and a name once. The
+ * kernel must live as long as the world. */
+QwStatus qw_transition(QWorld *w, QwPhen p, const char *name, const char *from, const char *to, const QkKernel *map);
+/* Switches to `model` with the map of the transition from the active model.
+ * QW_ENAME if the phenomenon has no such transition. */
+QwStatus qw_switch_to(QWorld *w, QwPhen p, const char *model);
 
 /* --- instances (ADR 0013) ---------------------------------------------------------- */
 
@@ -195,7 +205,7 @@ int64_t   qw_total(const QWorld *w, QwKind kind);        /* the sum of every cel
 
 /* A hash of all authoritative state: the clock, the epoch, each active
  * model, and every cell's base with its path. It does not depend on the
- * order in which phenomena and cells were declared (ADR 0013). Two runs with
+ * order in which phenomena, models and cells were declared (ADR 0013). Two runs with
  * the same inputs must give the same hash (ADR 0004). */
 uint64_t qw_hash(const QWorld *w);
 

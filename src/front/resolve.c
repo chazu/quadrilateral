@@ -20,17 +20,19 @@
  *     interpolations before the type hierarchy. */
 
 /* The prelude: the types that the front end knows (ADR 0011 section 2).
- * The list types are in the root. #Phenomenon, #Port and #Interaction, which
- * the elaborator recognizes, are in the package `quad` (ADR 0016, ADR 0020),
- * so their labels stay free for the content. The other prelude types come
- * with their stages. */
+ * The list types are in the root. #Phenomenon, #Port, #Interaction, #Model
+ * and #Map, which the elaborator recognizes, are in the package `quad`
+ * (ADR 0016, ADR 0020, ADR 0021), so their labels stay free for the content.
+ * The other prelude types come with their stages. */
 static const char *prelude =
     "#List: {}\n"
     "#Cons: #List & { first: _, rest: #List }\n"
     "#Null: #List\n";
 static const char *prelude_quad =
     "package quad\n"
-    "#Phenomenon: { evaluator: text }\n"
+    "#Phenomenon: { evaluator: text, model: text }\n"
+    "#Model: { evaluator: text }\n"
+    "#Map: { from: text, to: text, evaluator: text }\n"
     "#Port: {}\n"
     "#Interaction: { source: _, sink: _, rate: _, tolerance: *1pct | %ratio, conserved: *true | bool }\n";
 #define PRELUDE_FILE "<prelude>"

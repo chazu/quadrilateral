@@ -124,7 +124,14 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
         s = qw_enum_kind(w, names[taken], (const char *const *) en->atoms, en->natoms, &kinds[ir->nkinds + i]);
         taken++;
     }
-    for (uint32_t i = 0; i < ir->nphens && !s; i++) s = qw_phenomenon(w, ir->phens[i].name, &phens[i]);
+    for (uint32_t i = 0; i < ir->nphens && !s; i++) {
+        const QiPhen *ph = &ir->phens[i];
+        s = qw_phenomenon(w, ph->name, &phens[i]);
+        /* the first model that the world gets is active: the model of the start, and then the others (ADR 0021) */
+        if (!s && ph->nmodels) s = qw_model(w, phens[i], ph->models[ph->start]);
+        for (uint32_t m = 0; m < ph->nmodels && !s; m++)
+            if (m != ph->start) s = qw_model(w, phens[i], ph->models[m]);
+    }
     for (uint32_t i = 0; i < ir->ncells && !s; i++) {
         const QiCell *c = &ir->cells[i];
         s = c->domain == QI_SET ? qw_set_cell(w, c->path, kinds[ir->nkinds + c->kind], c->mask, &cells[i])
@@ -138,12 +145,15 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
         QnCell z = cells[p->cell[0]], x = cells[p->cell[1]], y = p->cell[2] == QI_NONE ? 0 : cells[p->cell[2]];
         QNet *net = qw_net(w);
         QStatus q = Q_OK;
+        /* a propagator of a model runs only while the model is active */
+        if (p->model != QI_NONE && (s = qw_model_begin(w, phens[p->mphen], ir->phens[p->mphen].models[p->model]))) break;
         QnStatus n = p->op == QI_EQUAL        ? qn_equal(net, z, x, &q)
                      : p->op == QI_SUM        ? qn_sum(net, z, x, y, &q)
                      : p->op == QI_DIFFERENCE ? qn_difference(net, z, x, y, &q)
                      : p->op == QI_PRODUCT    ? qn_product(net, z, x, y, &q)
                      : p->op == QI_QUOTIENT   ? qn_quotient(net, z, x, y, &q)
                                               : qn_less_equal(net, z, x, p->op == QI_LESS, &q);
+        if (p->model != QI_NONE) qw_model_end(w);
         if (n != QN_OK) {
             Buf b = { 0 };
             qf_buf_printf(&b, "the law %s: %s: %s%s%s", p->name, p->law, qn_status_str(n),
@@ -152,27 +162,56 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
             s = n == QN_ENOMEM ? QW_ENOMEM : QW_ETYPE;
         }
     }
-    for (uint32_t i = 0; i < ir->nports && !s; i++)
-        if (ir->ports[i].state == QI_PORT_CONNECTED)
-            s = qw_connect(w, phens[ir->ports[i].phen], ir->ports[i].name, ir->ports[i].target);
+    for (uint32_t i = 0; i < ir->nports && !s; i++) {
+        const QiPort *pt = &ir->ports[i];
+        if (pt->state == QI_PORT_CONNECTED) s = qw_connect(w, phens[pt->phen], pt->name, pt->target);
+        for (uint32_t m = 0; pt->state == QI_PORT_MODEL && m < ir->phens[pt->phen].nmodels && !s; m++)
+            s = qw_port(w, phens[pt->phen], pt->name, ir->phens[pt->phen].models[m], pt->targets[m]);
+    }
     for (uint32_t i = 0; i < ir->nkernels && !s; i++) {
-        if (ir->kernels[i].ntransfers && ir->kernels[i].transfers[0].rate != QI_NONE) {
+        const QiKernelUse *ku = &ir->kernels[i];
+        const char *model = ku->model == QI_NONE ? NULL : ir->phens[ku->phen].models[ku->model];
+        const QkKernel *k;
+        if (ku->ntransfers && ku->transfers[0].rate != QI_NONE) {
             /* interactions with a rate: the kernel comes from the IR, and the world frees it */
-            QkKernel *k = rate_kernel(ir, &ir->kernels[i]);
-            s = k ? qw_adopt_kernel(w, k, qk_rate_free) : QW_ENOMEM;
-            if (s && k) qk_rate_free(k);
-            if (!s) s = qw_attach(w, phens[ir->kernels[i].phen], k);
-            continue;
-        }
-        const QkKernel *k = qi_find_kernel(opt, ir->kernels[i].kernel);
-        if (!k) {
+            QkKernel *made = rate_kernel(ir, ku);
+            s = made ? qw_adopt_kernel(w, made, qk_rate_free) : QW_ENOMEM;
+            if (s && made) qk_rate_free(made);
+            k = made;
+        } else if (ku->size) {
+            /* a kernel of a room with n cells: the same rule */
+            QkKernel *made = qi_room_kernel(ku->kernel, ku->size);
+            s = made ? qw_adopt_kernel(w, made, qk_free) : QW_ENOMEM;
+            if (s && made) qk_free(made);
+            k = made;
+        } else if (!(k = qi_find_kernel(opt, ku->kernel))) {
             Buf b = { 0 };
-            qf_buf_printf(&b, "%s: unknown evaluator \"%s\"", ir->phens[ir->kernels[i].phen].name, ir->kernels[i].kernel);
+            qf_buf_printf(&b, "%s: unknown evaluator \"%s\"", ir->phens[ku->phen].name, ku->kernel);
             why = b.s;
             s = QW_ENAME;
             break;
         }
-        s = qw_attach(w, phens[ir->kernels[i].phen], k);
+        if (!s) s = model ? qw_model_attach(w, phens[ku->phen], model, k) : qw_attach(w, phens[ku->phen], k);
+    }
+    for (uint32_t i = 0; i < ir->nmaps && !s; i++) {
+        const QiMap *mp = &ir->maps[i];
+        const QiPhen *ph = &ir->phens[mp->phen];
+        const QkKernel *k = mp->size ? NULL : qi_find_kernel(opt, mp->kernel);
+        if (mp->size) {
+            QkKernel *made = qi_room_kernel(mp->kernel, mp->size);
+            s = made ? qw_adopt_kernel(w, made, qk_free) : QW_ENOMEM;
+            if (s && made) qk_free(made);
+            if (s) break;
+            k = made;
+        }
+        if (!k) {
+            Buf b = { 0 };
+            qf_buf_printf(&b, "the map %s.%s: unknown evaluator \"%s\"", ph->name, mp->name, mp->kernel);
+            why = b.s;
+            s = QW_ENAME;
+            break;
+        }
+        s = qw_transition(w, phens[mp->phen], mp->name, ph->models[mp->from], ph->models[mp->to], k);
     }
 
     for (uint32_t i = 0; i < taken; i++) free(names[i]);
@@ -187,4 +226,12 @@ QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWor
     }
     *out = w;
     return QW_OK;
+}
+
+QwStatus qi_switch(const QIr *ir, QWorld *w, const char *phen, const char *model)
+{
+    (void) ir;
+    QwPhen p;
+    QwStatus s = qw_find_phenomenon(w, phen, &p);
+    return s ? s : qw_switch_to(w, p, model);
 }

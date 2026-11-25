@@ -703,6 +703,10 @@ void     qf_sort_diags(Front *f);                        /* by location, then by
 QIr     *qf_elaborate(Front *f, const QiOptions *opt);
 /* The kernel that source names, from `opt` or from the native kernels. NULL if none. */
 const QkKernel *qi_find_kernel(const QiOptions *opt, const char *name);
+/* A native kernel of a room with n cells, by its name: native.diffusion,
+ * native.room.refine or native.room.abstract. NULL for another name or for
+ * n == 0. The caller frees it with qk_free. */
+QkKernel *qi_room_kernel(const char *name, unsigned n);
 
 QfNode  *type_expansion(QfOp *c, uint32_t t);            /* NULL while t is being expanded */
 QfNode  *type_instance(QfOp *c, uint32_t t, QfStore *a); /* a copy, or a lazy node */

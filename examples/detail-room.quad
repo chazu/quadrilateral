@@ -1,0 +1,53 @@
+// A room with two models: one temperature, or four cells in a row. Use this
+// file with thermal.quad:
+//
+//   build/quad run examples/thermal.quad examples/detail-room.quad --until 20min --every 5min \
+//       --switch study=fine@5min --switch study=coarse@15min \
+//       --show hall.temperature,study.coarse.temperature,study.fine.c0.temperature,study.fine.c3.temperature
+//
+// A model is a field with a type below #Model. Its cells have paths below
+// it, and its laws and its kernel work only while it is active. A map moves
+// the state from one model to another at a switch, and the energy of the
+// room stays the same.
+
+// One part of a room, with the law of its heat.
+#Lump: #Thermal & { storage: .energy == .capacity * .temperature }
+
+// The coarse model: the whole room is one part.
+#CoarseRoom: #Model & #Lump & {
+    west: #ThermalPort & { temperature: .temperature, capacity: .capacity, energy: .energy }
+}
+
+// The fine model: four parts in a row. The kernel moves heat between
+// neighbors. The port is the first part, at the west wall.
+#FineRoom: #Model & {
+    c0: #Lump, c1: #Lump, c2: #Lump, c3: #Lump
+    conductance: %conductance
+    tolerance:   *1pct | %ratio
+    evaluator:   "native.diffusion"
+    west: #ThermalPort & { temperature: .c0.temperature, capacity: .c0.capacity, energy: .c0.energy }
+}
+
+#DetailRoom: #Phenomenon & {
+    west:   #ThermalPort              // the port of the active model
+    spread: %temperature              // how far the map moves each part from the mean, with a seed
+    model:  *"coarse" | text          // the model that is active at the start
+
+    coarse: #CoarseRoom
+    fine:   #FineRoom
+
+    refine:   #Map & { from: "coarse", to: "fine", evaluator: "native.room.refine" }
+    abstract: #Map & { from: "fine", to: "coarse", evaluator: "native.room.abstract" }
+}
+
+hall: #Room & { temperature: 303.15K, capacity: 10000J/K }
+
+study: #DetailRoom & {
+    coarse: { temperature: 293.15K, capacity: 10000J/K }
+    fine:   { c0: { capacity: 2500J/K }, c1: { capacity: 2500J/K }, c2: { capacity: 2500J/K }, c3: { capacity: 2500J/K },
+              conductance: 20W/K }
+    spread: 0K
+}
+
+// The wall does not know which model is behind the port.
+door: #Wall & { hot: hall.west, cold: study.west, conductance: 10W/K }

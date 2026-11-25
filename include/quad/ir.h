@@ -51,9 +51,15 @@ typedef struct {
     uint32_t     natoms;
 } QiEnum;
 
+/* A phenomenon. With models (ADR 0021): the names of its models, in the
+ * order of the names, and the model that is active at the start. A cell of a
+ * model has a path below the model: roomB.fine.c0.energy. */
 typedef struct {
-    const char *name;        /* the name of the instance: the first component of its cells' paths */
-    const char *type;        /* its type in source */
+    const char  *name;       /* the name of the instance: the first component of its cells' paths */
+    const char  *type;       /* its type in source */
+    const char **models;
+    uint32_t     nmodels;    /* 0: the phenomenon has no models */
+    uint32_t     start;      /* index into models, or QI_NONE */
 } QiPhen;
 
 typedef enum { QI_INTERVAL, QI_SET } QiDomain;
@@ -61,6 +67,7 @@ typedef enum { QI_INTERVAL, QI_SET } QiDomain;
 typedef struct {
     const char *path;        /* roomA.energy */
     uint32_t    phen;        /* its owner: index into phens */
+    uint32_t    model;       /* the model that has the cell: index into the models of its owner, or QI_NONE */
     QiDomain    domain;
     uint32_t    kind;        /* index into kinds; for a set cell, into enums */
     QInterval   base;        /* an interval cell: quanta of its kind */
@@ -83,15 +90,17 @@ typedef enum {
     QI_PORT_VIEW,            /* each field is a cell of the phenomenon, by an alias */
     QI_PORT_CONNECTED,       /* the port is another phenomenon's port */
     QI_PORT_OPEN,            /* a field has no cell: nothing is connected */
+    QI_PORT_MODEL,           /* the port of the active model: each model gives the port as a view (ADR 0021) */
 } QiPortState;
 
 typedef struct {
-    uint32_t    phen;        /* index into phens */
-    const char *name;        /* the path of the port in the phenomenon: west */
-    const char *type;
-    QiPortState state;
-    const char *target;      /* connected: the path of the other port, roomA.west */
-    uint32_t    target_phen; /* connected: index into phens */
+    uint32_t     phen;        /* index into phens */
+    const char  *name;        /* the path of the port in the phenomenon: west */
+    const char  *type;
+    QiPortState  state;
+    const char  *target;      /* connected: the path of the other port, roomA.west */
+    uint32_t     target_phen; /* connected: index into phens */
+    const char **targets;     /* by model: for each model of the phenomenon, the path of its port, roomB.fine.west */
 } QiPort;
 
 typedef enum { QI_EQUAL, QI_SUM, QI_DIFFERENCE, QI_PRODUCT, QI_QUOTIENT, QI_LESS_EQUAL, QI_LESS } QiOp;
@@ -100,8 +109,13 @@ typedef enum { QI_EQUAL, QI_SUM, QI_DIFFERENCE, QI_PRODUCT, QI_QUOTIENT, QI_LESS
  * cell[1]. For QI_LESS_EQUAL and QI_LESS, cell[0] <= cell[1] or cell[0] <
  * cell[1]. It narrows every cell that it names, in every direction. One law
  * can give several propagators, with derived cells between them. */
+/* A law of a model works only while the model is active (ADR 0021): `mphen`
+ * and `model` name that model. A law that reads through a port of the active
+ * model gives one propagator for each model of that phenomenon. */
 typedef struct {
     uint32_t    phen;        /* the phenomenon that states the law */
+    uint32_t    mphen;       /* the phenomenon whose model the propagator belongs to: index into phens, or QI_NONE */
+    uint32_t    model;       /* index into the models of mphen, or QI_NONE */
     QiOp        op;
     uint32_t    cell[3];     /* indices into cells; cell[2] is QI_NONE where the propagator has two cells */
     const char *name;        /* the path of the law in source: roomA.storage */
@@ -110,10 +124,16 @@ typedef struct {
     int         line, col;
 } QiProp;
 
+/* The cell of a slot. A slot can go through a port of the active model of a
+ * phenomenon (ADR 0021): the world then binds the slot again at each switch.
+ * `cell` is the cell while the model of the start is active, and `mcells`
+ * has the cell for each model. */
 typedef struct {
     const char *slot;        /* the name of the slot in the kernel's contract */
     QkRole      role;
     uint32_t    cell;        /* index into cells */
+    uint32_t    mphen;       /* the phenomenon whose model decides the cell: index into phens, or QI_NONE */
+    uint32_t   *mcells;      /* for each model of mphen: index into cells. NULL if mphen is QI_NONE */
 } QiBind;
 
 /* A transfer of a kernel. An interaction with a rate in source (ADR 0020)
@@ -126,15 +146,32 @@ typedef struct {
     uint32_t    rate, tolerance;   /* indices into cells; QI_NONE for a transfer of a kernel in C */
 } QiTransfer;
 
-/* A kernel of a phenomenon, with the cell that each slot binds to. */
+/* A kernel of a phenomenon, or of one model of it, with the cell that each
+ * slot binds to. The kernel of a model runs only while the model is active. */
 typedef struct {
     uint32_t    phen;
+    uint32_t    model;       /* index into the models of phen, or QI_NONE */
     const char *kernel;      /* the name of the evaluator: native.conduction */
+    uint32_t    size;        /* a kernel of a room with n cells (quad/kernels.h) that the front end generates: n. Else 0 */
     QiBind     *binds;
     uint32_t    nbinds;
     QiTransfer *transfers;
     uint32_t    ntransfers;
 } QiKernelUse;
+
+/* A map of a phenomenon (ADR 0021 section 5): the way from one model to
+ * another. The kernel is a map kernel (ADR 0009 section 5). Its slot "from.x"
+ * binds to a cell of the model `from`, "to.x" to a cell of the model `to`,
+ * and another slot to a cell of the phenomenon. */
+typedef struct {
+    uint32_t    phen;
+    const char *name;        /* the name of the field: refine */
+    uint32_t    from, to;    /* indices into the models of phen */
+    const char *kernel;
+    uint32_t    size;        /* as in QiKernelUse */
+    QiBind     *binds;
+    uint32_t    nbinds;
+} QiMap;
 
 /* One edge of the dependency graph: a propagator or a kernel uses a cell. */
 typedef enum {
@@ -171,13 +208,18 @@ typedef struct QIr {
     uint32_t      nprops;
     QiKernelUse  *kernels;
     uint32_t      nkernels;
+    QiMap        *maps;          /* in the order of phenomenon, then name */
+    uint32_t      nmaps;
     QiDep        *deps;          /* in the order of cell, then propagators, then kernels */
     uint32_t      ndeps;
     void         *mem;           /* owns the strings and the arrays */
 } QIr;
 
 /* The kernels that source can name with `evaluator`. The native kernels of
- * quad/kernels.h that need no parameter are always known. */
+ * quad/kernels.h are always known. A kernel of a room with n cells has a
+ * contract for each n: the front end counts the cells c0, c1, ... of the
+ * model and generates the kernel, and the world frees it. A kernel that the
+ * options give has precedence over a native kernel with the same name. */
 typedef struct {
     const QkKernel *const *kernels;
     size_t                 nkernels;
@@ -207,5 +249,11 @@ const char *qi_unit(const char *dimension);
  * On an error, *out is NULL and `error`, if not NULL, gets a message that the
  * caller frees. */
 QwStatus qi_instantiate(const QIr *ir, uint64_t seed, const QiOptions *opt, QWorld **out, char **error);
+
+/* Switches the phenomenon `phen` of a world from the IR to `model`, at the
+ * current time (ADR 0021 section 5). It finds the map from the active model
+ * to `model` and switches with the kernel of that map. If the phenomenon has
+ * no such map, the result is QW_ENAME, and qw_error gives a message. */
+QwStatus qi_switch(const QIr *ir, QWorld *w, const char *phen, const char *model);
 
 #endif

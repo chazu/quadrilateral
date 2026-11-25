@@ -41,6 +41,7 @@ typedef struct {
 } Att;
 
 typedef struct { char *name; QnGroup group; Att att; } Model;
+typedef struct { char *name; int from, to; const QkKernel *map; } Transition;   /* qw_transition */
 
 typedef struct {
     char    *name;
@@ -51,6 +52,8 @@ typedef struct {
     Model   *models;
     size_t   nmodels, capmodels;
     int      active;            /* a model index, or NO_MODEL if the phenomenon has no models */
+    Transition *trans;
+    size_t   ntrans, captrans;
     Att      base;
     uint64_t predicts;
     uint64_t ident;             /* a hash of the name: the identity for random streams (ADR 0013) */
@@ -463,6 +466,8 @@ void qw_free(QWorld *w)
             free(p->pmaps[j].port);
             free(p->pmaps[j].target);
         }
+        for (size_t j = 0; j < p->ntrans; j++) free(p->trans[j].name);
+        free(p->trans);
         free(p->models);
         free(p->ports);
         free(p->pmaps);
@@ -673,6 +678,11 @@ static QwStatus new_phen(QWorld *w, const char *name, QwPhen *out)
 }
 
 QwStatus qw_phenomenon(QWorld *w, const char *name, QwPhen *out) { return new_phen(w, name, out); }
+
+QwStatus qw_find_phenomenon(const QWorld *w, const char *name, QwPhen *out)
+{
+    return find_phen(w, name, strlen(name), out) ? QW_OK : QW_ENAME;
+}
 
 QwStatus qw_model(QWorld *w, QwPhen pid, const char *name)
 {
@@ -1551,6 +1561,48 @@ fail_map:
     return st;
 }
 
+/* --- transitions (ADR 0021 section 5) --------------------------------------------------- */
+
+QwStatus qw_transition(QWorld *w, QwPhen pid, const char *name, const char *from, const char *to, const QkKernel *map)
+{
+    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
+    Phen *p = &w->phens[pid];
+    if (!valid_name(name)) return fail(w, QW_ENAME, "%s: invalid transition name '%s'", p->name, name);
+    int f = find_model(p, from, strlen(from)), t = find_model(p, to, strlen(to));
+    if (f == NO_MODEL || t == NO_MODEL) return fail(w, QW_ENAME, "%s: no model '%s'", p->name, f == NO_MODEL ? from : to);
+    if (f == t) return fail(w, QW_EDUP, "%s: the transition '%s' goes from the model '%s' to itself", p->name, name, from);
+    for (size_t i = 0; i < p->ntrans; i++) {
+        if (!strcmp(p->trans[i].name, name)) return fail(w, QW_EDUP, "%s: the transition '%s' already exists", p->name, name);
+        if (p->trans[i].from == f && p->trans[i].to == t)
+            return fail(w, QW_EDUP, "%s: the transition '%s' already goes from '%s' to '%s'", p->name, p->trans[i].name, from, to);
+    }
+    QwStatus st = check_contract(w, p->name, map);
+    if (st) return st;
+    if (!(map->flags & QK_MAP)) return fail(w, QW_EKERNEL, "%s: kernel '%s' is not a map kernel", p->name, map->name);
+    if (!grow((void **) &p->trans, &p->captrans, p->ntrans + 1, sizeof *p->trans)) return QW_ENOMEM;
+    Transition *tr = &p->trans[p->ntrans];
+    memset(tr, 0, sizeof *tr);
+    if (!(tr->name = dupstr(name))) return QW_ENOMEM;
+    tr->from = f;
+    tr->to = t;
+    tr->map = map;
+    p->ntrans++;
+    return QW_OK;
+}
+
+QwStatus qw_switch_to(QWorld *w, QwPhen pid, const char *model)
+{
+    if (pid >= w->nphens) return fail(w, QW_ENAME, "no such phenomenon");
+    Phen *p = &w->phens[pid];
+    int to = find_model(p, model, strlen(model));
+    if (to == NO_MODEL) return fail(w, QW_ENAME, "%s: no model '%s'", p->name, model);
+    if (to == p->active) return fail(w, QW_EDUP, "%s: model '%s' is already active", p->name, model);
+    for (size_t i = 0; i < p->ntrans; i++)
+        if (p->trans[i].from == p->active && p->trans[i].to == to) return qw_switch(w, pid, model, p->trans[i].map);
+    return fail(w, QW_ENAME, "%s: no transition from the model '%s' to the model '%s'", p->name, p->models[p->active].name,
+                model);
+}
+
 /* --- instances (ADR 0013) -------------------------------------------------------------- */
 
 QwStatus qw_instance(QWorld *w, const char *key, QwPhen *out)
@@ -2340,8 +2392,12 @@ uint64_t qw_hash(const QWorld *w)
      * declaration (ADR 0013). */
     const uint64_t seed = 0xcbf29ce484222325ULL;
     uint64_t sum = 0;
-    for (size_t i = 0; i < w->nphens; i++)
-        sum += fnv(fnv(seed, w->phens[i].ident), (uint64_t) (int64_t) w->phens[i].active);
+    for (size_t i = 0; i < w->nphens; i++) {
+        /* the active model by its name: the order of the models is not state */
+        const Phen *p = &w->phens[i];
+        const char *model = p->active == NO_MODEL ? "" : p->models[p->active].name;
+        sum += fnv(fnv(seed, p->ident), qr_name_hash(model, strlen(model)));
+    }
     for (size_t c = 0; c < w->ncells; c++) {
         if (w->cells[c].derived) continue;       /* not state */
         QInterval b = qn_base(w->net, (QnCell) c);
