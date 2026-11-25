@@ -126,6 +126,23 @@ char *qi_text(const QIr *ir)
             qf_buf_printf(&b, "  map %s, at a switch: %s -> %s, %s", mp->name, ph->models[mp->from], ph->models[mp->to],
                           mp->kernel);
             if (mp->size) qf_buf_printf(&b, ", for %u cells", mp->size);
+            if (mp->when.path) {
+                /* the condition: the cell, and the atoms or the range that make it true */
+                const QiCell *c = &ir->cells[mp->when.cell];
+                qf_buf_printf(&b, ", when %s.%s is ", ph->name, mp->when.path);
+                if (c->domain == QI_SET) {
+                    bool first = true;
+                    for (uint32_t a = 0; a < ir->enums[c->kind].natoms; a++)
+                        if (mp->when.mask >> a & 1) {
+                            qf_buf_printf(&b, "%s%s", first ? "" : " | ", ir->enums[c->kind].atoms[a]);
+                            first = false;
+                        }
+                } else {
+                    char range[160];
+                    qi_format_interval(mp->when.range, ir->kinds[c->kind].scale, range, sizeof range);
+                    qf_buf_puts(&b, range);
+                }
+            }
             qf_buf_putc(&b, '\n');
             for (uint32_t s2 = 0; s2 < mp->nbinds; s2++)
                 qf_buf_printf(&b, "    %s %s = %s\n", roles[mp->binds[s2].role], mp->binds[s2].slot,

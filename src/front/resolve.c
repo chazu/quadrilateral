@@ -32,7 +32,7 @@ static const char *prelude_quad =
     "package quad\n"
     "#Phenomenon: { evaluator: text, model: text }\n"
     "#Model: { evaluator: text }\n"
-    "#Map: { from: text, to: text, evaluator: text }\n"
+    "#Map: { from: text, to: text, evaluator: text, when: _ }\n"
     "#Port: {}\n"
     "#Interaction: { source: _, sink: _, rate: _, ratio: _, tolerance: *1pct | %ratio, conserved: *true | bool }\n"
     "#Reaction: { rate: _, tolerance: *1pct | %ratio }\n";
@@ -690,6 +690,11 @@ static bool check_expr(Build *b, const X *x, const X *parent)
             build_error(b, x->loc, "the name '%s' cannot stand in an expression: a value of the structure is a "
                         "reference, for example .size", x->u.name);
         }
+        return false;
+    case X_ATOM:
+        /* the condition of a map compares a field with an atom: .visible == false (ADR 0022) */
+        if (parent && parent->k == X_CMP && (parent->u.ar.op == 'e' || parent->u.ar.op == 'n')) return true;
+        build_error(b, x->loc, "the atom %s can stand in an expression only in a comparison with == or !=", x->u.name);
         return false;
     case X_CALL:
         build_error(b, x->loc, "the function '%s' was not expanded", x->u.call.name);

@@ -21,6 +21,9 @@
  *   --seed N        the seed of the world (the default is 1)
  *   --switch P=M@T  switches the phenomenon P to its model M at the time T, with
  *                   the map that the content gives: roomB=fine@200s
+ *   --set C=V@T     gives the cell C the value V at the time T, as an input of
+ *                   the application: roomB.visible=true@200s. For a quantity,
+ *                   V is a number in the coherent unit of its dimension
  *
  * Without --until, run prints each cell after propagation, with no time
  * step. A value is in the coherent unit of its dimension. */
@@ -31,7 +34,7 @@ static void usage(void)
           "       quad ir FILE...\n"
           "       quad transfers FILE...\n"
           "       quad run FILE... [--until TIME] [--every TIME] [--show PATH,PATH] [--seed N]\n"
-          "                        [--switch PHENOMENON=MODEL@TIME]...\n"
+          "                        [--switch PHENOMENON=MODEL@TIME]... [--set CELL=VALUE@TIME]...\n"
           "A time is a number and a unit: 1000s, 20min, 2h, 1d.\n",
           stderr);
 }
@@ -168,8 +171,43 @@ static void show_transfers(const QIr *ir)
     }
 }
 
-/* A switch of a model that --switch asks for. */
-typedef struct { char phen[128], model[128]; const char *when; int64_t at; bool done; } Switch;
+/* A switch of a model that --switch asks for, or an input that --set asks
+ * for: then `phen` is the path of the cell and `model` is the value. */
+typedef struct { char phen[128], model[128]; const char *when; int64_t at; bool done, set; } Switch;
+
+/* Gives a cell a value from the text of --set. False with a message. */
+static bool set_input(const QIr *ir, QWorld *w, const Switch *in)
+{
+    const QiCell *c = find_cell(ir, in->phen);
+    if (!c) {
+        fprintf(stderr, "quad: --set %s=%s@%s: no cell %s. `quad ir` lists the cells\n", in->phen, in->model, in->when, in->phen);
+        return false;
+    }
+    QwStatus st;
+    if (c->domain == QI_SET) {
+        const QiEnum *en = &ir->enums[c->kind];
+        uint64_t mask = 0;
+        for (uint32_t a = 0; a < en->natoms; a++)
+            if (!strcmp(en->atoms[a], in->model)) mask = (uint64_t) 1 << a;
+        if (!mask) {
+            fprintf(stderr, "quad: --set %s=%s@%s: %s is not an atom of the cell\n", in->phen, in->model, in->when, in->model);
+            return false;
+        }
+        st = qw_input_set(w, c->path, mask);
+    } else {
+        char *end;
+        double v = strtod(in->model, &end);
+        if (end == in->model || *end) {
+            fprintf(stderr, "quad: --set %s=%s@%s: the value of a quantity is a number\n", in->phen, in->model, in->when);
+            return false;
+        }
+        for (int i = ir->kinds[c->kind].scale; i < 0; i++) v *= 10;
+        for (int i = ir->kinds[c->kind].scale; i > 0; i--) v /= 10;
+        st = qw_input(w, c->path, qi_point((int64_t) (v < 0 ? v - 0.5 : v + 0.5)));
+    }
+    if (st != QW_OK) fprintf(stderr, "quad: --set %s=%s@%s: %s\n", in->phen, in->model, in->when, qw_error(w));
+    return st == QW_OK;
+}
 
 /* Makes each switch whose time is not after `t`, in the order of the times.
  * False with a report if the run or a switch fails. */
@@ -185,7 +223,9 @@ static bool switches_to(const QIr *ir, QWorld *w, Switch *sw, size_t nsw, int64_
             report(ir, w, next->at);
             return false;
         }
-        if (qi_switch(ir, w, next->phen, next->model) != QW_OK) {
+        if (next->set) {
+            if (!set_input(ir, w, next)) return false;
+        } else if (qi_switch(ir, w, next->phen, next->model) != QW_OK) {
             fprintf(stderr, "quad: --switch %s=%s@%s: %s\n", next->phen, next->model, next->when, qw_error(w));
             return false;
         }
@@ -221,13 +261,15 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--every")) every_text = argv[++i];
         else if (!strcmp(a, "--show")) show = argv[++i];
         else if (!strcmp(a, "--seed")) seed = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--switch")) {
+        else if (!strcmp(a, "--switch") || !strcmp(a, "--set")) {
             const char *v = argv[++i], *eq = strchr(v, '='), *at = eq ? strchr(eq, '@') : NULL;
             if (!at || eq == v || at == eq + 1 || !at[1] || nsw == 16 || eq - v > 127 || at - eq > 127) {
-                fprintf(stderr, "quad: --switch needs PHENOMENON=MODEL@TIME, for example roomB=fine@200s, 16 times at most\n");
+                fprintf(stderr, "quad: %s needs NAME=VALUE@TIME, for example roomB=fine@200s. --switch and --set together "
+                                "can be there 16 times\n", a);
                 return 2;
             }
             memset(&sw[nsw], 0, sizeof sw[nsw]);
+            sw[nsw].set = !strcmp(a, "--set");
             memcpy(sw[nsw].phen, v, (size_t) (eq - v));
             memcpy(sw[nsw].model, eq + 1, (size_t) (at - eq - 1));
             sw[nsw++].when = at + 1;
@@ -288,8 +330,8 @@ int main(int argc, char **argv)
     for (size_t i = 0; i < nsw; i++) {
         sw[i].at = parse_time(sw[i].when, ir->tick_scale);
         if (sw[i].at < 0 || !until_text || sw[i].at > until) {
-            fprintf(stderr, "quad: --switch %s=%s@%s: the time must be a time of the run, so --until must give a later time\n",
-                    sw[i].phen, sw[i].model, sw[i].when);
+            fprintf(stderr, "quad: %s %s=%s@%s: the time must be a time of the run, so --until must give a later time\n",
+                    sw[i].set ? "--set" : "--switch", sw[i].phen, sw[i].model, sw[i].when);
             return 2;
         }
     }

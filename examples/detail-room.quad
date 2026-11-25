@@ -2,13 +2,16 @@
 // file with thermal.quad:
 //
 //   build/quad run examples/thermal.quad examples/detail-room.quad --until 20min --every 5min \
-//       --switch study=fine@5min --switch study=coarse@15min \
+//       --set study.visible=true@5min --set study.visible=false@15min \
 //       --show hall.temperature,study.coarse.temperature,study.fine.c0.temperature,study.fine.c3.temperature
 //
 // A model is a field with a type below #Model. Its cells have paths below
 // it, and its laws and its kernel work only while it is active. A map moves
 // the state from one model to another at a switch, and the energy of the
 // room stays the same.
+//
+// A map can have a condition. The room is fine while somebody looks at it:
+// `visible` is an input that the application sets.
 
 // One part of a room, with the law of its heat.
 #Lump: #Thermal & { storage: .energy == .capacity * .temperature }
@@ -32,12 +35,13 @@
     west:   #ThermalPort              // the port of the active model
     spread: %temperature              // how far the map moves each part from the mean, with a seed
     model:  *"coarse" | text          // the model that is active at the start
+    visible: *false | bool            // an input of the application: somebody looks at the room
 
     coarse: #CoarseRoom
     fine:   #FineRoom
 
-    refine:   #Map & { from: "coarse", to: "fine", evaluator: "native.room.refine" }
-    abstract: #Map & { from: "fine", to: "coarse", evaluator: "native.room.abstract" }
+    refine:   #Map & { from: "coarse", to: "fine", evaluator: "native.room.refine", when: .visible }
+    abstract: #Map & { from: "fine", to: "coarse", evaluator: "native.room.abstract", when: .visible == false }
 }
 
 hall: #Room & { temperature: 303.15K, capacity: 10000J/K }

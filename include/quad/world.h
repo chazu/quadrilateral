@@ -56,6 +56,7 @@ typedef enum {
     QW_ETIME,           /* a time before now, or past the end of the clock */
     QW_ELIFE,           /* an instance in the wrong state, or existence conditions that do not settle */
     QW_ESNAPSHOT,       /* bytes that are not a snapshot, or a snapshot of a world with another structure */
+    QW_ECONDITION,      /* two transitions of one phenomenon have a true condition at one boundary */
     QW_ENOMEM,
 } QwStatus;
 
@@ -137,6 +138,100 @@ QwStatus qw_transition(QWorld *w, QwPhen p, const char *name, const char *from, 
  * QW_ENAME if the phenomenon has no such transition. */
 QwStatus qw_switch_to(QWorld *w, QwPhen p, const char *model);
 
+/* --- transition conditions (ADR 0022) -------------------------------------------------- */
+
+/* A condition is a statement about one cell of the phenomenon: the value of
+ * the cell is in a set. `path` is relative to the phenomenon, and it can go
+ * through the port of the active model: "visible", "west.temperature". For an
+ * interval cell the set is `range`, in quanta of the cell, and `mask` is 0.
+ * For a set cell the set is the atoms of `mask`.
+ *
+ * A condition is true if each possible value of the cell is in the set, and
+ * false if no possible value is. If not, it is unknown, and an unknown
+ * condition changes nothing. A NULL path is the condition "never". */
+typedef struct {
+    const char *path;
+    QInterval   range;
+    uint64_t    mask;
+} QwCondition;
+
+QwCondition qw_when_true(const char *path);                  /* a boolean cell is true */
+QwCondition qw_when_false(const char *path);
+QwCondition qw_when_atoms(const char *path, uint64_t mask);
+QwCondition qw_when_in(const char *path, QInterval range);
+QwCondition qw_never(void);
+
+/* The exact type of a phenomenon in source, such as "#DetailRoom". */
+QwStatus    qw_set_type(QWorld *w, QwPhen p, const char *type);
+const char *qw_type(const QWorld *w, QwPhen p);              /* "" if the phenomenon has none */
+
+/* The condition of a transition from the content: a part of the build. The
+ * world reads the conditions at the start of qw_run and after each boundary,
+ * after the step for the instances. It decides each switch from the values at
+ * that time, and then makes the switches in the order of the names of the
+ * phenomena. Only the transitions from the active model count, and a
+ * phenomenon makes one switch at most at a boundary. Two transitions of one
+ * phenomenon that are true together stop the run: QW_ECONDITION. */
+QwStatus qw_transition_when(QWorld *w, QwPhen p, const char *transition, const QwCondition *cond);
+
+/* The application can replace a condition for one instance, or for each
+ * instance of an exact type. The world uses the condition of the instance. If
+ * there is none, it uses the condition of the exact type, and then the
+ * condition from the content. A call takes effect at the current time. The
+ * conditions of the application are state: qw_hash and a snapshot have them.
+ * A clear of a condition that is not there is QW_ENAME. */
+QwStatus qw_override_condition(QWorld *w, QwPhen p, const char *transition, const QwCondition *cond);
+QwStatus qw_clear_condition(QWorld *w, QwPhen p, const char *transition);
+QwStatus qw_override_type_condition(QWorld *w, const char *type, const char *transition, const QwCondition *cond);
+QwStatus qw_clear_type_condition(QWorld *w, const char *type, const char *transition);
+
+/* The condition that is in effect for a transition, and where it comes from.
+ * QW_LEVEL_NONE: the transition has no condition, and only the application
+ * starts its switch. The path of *out is valid until the next change of a
+ * condition. */
+typedef enum { QW_LEVEL_NONE, QW_LEVEL_SOURCE, QW_LEVEL_TYPE, QW_LEVEL_INSTANCE } QwLevel;
+QwStatus qw_condition(const QWorld *w, QwPhen p, const char *transition, QwCondition *out, QwLevel *level);
+
+/* --- the record of the calls of the application (ADR 0022 section 5) --------------------- */
+
+/* The world can record each call that changes it: a run to a time, an
+ * input, a start or an end of an instance, a switch, and a change of a
+ * condition. A call that fails is not in the record. qw_replay makes the
+ * calls again in a new world with the same structure. That world then has
+ * the same state hash at each time, and each switch at the same boundary. A
+ * run to a time is in the record because each stop of a run is a boundary.
+ *
+ * A switch with qw_switch replays through the transition between the two
+ * models, so the world must have one. */
+typedef enum {
+    QW_CALL_RUN,
+    QW_CALL_INPUT,
+    QW_CALL_INPUT_SET,
+    QW_CALL_START,
+    QW_CALL_END,
+    QW_CALL_SWITCH,
+    QW_CALL_CONDITION,
+    QW_CALL_TYPE_CONDITION,
+} QwCallKind;
+
+typedef struct {
+    QwCallKind  kind;
+    int64_t     time;        /* the time of the world at the call. QW_CALL_RUN: the time that the run went to */
+    const char *target;      /* the path of a cell, the name of a phenomenon, or a type. NULL for a run */
+    const char *name;        /* QW_CALL_SWITCH: the model. A condition: the transition */
+    QInterval   value;       /* QW_CALL_INPUT */
+    uint64_t    mask;        /* QW_CALL_INPUT_SET */
+    bool        clear;       /* a condition: the call removed it */
+    QwCondition cond;        /* a condition: the one that the call gave */
+} QwCall;
+
+/* Turns the record on or off. It is off by default. Turning it off keeps the entries. */
+void          qw_record(QWorld *w, bool on);
+/* The entries, and their number in *n. Valid until the next call that the world records. */
+const QwCall *qw_calls(const QWorld *w, size_t *n);
+/* Makes each call of a record, in order. A call that is not a run must have the time of the world. */
+QwStatus      qw_replay(QWorld *w, const QwCall *calls, size_t n);
+
 /* --- instances (ADR 0013) ---------------------------------------------------------- */
 
 /* The built-in enumeration kind "boolean": atom 0 is "false", atom 1 "true". */
@@ -215,7 +310,8 @@ uint64_t qw_hash(const QWorld *w);
  * epoch, the base of each cell, the active model of each phenomenon, the
  * instances that are alive, and for each kernel its prediction, its
  * assumptions, its event count and its private state. A prediction decides
- * the next boundary, so it is state.
+ * the next boundary, so it is state. It also has each condition that the
+ * application gave (ADR 0022).
  *
  * qw_snapshot gives the bytes, and the caller frees them. A kernel that is
  * not stateless must give `save`, or the snapshot fails.

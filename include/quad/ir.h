@@ -168,10 +168,22 @@ typedef struct {
     uint32_t    ntransfers;
 } QiKernelUse;
 
+/* The condition of a map (ADR 0022): the value of one cell of the phenomenon
+ * is in a set. For an interval cell the set is `range`, in quanta of the
+ * cell. For a set cell it is the atoms of `mask`. */
+typedef struct {
+    const char *path;        /* the cell, as a path in the phenomenon: visible, west.temperature. NULL: no condition */
+    uint32_t    cell;        /* index into cells; for a path through the port of the active model, the cell at the start */
+    QInterval   range;
+    uint64_t    mask;        /* 0 for an interval cell */
+    const char *text;        /* the condition in source: .visible == false */
+} QiCondition;
+
 /* A map of a phenomenon (ADR 0021 section 5): the way from one model to
  * another. The kernel is a map kernel (ADR 0009 section 5). Its slot "from.x"
  * binds to a cell of the model `from`, "to.x" to a cell of the model `to`,
- * and another slot to a cell of the phenomenon. */
+ * and another slot to a cell of the phenomenon. The map is a transition of
+ * the world, with the name of its field. */
 typedef struct {
     uint32_t    phen;
     const char *name;        /* the name of the field: refine */
@@ -180,6 +192,7 @@ typedef struct {
     uint32_t    size;        /* as in QiKernelUse */
     QiBind     *binds;
     uint32_t    nbinds;
+    QiCondition when;        /* the world switches with the map while this is true (ADR 0022) */
 } QiMap;
 
 /* One edge of the dependency graph: a propagator or a kernel uses a cell. */
