@@ -40,7 +40,7 @@ static QWorld *tank(double volume_m3, int64_t empties_s, int64_t tol_e9, QkKerne
         { "tolerance", QK_IN, "", -9, { 1, 1000000000 } },
         { "volume", QK_STOCK, "m^3", -9, ANY },
     };
-    const QkRateTransfer leak = { "leak", 0, 1, 2, QK_NONE };
+    const QkRateTransfer leak = { "leak", 0, 1, 2, QK_NONE, QK_NONE };
     *kernel = qk_rate_new(slots, 3, &leak, 1);
     CHECK(*kernel != NULL);
     if (*kernel) OK(qw_attach(w, p, *kernel));
@@ -140,8 +140,8 @@ static Rooms rooms(int64_t power_mw, int64_t per_s_e9)
         { "cold.energy", QK_LINK, "J", -3, ANY },
     };
     const QkRateTransfer moves[] = {
-        { "heat", 0, 2, QK_NONE, 3 },          /* from outside into a */
-        { "level", 1, 2, 3, 4 },               /* from a to b */
+        { "heat", 0, 2, QK_NONE, 3, QK_NONE },          /* from outside into a */
+        { "level", 1, 2, 3, 4, QK_NONE },               /* from a to b */
     };
     r.k = qk_rate_new(slots, 5, moves, 2);
     CHECK(r.k != NULL);
@@ -208,7 +208,7 @@ void test_rate_carry(void)
         { "tolerance", QK_IN, "", -9, { 1, 1000000000 } },
         { "energy", QK_STOCK, "J", 0, ANY },
     };
-    const QkRateTransfer in = { "in", 0, 1, QK_NONE, 2 };
+    const QkRateTransfer in = { "in", 0, 1, QK_NONE, 2, QK_NONE };
     QkKernel *k = qk_rate_new(slots, 3, &in, 1);
     CHECK(k != NULL);
     if (k) {
@@ -253,7 +253,7 @@ void test_rate_balance(void)
         { "tolerance", QK_IN, "", -9, { 1, 1000000000 } },
         { "volume", QK_STOCK, "m^3", -9, ANY },
     };
-    const QkRateTransfer moves[] = { { "tap", 0, 2, QK_NONE, 3 }, { "leak", 1, 2, 3, QK_NONE } };
+    const QkRateTransfer moves[] = { { "tap", 0, 2, QK_NONE, 3, QK_NONE }, { "leak", 1, 2, 3, QK_NONE, QK_NONE } };
     QkKernel *k = qk_rate_new(slots, 4, moves, 2);
     CHECK(k != NULL);
     if (k) {
@@ -297,7 +297,7 @@ void test_rate_contract(void)
         { "tolerance", QK_IN, "", -9, { 1, 1000000000 } },
         { "energy", QK_STOCK, "J", 0, ANY },
     };
-    const QkRateTransfer good = { "in", 0, 1, QK_NONE, 2 };
+    const QkRateTransfer good = { "in", 0, 1, QK_NONE, 2, QK_NONE };
     QkKernel *k = qk_rate_new(slots, 3, &good, 1);
     CHECK(k != NULL);
     if (k) {
@@ -307,20 +307,167 @@ void test_rate_contract(void)
         CHECK(k->save && k->restore);
     }
     qk_rate_free(k);
-    const QkRateTransfer both = { "move", 0, 1, 2, 2 };
+    const QkRateTransfer both = { "move", 0, 1, 2, 2, QK_NONE };
     k = qk_rate_new(slots, 3, &both, 1);
     CHECK(k && k->transfers[0].conserved);
     qk_rate_free(k);
     const QkRateTransfer bad[] = {
-        { "none", 0, 1, QK_NONE, QK_NONE },    /* no stock */
-        { "rate", 3, 1, QK_NONE, 2 },          /* the rate is no slot */
-        { "tol", 0, 9, QK_NONE, 2 },           /* the tolerance is no slot */
-        { "stock", 0, 1, 2, 5 },               /* the sink is no slot */
-        { "from", 0, 1, 7, 2 },                /* the source is no slot */
-        { "role", 0, 2, QK_NONE, 2 },          /* the tolerance is a stock */
+        { "none", 0, 1, QK_NONE, QK_NONE, QK_NONE },    /* no stock */
+        { "rate", 3, 1, QK_NONE, 2, QK_NONE },          /* the rate is no slot */
+        { "tol", 0, 9, QK_NONE, 2, QK_NONE },           /* the tolerance is no slot */
+        { "stock", 0, 1, 2, 5, QK_NONE },               /* the sink is no slot */
+        { "from", 0, 1, 7, 2, QK_NONE },                /* the source is no slot */
+        { "role", 0, 2, QK_NONE, 2, QK_NONE },          /* the tolerance is a stock */
+        { "ratio", 0, 1, QK_NONE, 2, 3 },               /* the ratio is no slot */
+        { "ratio", 0, 1, QK_NONE, 2, 2 },               /* the ratio is a stock */
     };
+    const QkRateTransfer flow = { "flow", 0, 1, QK_NONE, 2, 1 };            /* a ratio that the kernel reads */
+    k = qk_rate_new(slots, 3, &flow, 1);
+    CHECK(k != NULL);
+    qk_rate_free(k);
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) CHECK(qk_rate_new(slots, 3, &bad[i], 1) == NULL);
     CHECK(qk_rate_new(slots, 0, &good, 1) == NULL);
     CHECK(qk_rate_new(slots, 3, &good, 0) == NULL);
     qk_rate_free(NULL);
+}
+
+/* --- a reaction: one rate, and a ratio for each flow (docs/adr/0021 section 7) ------------------------ */
+
+/* A fire: wood in mg (scale -6), heat in mJ (scale -3). The wood burns at
+ * wood / life, and each kilogram gives `heating` J. The flow of the fuel has
+ * the ratio 1, and the flow of the heat has the ratio `heating`. */
+static QWorld *fire(int64_t wood_mg, int64_t life_s, int64_t heating_mJ_kg, QkKernel **kernel)
+{
+    QWorld *w = qw_new(1, -6);
+    QwKind mass, energy, burn, time, ratio, per;
+    QwPhen p;
+    QnCell m, b, l;
+    OK(qw_kind(w, "mass", "kg", -6, true, &mass));
+    OK(qw_kind(w, "energy", "J", -3, true, &energy));
+    OK(qw_kind(w, "burn", "kg/s", -12, false, &burn));
+    OK(qw_kind(w, "time", "s", -6, false, &time));
+    OK(qw_kind(w, "ratio", "", -9, false, &ratio));
+    OK(qw_kind(w, "per", "J/kg", -3, false, &per));
+    OK(qw_phenomenon(w, "fire", &p));
+    OK(qw_cell(w, "fire.wood", mass, qi_point(wood_mg), &m));
+    OK(qw_cell(w, "fire.heat", energy, qi_point(0), NULL));
+    OK(qw_cell(w, "fire.life", time, qi_point(TICKS(life_s)), &l));
+    OK(qw_derived_cell(w, "fire.burning", burn, qi_top(), &b));
+    OK(qw_cell(w, "fire.tolerance", ratio, qi_point(10000000), NULL));
+    OK(qw_cell(w, "fire.one", ratio, qi_point(1000000000), NULL));
+    OK(qw_cell(w, "fire.heating", per, heating_mJ_kg < 0 ? qi_top() : qi_point(heating_mJ_kg), NULL));
+    CHECK(qn_quotient(qw_net(w), b, m, l, NULL) == QN_OK);
+    const QkSlot slots[] = {
+        { "burning", QK_IN, "kg/s", -12, ANY },
+        { "tolerance", QK_IN, "", -9, { 1, 1000000000 } },
+        { "one", QK_IN, "", -9, ANY },
+        { "heating", QK_IN, "J/kg", -3, ANY },
+        { "wood", QK_STOCK, "kg", -6, ANY },
+        { "heat", QK_STOCK, "J", -3, ANY },
+    };
+    const QkRateTransfer flows[] = { { "fuel", 0, 1, 4, QK_NONE, 2 }, { "heat", 0, 1, QK_NONE, 5, 3 } };
+    *kernel = qk_rate_new(slots, 6, flows, 2);
+    CHECK(*kernel != NULL);
+    if (*kernel) OK(qw_attach(w, p, *kernel));
+    return w;
+}
+
+/* The two flows of a reaction keep their ratio at each time of a run: the
+ * heat is the wood that burned times the heating, to one quantum of the wood. */
+void test_rate_reaction(void)
+{
+    QkKernel *k;
+    const int64_t wood0 = 5000000;                                         /* 5 kg */
+    QWorld *w = fire(wood0, 2400, 15000000000, &k);                        /* 15 MJ/kg */
+    if (k) {
+        CHECK(k->ntransfers == 2 && !k->transfers[0].conserved && k->transfers[0].to == QK_NONE);
+        for (int t = 1; t <= 7201; t += 240) {
+            OK(qw_run(w, TICKS(t)));
+            int64_t burned = wood0 - qw_get(w, "fire.wood").lo, heat = qw_get(w, "fire.heat").lo;
+            /* 15 J for each mg. The wood has whole mg, so the heat is at most the heat of one mg more */
+            CHECK(heat >= 15000 * burned && heat < 15000 * (burned + 1));
+            double exact = (double) wood0 * exp(-(double) t / 2400.0), got = (double) qw_get(w, "fire.wood").lo;
+            CHECK(fabs(got - exact) <= 0.03 * exact + 2);
+        }
+        CHECK(qw_get(w, "fire.wood").lo < wood0 / 15 && qw_get(w, "fire.heat").lo > 69000000000);
+    }
+    qw_free(w);
+    qk_rate_free(k);
+
+    /* a ratio with no value stops the run, with a message */
+    w = fire(wood0, 2400, -1, &k);
+    if (k) {
+        CHECK(qw_run(w, TICKS(10)) == QW_EKERNEL);
+        CHECK(strstr(qw_error(w), "the ratio of the interaction heat has no bound") != NULL);
+    }
+    qw_free(w);
+    qk_rate_free(k);
+
+    /* an amount that the arithmetic cannot hold stops the run */
+    w = fire(wood0, 2400, 9000000000000000000, &k);
+    if (k) {
+        OK(qw_input(w, "fire.life", qi_point(1)));                         /* a rate of 5 × 10^18 quanta */
+        CHECK(qw_run(w, TICKS(100)) == QW_EKERNEL);
+        CHECK(strstr(qw_error(w), "the amount of the interaction heat in one step is too large for the arithmetic of the "
+                                  "kernel") != NULL);
+    }
+    qw_free(w);
+    qk_rate_free(k);
+}
+
+/* A constant rate with amounts that are whole quanta: each flow is exact at
+ * each stop. Then the ratio changes, and the flow follows from that time. */
+void test_rate_reaction_exact(void)
+{
+    QWorld *w = qw_new(1, -6);
+    QwKind mass, burn, ratio;
+    QwPhen p;
+    OK(qw_kind(w, "mass", "kg", -6, true, &mass));
+    OK(qw_kind(w, "burn", "kg/s", -12, false, &burn));
+    OK(qw_kind(w, "ratio", "", -9, false, &ratio));
+    OK(qw_phenomenon(w, "mix", &p));
+    OK(qw_cell(w, "mix.a", mass, qi_point(10000000), NULL));
+    OK(qw_cell(w, "mix.b", mass, qi_point(0), NULL));
+    OK(qw_cell(w, "mix.c", mass, qi_point(0), NULL));
+    OK(qw_cell(w, "mix.rate", burn, qi_point(1000000000), NULL));          /* 1 g for each second */
+    OK(qw_cell(w, "mix.tolerance", ratio, qi_point(10000000), NULL));
+    OK(qw_cell(w, "mix.one", ratio, qi_point(1000000000), NULL));
+    OK(qw_cell(w, "mix.part", ratio, qi_point(2500000000), NULL));         /* 2.5 */
+    OK(qw_cell(w, "mix.third", ratio, qi_point(333333333), NULL));         /* less than one quantum for each tick */
+    const QkSlot slots[] = {
+        { "rate", QK_IN, "kg/s", -12, ANY },   { "tolerance", QK_IN, "", -9, { 1, 1000000000 } },
+        { "one", QK_IN, "", -9, ANY },         { "part", QK_IN, "", -9, ANY },
+        { "third", QK_IN, "", -9, ANY },       { "a", QK_STOCK, "kg", -6, ANY },
+        { "b", QK_STOCK, "kg", -6, ANY },      { "c", QK_STOCK, "kg", -6, ANY },
+    };
+    /* a goes to b with the ratio 1, b gets 2.5 more from outside, and c gets a third */
+    const QkRateTransfer flows[] = {
+        { "use", 0, 1, 5, 6, 2 }, { "make", 0, 1, QK_NONE, 6, 3 }, { "side", 0, 1, QK_NONE, 7, 4 },
+    };
+    QkKernel *k = qk_rate_new(slots, 8, flows, 3);
+    CHECK(k != NULL);
+    if (k) {
+        CHECK(k->transfers[0].conserved && !k->transfers[1].conserved);
+        OK(qw_attach(w, p, k));
+        const int times[] = { 1, 2, 3, 10, 17, 250, 1000 };
+        for (size_t i = 0; i < sizeof times / sizeof times[0]; i++) {
+            int64_t t = times[i];
+            OK(qw_run(w, TICKS(t)));
+            CHECK_I64(qw_get(w, "mix.a").lo, 10000000 - 1000 * t);
+            CHECK_I64(qw_get(w, "mix.b").lo, 3500 * t);
+            /* 333.333333 quanta for each second: the part below one quantum stays for the next step */
+            CHECK_I64(qw_get(w, "mix.c").lo, t * 333333333 / 1000000);
+        }
+        /* another ratio from 1000 s */
+        OK(qw_input(w, "mix.part", qi_point(500000000)));                  /* 0.5 */
+        OK(qw_run(w, TICKS(1100)));
+        CHECK_I64(qw_get(w, "mix.b").lo, 3500 * 1000 + 1500 * 100);
+        CHECK_I64(qw_get(w, "mix.a").lo, 10000000 - 1000 * 1100);
+        /* a ratio below zero moves the quantity in the other direction */
+        OK(qw_input(w, "mix.part", qi_point(-1000000000)));
+        OK(qw_run(w, TICKS(1200)));
+        CHECK_I64(qw_get(w, "mix.b").lo, 3500 * 1000 + 1500 * 100 + 0);
+    }
+    qw_free(w);
+    qk_rate_free(k);
 }

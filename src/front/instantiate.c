@@ -63,11 +63,12 @@ static QkKernel *rate_kernel(const QIr *ir, const QiKernelUse *ku)
         }
         for (uint32_t t = 0; t < ku->ntransfers; t++) {
             const QiTransfer *tr = &ku->transfers[t];
-            uint32_t ends[4] = { tr->rate, tr->tolerance, tr->from, tr->to }, at[4] = { QK_NONE, QK_NONE, QK_NONE, QK_NONE };
-            for (int e = 0; e < 4; e++)
+            uint32_t ends[5] = { tr->rate, tr->tolerance, tr->from, tr->to, tr->ratio };
+            uint32_t at[5] = { QK_NONE, QK_NONE, QK_NONE, QK_NONE, QK_NONE };
+            for (int e = 0; e < 5; e++)
                 for (uint32_t b = 0; b < ku->nbinds && ends[e] != QI_NONE; b++)
                     if (ku->binds[b].cell == ends[e]) at[e] = b;
-            moves[t] = (QkRateTransfer) { tr->name, at[0], at[1], at[2], at[3] };
+            moves[t] = (QkRateTransfer) { tr->name, at[0], at[1], at[2], at[3], at[4] };
             /* the kernel reads the tolerance as a part of one, in units of 10^-9 */
             if (at[1] != QK_NONE) {
                 slots[at[1]].scale = -9;

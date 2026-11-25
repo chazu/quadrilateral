@@ -1119,3 +1119,188 @@ void test_detail_stated_transfers(void)
                       "wall: #Odd & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 1pct }\n"),
         "world.quad:4:1: error: wall: unknown evaluator \"native.nothing\"\n");
 }
+
+/* --- reactions (ADR 0021 section 7) ---------------------------------------------------------------------- */
+
+#define MASS "%mass: { dimension: \"kg\", scale: -6, conserved: true }\n"
+#define BURN                                                                                            \
+    "#Burn: #Reaction & { fuel: #Interaction & { ratio: 1, conserved: false },\n"                       \
+    "                     heat: #Interaction & { conserved: false } }\n"
+/* A fire with the reaction `burn`: `flows` gives the rate and the flows. */
+#define FIRE(flows)                                                                                     \
+    MASS BURN                                                                                           \
+    "#Fire: #Phenomenon & { room: #ThermalPort, wood: %mass, life: %time, burning: %mass / %time,\n"    \
+    "  heating: %energy / %mass, speed: .burning == .wood / .life,\n"                                   \
+    "  burn: " flows " }\n"                                                                             \
+    "r: #LumpedRoom & { temperature: 280K, capacity: 100000J/K }\n"                                     \
+    "fire: #Fire & { room: r.west, wood: 5kg, life: 40min, heating: 15MJ/kg }\n"
+#define FLOWS "#Burn & { rate: .burning, fuel: { source: .wood }, heat: { sink: .room.energy, ratio: .heating } }"
+
+/* ADR 0021, acceptance test 4: a reaction that burns wood moves the mass
+ * and the energy in the stated ratio, at each time of a run. */
+void test_reaction_fire(void)
+{
+    QIr *ir = compile(FIRE(FLOWS));
+    if (!ir) return;
+    char *text = qi_text(ir);
+    HAS(text, "  cell fire.burn.fuel.ratio: dim[1]@-9 = 1\n"
+              "  cell fire.burn.tolerance: %ratio = 0.01\n"
+              "  cell fire.burning: dim[kg s^-1]@-12 = any\n"
+              "  cell fire.heating: dim[m^2 s^-2]@-9 = 15000000\n");
+    HAS(text, "  alias fire.burn.heat.ratio = fire.heating\n  alias fire.burn.rate = fire.burning\n");
+    HAS(text, "  kernel K0, at a boundary: native.rate\n"
+              "    in burning = fire.burning\n"
+              "    in burn.tolerance = fire.burn.tolerance\n"
+              "    in burn.fuel.ratio = fire.burn.fuel.ratio\n"
+              "    stock wood = fire.wood\n"
+              "    in heating = fire.heating\n"
+              "    link room.energy = r.energy\n"
+              "    transfer burn.fuel: fire.wood -> nothing, at the rate fire.burning times the ratio fire.burn.fuel.ratio, "
+              "with the tolerance fire.burn.tolerance\n"
+              "    transfer burn.heat: nothing -> r.energy, at the rate fire.burning times the ratio fire.heating, with "
+              "the tolerance fire.burn.tolerance\n");
+    /* the flows have no tolerance of their own, and the reaction has one */
+    CHECK(!strstr(text, "fire.burn.fuel.tolerance") && !strstr(text, "fire.burn.heat.tolerance"));
+    free(text);
+    const QiKernelUse *k = &ir->kernels[0];
+    CHECK(k->ntransfers == 2 && k->transfers[0].ratio != QI_NONE && k->transfers[1].ratio != QI_NONE);
+    CHECK(!strcmp(ir->cells[k->transfers[1].ratio].path, "fire.heating") && k->transfers[0].rate == k->transfers[1].rate &&
+          k->transfers[0].tolerance == k->transfers[1].tolerance && !strcmp(k->transfers[0].stated, "fire.burn.fuel"));
+    QWorld *w = build(ir, 1), *again = build(ir, 1);
+    if (w && again) {
+        const int64_t wood0 = stock(w, "fire.wood"), heat0 = stock(w, "r.energy");
+        CHECK_I64(wood0, 5000000);
+        for (int t = 1; t <= 7201; t += 300) {
+            OK(qw_run(w, t * SEC));
+            OK(qw_run(again, t * SEC));
+            int64_t burned = wood0 - stock(w, "fire.wood"), heat = stock(w, "r.energy") - heat0;
+            /* 15 MJ/kg is 15 J for each mg of wood. The wood has whole mg, so the heat is at most that of one mg more */
+            CHECK(burned > 0 && heat >= 15000 * burned && heat < 15000 * (burned + 1));
+            CHECK(qw_hash(w) == qw_hash(again));
+        }
+        /* after three times the life, 5 % of the wood is there */
+        CHECK(stock(w, "fire.wood") > wood0 / 25 && stock(w, "fire.wood") < wood0 / 18);
+    }
+    qw_free(w);
+    qw_free(again);
+    qi_free(ir);
+
+    /* a reaction with whole ratios: 2 parts of a and 1 part of b make 3 parts of c, and nothing is lost */
+    ir = compile(MASS
+                 "#Mix: #Reaction & { a: #Interaction & { ratio: 2 }, b: #Interaction & { ratio: 1 } }\n"
+                 "#Vat: #Phenomenon & { a: %mass, b: %mass, c: %mass, speed: %mass / %time,\n"
+                 "  mix: #Mix & { rate: .speed, a: { source: .a, sink: .c }, b: { source: .b, sink: .c } } }\n"
+                 "vat: #Vat & { a: 10kg, b: 10kg, c: 0kg, speed: 1g/s }\n");
+    if (ir) {
+        w = build(ir, 1);
+        if (w) {
+            for (int t = 1; t <= 4001; t += 500) {
+                OK(qw_run(w, t * SEC));
+                CHECK_I64(stock(w, "vat.a"), 10000000 - 2000 * (int64_t) t);
+                CHECK_I64(stock(w, "vat.b"), 10000000 - 1000 * (int64_t) t);
+                CHECK_I64(stock(w, "vat.c"), 3000 * (int64_t) t);
+            }
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* a reaction of a model works only while the model is active */
+    ir = compile(MASS BURN
+                 "#Lit: #Model & { wood: %mass, ash: %mass, speed: %mass / %time,\n"
+                 "  burn: #Burn & { rate: .speed, fuel: { source: .wood }, heat: { sink: .ash, ratio: 0.5 } } }\n"
+                 "#Out: #Model & { wood: %mass }\n"
+                 "#Hearth: #Phenomenon & { model: text, lit: #Lit, out: #Out }\n"
+                 "h: #Hearth & { model: \"lit\", lit: { wood: 1kg, ash: 0kg, speed: 2g/s } }\n");
+    if (ir) {
+        text = qi_text(ir);
+        HAS(text, "  kernel K0, at a boundary, in the model lit: native.rate\n");
+        free(text);
+        w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 100 * SEC));
+            CHECK_I64(stock(w, "h.lit.wood"), 1000000 - 200000);
+            CHECK_I64(stock(w, "h.lit.ash"), 100000);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+}
+
+void test_reaction_errors(void)
+{
+    static const struct { const char *src, *message; } cases[] = {
+        { FIRE("#Burn & { rate: .burning, fuel: { source: .wood, rate: .burning }, heat: { sink: .room.energy, ratio: .heating } }"),
+          "error: fire.burn.fuel is a flow of the reaction fire.burn, and it has a rate: the reaction gives the rate. Give "
+          "the flow a ratio, as in `ratio: 1`\n" },
+        { FIRE("#Burn & { rate: .burning, fuel: { source: .wood }, heat: { sink: .room.energy } }"),
+          "error: fire.burn.heat is a flow of the reaction fire.burn, and it has no ratio: give the amount of its stock for "
+          "each unit of the reaction, as in `ratio: 1`\n" },
+        { FIRE("#Burn & { fuel: { source: .wood }, heat: { sink: .room.energy, ratio: .heating } }"),
+          "error: the reaction fire.burn has no rate: give the amount of the reaction for each second, as in `rate: "
+          ".burning`\n" },
+        { FIRE("#Reaction & { rate: .burning }"),
+          "error: the reaction fire.burn has no flows: give it an interaction with a ratio for each stock that it changes, "
+          "as in `fuel: #Interaction & { source: .wood, ratio: 1, conserved: false }`\n" },
+        { FIRE("#Burn & { rate: \"fast\", fuel: { source: .wood }, heat: { sink: .room.energy, ratio: .heating } }"),
+          "error: the rate of fire.burn must be a quantity: the amount for each second\n" },
+        { FIRE("#Burn & { rate: .burning, fuel: { source: .wood }, heat: { sink: .room.energy, ratio: .life } }"),
+          "error: the ratio of fire.burn.heat is in s, the rate of the reaction fire.burn is in kg s^-1, and the stock "
+          "r.energy is in J: the ratio must be the quantity of the stock for each unit of the reaction, in m^2 s^-2\n" },
+        { FIRE("#Burn & { rate: .burning, fuel: { source: .wood }, heat: { sink: .room.energy, ratio: .room.capacity } }"),
+          "error: the ratio of fire.burn.heat must be a number or a quantity that is a field of fire, as in `ratio: 1` or "
+          "`ratio: .heating`\n" },
+        { MASS "#Lose: #Reaction & { fuel: #Interaction & { ratio: 1 } }\n"
+          "#P: #Phenomenon & { m: %mass, p: %mass / %time, burn: #Lose & { rate: .p, fuel: { source: .m } } }\n"
+          "p: #P & { m: 1kg, p: 1g/s }\n",
+          "error: p.burn.fuel has a source and no sink: the quantity then comes from outside the world, or goes there." },
+        { MASS "#P: #Phenomenon & { m: %mass, p: %mass / %time,\n"
+          "  out: #Interaction & { source: .m, rate: .p, ratio: 2, conserved: false } }\np: #P & { m: 1kg, p: 1g/s }\n",
+          "error: p.out has a ratio, and it is not in a reaction: a ratio is for a flow of a #Reaction. An interaction "
+          "alone has a rate, as in `rate: .power`\n" },
+        { MASS BURN "#P: #Phenomenon & { m: %mass, e: %mass, p: %mass / %time, evaluator: \"native.conduction\",\n"
+          "  burn: #Burn & { rate: .p, fuel: { source: .m }, heat: { sink: .e, ratio: 1 } } }\np: #P & { m: 1kg, e: 0kg, p: 1g/s }\n",
+          "error: p.burn has a rate, and p names the evaluator \"native.conduction\": a phenomenon moves its quantities "
+          "with rates or with a kernel, and not with both\n" },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) HAS(compile_error(cases[i].src), cases[i].message);
+}
+
+/* More cases of reactions and models that a mutation round found. */
+void test_reaction_more(void)
+{
+    /* each flow reports its own error */
+    const char *two = compile_error(FIRE("#Burn & { rate: .burning, fuel: { source: .wood, rate: .burning }, heat: { sink: .room.energy } }"));
+    HAS(two, "error: fire.burn.fuel is a flow of the reaction fire.burn, and it has a rate");
+    HAS(two, "error: fire.burn.heat is a flow of the reaction fire.burn, and it has no ratio");
+
+    /* two flows with a number as the ratio, on stocks with different scales: the rate has the finer scale */
+    QIr *ir = compile(MASS "%grain: { dimension: \"kg\", scale: -3, conserved: true }\n"
+                      "#Sift: #Reaction & { fine: #Interaction & { ratio: 1, conserved: false },\n"
+                      "                     coarse: #Interaction & { ratio: 2, conserved: false } }\n"
+                      "#Mill: #Phenomenon & { flour: %mass, bran: %grain, speed: %mass / %time,\n"
+                      "  sift: #Sift & { rate: .speed, fine: { sink: .flour }, coarse: { sink: .bran } } }\n"
+                      "mill: #Mill & { flour: 0kg, bran: 0kg, speed: 1g/s }\n");
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  cell mill.speed: dim[kg s^-1]@-12 = 0.001\n");
+        free(text);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 1000 * SEC));
+            CHECK_I64(stock(w, "mill.flour"), 1000000);                    /* 1 kg, in mg */
+            CHECK_I64(stock(w, "mill.bran"), 2000);                        /* 2 kg, in g */
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* a stock of a model that is not active at the start: a range from zero is a value also */
+    HAS(compile_error(ROOM("#DetailRoom") "r: { fine: { c1: { energy: >= 0J } } }\n"),
+        "error: r.fine.c1.energy has a value, and its model fine is not active at the start");
+    HAS(compile_error(ROOM("#DetailRoom") "r: { fine: { c1: { energy: <= 0J } } }\n"),
+        "error: r.fine.c1.energy has a value, and its model fine is not active at the start");
+    /* and zero is no error */
+    ir = compile(ROOM("#DetailRoom") "r: { fine: { c1: { energy: 0J } } }\n");
+    qi_free(ir);
+}

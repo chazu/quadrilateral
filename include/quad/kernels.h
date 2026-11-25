@@ -67,6 +67,15 @@ void      qk_free(QkKernel *k);
  * change. The kernel keeps that history for each transfer, so it is not
  * stateless: it gives save and restore. The arithmetic is integer only.
  *
+ * A reaction (docs/adr/0021 section 7) is a set of transfers with one rate
+ * slot, one tolerance slot, and a ratio slot for each transfer (IN). The
+ * amount of the reaction in a step is rate × step, and each transfer moves
+ * that amount times its ratio. The ratio has the dimension of its stock for
+ * each unit of the reaction. Each transfer keeps the part of its amount that
+ * is smaller than one quantum, so the transfers keep their ratios over a
+ * run: the sum of a transfer differs from the sum of the reaction times the
+ * ratio by less than one quantum of the stock, while the ratio is constant.
+ *
  * qk_rate_new copies its arguments. NULL if a transfer names a slot that
  * does not fit. Free the kernel with qk_rate_free after every world that
  * uses it is freed, or give it to the world with qw_adopt_kernel. */
@@ -74,6 +83,7 @@ typedef struct {
     const char *name;
     uint32_t    rate, tolerance;   /* slot indices */
     uint32_t    from, to;          /* slot indices, or QK_NONE */
+    uint32_t    ratio;             /* slot index of the ratio of a flow of a reaction, or QK_NONE */
 } QkRateTransfer;
 
 QkKernel *qk_rate_new(const QkSlot *slots, uint32_t nslots, const QkRateTransfer *transfers, uint32_t ntransfers);

@@ -196,3 +196,32 @@ time [s]    hall.temperature [K]  study.coarse.temperature [K]  study.fine.c0.te
 At 300 s the room becomes fine. Each part starts at the temperature of the whole room, and the energy of the room does not change. Then the part at the wall warms faster than the far part, so less power comes through the wall. At 900 s the room becomes coarse again, with the energy of the four parts.
 
 A program in C makes the same switch with `qi_switch(ir, world, "study", "fine")`.
+
+## thermal.quad and fire.quad: a reaction
+
+A fire burns wood and heats a room. One amount decides both changes: the mass of wood that burns. A reaction has the rate one time, and each flow has a ratio. For each kilogram that burns, the stove loses one kilogram of wood, and the room gets the heat of one kilogram.
+
+```
+#Burn: #Reaction & {
+    fuel: #Interaction & { ratio: 1, conserved: false }
+    heat: #Interaction & { conserved: false }
+}
+
+#Stove: #Phenomenon & {
+    ...
+    speed: .burning == .wood / .life
+    burn: #Burn & {
+        rate: .burning
+        fuel: { source: .wood }
+        heat: { sink: .room.energy, ratio: .heating }
+    }
+}
+```
+
+```
+$ build/quad run examples/thermal.quad examples/fire.quad --until 2h --every 20min \
+      --show stove.wood,stove.burning,cabin.temperature
+```
+
+The fire burns fast at the start and slower as the wood goes. The room becomes warm, and then the walls lose more heat than the fire gives. At each time, the heat that the fire gave is the wood that burned times 15 MJ/kg.
+

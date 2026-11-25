@@ -48,6 +48,7 @@ typedef struct {
     uint32_t          tphen, tport, fevaluator;
     uint32_t          tinter, fsource, fsink, frate, ftol, fcons;    /* #Interaction and its fields (ADR 0020) */
     uint32_t          tmodel, tmap, fmodel, ffrom, fto;              /* #Model, #Map and their fields (ADR 0021) */
+    uint32_t          treact, fratio;                                /* #Reaction, and the ratio of a flow (ADR 0021) */
     VEC(ModelRef)     models;       /* the models of each phenomenon, in the order of their names */
     U32Vec            model0;       /* for each phenomenon: its first model in `models`, and one entry more */
     U32Vec            mstart;       /* for each phenomenon: its model at the start, or QI_NONE */
@@ -337,6 +338,7 @@ static void walk(Walk *w, const QfNode *n)
     TypeKind tk = f->types.v[n->type].kind;
     if (n->flags & NF_VALUE) {
         if (tk == TK_KIND || tk == TK_DIMT) leaf(w, n, false);
+        else if (tk == TK_NUMBER && u64map_get(&w->rates, (uint64_t) (uintptr_t) n, NULL)) leaf(w, n, false);   /* a ratio */
         else if (tk == TK_NUMBER) {
             Buf b = { 0 };
             rel_text(e, &b, w->path.v, len);
@@ -556,15 +558,16 @@ typedef VEC(const QfNode *) NodeStack;
 typedef struct { U32Vec path; const QfNode *node; Sym text; } Inter;
 typedef VEC(Inter) InterVec;
 
-/* The structures below #Interaction in a phenomenon, outside its connections. */
-static void find_inters(Elab *e, const char *phen, const QfNode *n, U32Vec *path, NodeStack *stack, size_t conn0, size_t conn1,
-                        InterVec *out)
+/* The structures below the type `type` in a phenomenon, outside its
+ * connections: its interactions, or its reactions. */
+static void find_typed(Elab *e, uint32_t type, const char *phen, const QfNode *n, U32Vec *path, NodeStack *stack, size_t conn0,
+                       size_t conn1, InterVec *out)
 {
     Front *f = e->f;
     for (size_t c = conn0; c < conn1; c++)
         if (e->conns.v[c].path.n == path->n && starts_with(path->v, path->n, &e->conns.v[c].path)) return;
     if (n->flags & NF_VALUE) return;
-    if (path->n && is_subtype(f, n->type, e->tinter)) {
+    if (path->n && is_subtype(f, n->type, type)) {
         Inter in = { { 0 }, n, path_sym(e, phen, path->v, path->n) };
         for (size_t i = 0; i < path->n; i++) VEC_PUSH(in.path, path->v[i]);
         VEC_PUSH(*out, in);
@@ -575,10 +578,37 @@ static void find_inters(Elab *e, const char *phen, const QfNode *n, U32Vec *path
     VEC_PUSH(*stack, n);
     for (uint32_t i = 0; i < n->narcs; i++) {
         VEC_PUSH(*path, n->arcs[i].feat);
-        find_inters(e, phen, n->arcs[i].val, path, stack, conn0, conn1, out);
+        find_typed(e, type, phen, n->arcs[i].val, path, stack, conn0, conn1, out);
         path->n--;
     }
     stack->n--;
+}
+
+static void find_inters(Elab *e, const char *phen, const QfNode *n, U32Vec *path, NodeStack *stack, size_t conn0, size_t conn1,
+                        InterVec *out)
+{
+    find_typed(e, e->tinter, phen, n, path, stack, conn0, conn1, out);
+}
+
+/* A field with no value and no structure: the author did not state it. */
+static bool unstated(const Front *f, const QfNode *n) { return !n || (!(n->flags & NF_VALUE) && n->type == f->top && !n->narcs); }
+
+/* The reaction that an interaction is a flow of (ADR 0021 section 7): the
+ * structure below #Reaction on its path. *len gets the length of the path of
+ * the reaction. NULL if the interaction is not in a reaction. */
+static const QfNode *reaction_of(Elab *e, uint32_t phen, const Inter *in, size_t *len)
+{
+    Front *f = e->f;
+    *len = 0;
+    if (e->treact == QF_BOTTOM) return NULL;
+    for (size_t k = 1; k < in->path.n; k++) {
+        const QfNode *at = node_at(f->insts.v[e->insts.v[phen]].node, in->path.v, k);
+        if (at && !(at->flags & NF_VALUE) && is_subtype(f, at->type, e->treact)) {
+            *len = k;
+            return at;
+        }
+    }
+    return NULL;
 }
 
 /* Makes the cell of a value. first: the first leaf of the value in
@@ -607,9 +637,10 @@ static void add_cell(Walk *w, size_t first, const Leaf *l)
             for (uint32_t a = 0; a < e->enums.v[en].natoms; a++)
                 if (!strcmp(e->enums.v[en].atoms[a], name)) c.mask |= (uint64_t) 1 << a;
         }
-    } else if (f->types.v[l->node->type].kind == TK_DIMT) {
-        /* a dimension and no kind: an anonymous kind with the default scale of the dimension */
-        QDim dim = f->dims.v[f->types.v[l->node->type].dimix].dim;
+    } else if (f->types.v[l->node->type].kind == TK_DIMT || f->types.v[l->node->type].kind == TK_NUMBER) {
+        /* a dimension and no kind: an anonymous kind with the default scale of the dimension. A number that
+         * is the ratio of a flow has no dimension */
+        QDim dim = f->types.v[l->node->type].kind == TK_NUMBER ? qdim_none() : f->dims.v[f->types.v[l->node->type].dimix].dim;
         int8_t scale = qdim_default_scale(&dim, f->tick_scale);
         uint64_t rs;
         if (u64map_get(&w->rates, (uint64_t) (uintptr_t) l->node, &rs)) scale = (int8_t) ((int) rs - 1000);
@@ -681,14 +712,38 @@ static void rate_scales(Walk *w)
     NodeStack stack = { 0 };
     find_inters(e, w->in->name, w->in->node, &path, &stack, w->conn0, e->conns.n, &inters);
     for (size_t i = 0; i < inters.n; i++) {
-        const QfNode *rn = node_arc(inters.v[i].node, e->frate);
+        size_t rlen;
+        const QfNode *rx = reaction_of(e, w->phen, &inters.v[i], &rlen);
+        const QfNode *rn = node_arc(rx ? rx : inters.v[i].node, e->frate);
+        const QfNode *qn = rx && e->fratio != QF_BOTTOM ? node_arc(inters.v[i].node, e->fratio) : NULL;
+        TypeKind qk = qn && (qn->flags & NF_VALUE) ? f->types.v[qn->type].kind : TK_TOP;
+        /* The ratio of a flow of a reaction (ADR 0021 section 7). A number
+         * has 9 decimals. A quantity with no kind has 6 decimals more than
+         * the default of its dimension, as an inner quotient has. */
+        bool plain = qk == TK_NUMBER || (qk == TK_DIMT && qdim_is_none(&f->dims.v[f->types.v[qn->type].dimix].dim));
+        if (plain) u64map_put(&w->rates, (uint64_t) (uintptr_t) qn, (uint64_t) (-9 + 1000));
+        else if (qk == TK_DIMT) {
+            int scale = qdim_default_scale(&f->dims.v[f->types.v[qn->type].dimix].dim, f->tick_scale) - 6;
+            u64map_put(&w->rates, (uint64_t) (uintptr_t) qn, (uint64_t) ((scale < -18 ? -18 : scale) + 1000));
+        }
+        /* The rate of a reaction with no kind: 6 decimals more than the
+         * default of its dimension. If a flow has a number as its ratio, the
+         * rate has the dimension of that stock for each second, and it gets
+         * the scale of that stock with 6 more decimals, as for an interaction. */
+        bool free_rate = rn && (rn->flags & NF_VALUE) && f->types.v[rn->type].kind == TK_DIMT;
+        uint64_t have;
+        if (rx && free_rate && !u64map_get(&w->rates, (uint64_t) (uintptr_t) rn, &have)) {
+            int scale = qdim_default_scale(&f->dims.v[f->types.v[rn->type].dimix].dim, f->tick_scale) - 6;
+            u64map_put(&w->rates, (uint64_t) (uintptr_t) rn, (uint64_t) ((scale < -18 ? -18 : scale) + 1000));
+        }
         const uint32_t ends[2] = { e->fsource, e->fsink };
-        for (int k = 0; k < 2 && rn; k++) {
+        for (int k = 0; k < 2 && free_rate && (!rx || plain); k++) {
             const QfNode *sn = node_arc(inters.v[i].node, ends[k]);
             if (!sn || !(sn->flags & NF_VALUE) || f->types.v[sn->type].kind != TK_KIND) continue;
-            if (!(rn->flags & NF_VALUE) || f->types.v[rn->type].kind != TK_DIMT) continue;
             int scale = f->kinds.v[f->types.v[sn->type].kindix].scale - 6;
             if (scale < -18) scale = -18;
+            if (rx && u64map_get(&w->rates, (uint64_t) (uintptr_t) rn, &have) && (int) have - 1000 < scale)
+                scale = (int) have - 1000;                    /* the finest scale that a flow asks for */
             u64map_put(&w->rates, (uint64_t) (uintptr_t) rn, (uint64_t) (scale + 1000));
             break;
         }
@@ -1425,7 +1480,7 @@ static void kernel_use(Elab *e, uint32_t phen, uint32_t model)
         const QkTransfer *kt = &k->transfers[t];
         ku.transfers[t] = (QiTransfer) { keep(e, kt->name), kt->from == QK_NONE ? QI_NONE : ku.binds[kt->from].cell,
                                          kt->to == QK_NONE ? QI_NONE : ku.binds[kt->to].cell, kt->conserved, QI_NONE,
-                                         QI_NONE, NULL };
+                                         QI_NONE, NULL, QI_NONE };
     }
     if (ok) VEC_PUSH(e->kernels, ku);
     qf_buf_free(&who);
@@ -1579,7 +1634,7 @@ static void owner_interactions(Elab *e, uint32_t phen, uint32_t owner, const Int
     if (e->fevaluator != QF_BOTTOM) text_value(e, node_arc(mr ? mr->node : ii->node, e->fevaluator), &evname);
     const char *evaluator = evname.s;
 
-    QiKernelUse ku = { phen, owner, "native.rate", 0, qf_alloc(e->mem, (inters->n ? inters->n : 1) * 4 * sizeof(QiBind)), 0,
+    QiKernelUse ku = { phen, owner, "native.rate", 0, qf_alloc(e->mem, (inters->n ? inters->n : 1) * 5 * sizeof(QiBind)), 0,
                        qf_alloc(e->mem, (inters->n ? inters->n : 1) * sizeof(QiTransfer)), 0 };
     bool ok = true;
     for (size_t i = 0; i < inters->n; i++) {
@@ -1588,10 +1643,42 @@ static void owner_interactions(Elab *e, uint32_t phen, uint32_t owner, const Int
         const char *name = in->text + strlen(ii->name) + 1;
         size_t errors = f->nerrors;                  /* each interaction reports its own errors */
         const QfNode *rn = node_arc(in->node, e->frate), *cn = node_arc(in->node, e->fcons);
+        const QfNode *qn = e->fratio == QF_BOTTOM ? NULL : node_arc(in->node, e->fratio);
+        /* A flow of a reaction has a ratio and no rate: the rate and the
+         * tolerance are those of the reaction (ADR 0021 section 7). */
+        size_t rlen;
+        const QfNode *rx = reaction_of(e, phen, in, &rlen);
+        U32Vec holder = in->path;                    /* the structure that has the rate: the interaction, or its reaction */
+        if (rx) holder.n = rlen;
+        Sym rtext = rx ? path_sym(e, ii->name, holder.v, holder.n) : in->text;
+        const char *rname = rtext + strlen(ii->name) + 1;
+        if (rx && !unstated(f, rn)) {
+            err(e, loc, "%s is a flow of the reaction %s, and it has a rate: the reaction gives the rate. Give the flow a "
+                "ratio, as in `ratio: 1`", in->text, rtext);
+            ok = false;
+            continue;
+        }
+        if (rx && unstated(f, qn)) {
+            err(e, loc, "%s is a flow of the reaction %s, and it has no ratio: give the amount of its stock for each unit of "
+                "the reaction, as in `ratio: 1`", in->text, rtext);
+            ok = false;
+            continue;
+        }
+        if (!rx && !unstated(f, qn)) {
+            err(e, loc, "%s has a ratio, and it is not in a reaction: a ratio is for a flow of a #Reaction. An interaction "
+                "alone has a rate, as in `rate: .power`", in->text);
+            ok = false;
+            continue;
+        }
+        if (rx) rn = node_arc(rx, e->frate);
         TypeKind rk = rn ? f->types.v[rn->type].kind : TK_TOP;
-        if (!rn || (!(rn->flags & NF_VALUE) && rn->type == f->top && !rn->narcs)) {
+        if (unstated(f, rn)) {
             /* no rate: the interaction states a transfer of the kernel in C */
-            if (!evaluator) {
+            if (rx) {
+                err(e, loc, "the reaction %s has no rate: give the amount of the reaction for each second, as in `rate: "
+                    ".burning`", rtext);
+                ok = false;
+            } else if (!evaluator) {
                 err(e, loc, "%s has no rate, and %s names no evaluator: nothing moves the quantity. Give the interaction "
                     "a rate, as in `rate: .power`", in->text, who.s);
                 ok = false;
@@ -1600,38 +1687,52 @@ static void owner_interactions(Elab *e, uint32_t phen, uint32_t owner, const Int
         }
         if (evaluator) {
             err(e, loc, "%s has a rate, and %s names the evaluator \"%s\": a phenomenon moves its quantities with rates or "
-                "with a kernel, and not with both", in->text, who.s, evaluator);
+                "with a kernel, and not with both", rtext, who.s, evaluator);
             ok = false;
             continue;
         }
         if (!mr && nmodels(e, phen)) {
             err(e, loc, "%s has a rate, and %s has models: a phenomenon with models has no kernel of its own. Put the "
-                "interaction in a model", in->text, ii->name);
+                "%s in a model", rtext, ii->name, rx ? "reaction" : "interaction");
             ok = false;
             continue;
         }
         if (!(rn->flags & NF_VALUE) || (rk != TK_KIND && rk != TK_DIMT)) {
-            err(e, loc, "the rate of %s must be a quantity: the amount for each second", in->text);
+            err(e, loc, "the rate of %s must be a quantity: the amount for each second", rtext);
             ok = false;
             continue;
         }
-        Buf rate_path = { 0 }, tol_path = { 0 };
-        qf_buf_printf(&rate_path, "%s.rate", name);
-        qf_buf_printf(&tol_path, "%s.tolerance", name);
+        Buf rate_path = { 0 }, tol_path = { 0 }, ratio_path = { 0 };
+        qf_buf_printf(&rate_path, "%s.rate", rname);
+        qf_buf_printf(&tol_path, "%s.tolerance", rname);
+        qf_buf_printf(&ratio_path, "%s.ratio", name);
         uint32_t rate = find_cell(e, phen, rate_path.s, NULL), tol = find_cell(e, phen, tol_path.s, NULL);
+        uint32_t ratio = rx ? find_cell(e, phen, ratio_path.s, NULL) : QI_NONE;
         qf_buf_free(&rate_path);
         qf_buf_free(&tol_path);
+        qf_buf_free(&ratio_path);
         End from, to;
         bool ends = inter_end(e, phen, in, e->fsource, "source", loc, &from);
         if (!inter_end(e, phen, in, e->fsink, "sink", loc, &to)) ends = false;
         /* a rate that is a field of another phenomenon stands also behind a port: the walk gave it no cell there */
         Buf other = { 0 };
         const char *open;
-        uint32_t behind = node_cell(e, phen, rn, &in->path, &other, &open);
+        uint32_t behind = node_cell(e, phen, rn, &holder, &other, &open);
         qf_buf_free(&other);
         if (rate == QI_NONE || tol == QI_NONE || (behind != QI_NONE && e->cells.v[behind].phen != phen)) {
             err(e, loc, "the rate and the tolerance of %s must be fields of %s: give %s a field with a law for the rate",
-                in->text, ii->name, ii->name);
+                rtext, ii->name, ii->name);
+            ok = false;
+            continue;
+        }
+        /* a ratio that is a field of another phenomenon stands behind a port, as a rate can */
+        Buf rother = { 0 };
+        uint32_t rbehind = rx ? node_cell(e, phen, qn, &in->path, &rother, &open) : QI_NONE;
+        qf_buf_free(&rother);
+        if (rbehind != QI_NONE && e->cells.v[rbehind].phen != phen) ratio = QI_NONE;
+        if (rx && (ratio == QI_NONE || e->cells.v[ratio].domain == QI_SET || e->cells.v[ratio].phen != phen)) {
+            err(e, loc, "the ratio of %s must be a number or a quantity that is a field of %s, as in `ratio: 1` or `ratio: "
+                ".heating`", in->text, ii->name);
             ok = false;
             continue;
         }
@@ -1671,7 +1772,31 @@ static void owner_interactions(Elab *e, uint32_t phen, uint32_t owner, const Int
         /* the rate is the quantity of the stock for each second */
         uint32_t stock = from.cell != QI_NONE ? from.cell : to.cell;
         QDim second = qdim_base(Q_BASE_TIME), want;
-        if (qdim_div(&e->ctypes.v[stock].dim, &second, &want) != Q_OK || !qdim_eq(&want, &e->ctypes.v[rate].dim)) {
+        if (rx) {
+            /* a flow: the ratio times the rate of the reaction is the quantity of the stock for each second */
+            QDim flow, per;
+            bool fits = qdim_div(&e->ctypes.v[stock].dim, &second, &want) == Q_OK &&
+                        qdim_mul(&e->ctypes.v[ratio].dim, &e->ctypes.v[rate].dim, &flow) == Q_OK && qdim_eq(&want, &flow);
+            if (!fits) {
+                Buf has = { 0 }, needs = { 0 }, su = { 0 }, ru = { 0 };
+                dim_unit(e, &has, &e->ctypes.v[ratio].dim);
+                dim_unit(e, &su, &e->ctypes.v[stock].dim);
+                dim_unit(e, &ru, &e->ctypes.v[rate].dim);
+                if (qdim_div(&e->ctypes.v[stock].dim, &second, &want) == Q_OK &&
+                    qdim_div(&want, &e->ctypes.v[rate].dim, &per) == Q_OK)
+                    dim_unit(e, &needs, &per);
+                err(e, loc, "the ratio of %s is in %s, the rate of the reaction %s is in %s, and the stock %s is in %s: the "
+                    "ratio must be the quantity of the stock for each unit of the reaction, in %s", in->text,
+                    has.len ? has.s : "1", rtext, ru.len ? ru.s : "1", e->cells.v[stock].path, su.len ? su.s : "1",
+                    needs.len ? needs.s : "1");
+                qf_buf_free(&has);
+                qf_buf_free(&needs);
+                qf_buf_free(&su);
+                qf_buf_free(&ru);
+                ok = false;
+                continue;
+            }
+        } else if (qdim_div(&e->ctypes.v[stock].dim, &second, &want) != Q_OK || !qdim_eq(&want, &e->ctypes.v[rate].dim)) {
             Buf has = { 0 }, needs = { 0 }, su = { 0 };
             dim_unit(e, &has, &e->ctypes.v[rate].dim);
             dim_unit(e, &su, &e->ctypes.v[stock].dim);
@@ -1685,18 +1810,22 @@ static void owner_interactions(Elab *e, uint32_t phen, uint32_t owner, const Int
             ok = false;
             continue;
         }
-        size_t cap = inters->n * 4;
+        size_t cap = inters->n * 5;
         End rate_end = { rate, keep(e, e->cells.v[rate].path + strlen(ii->name) + 1), QI_NONE, NULL };
         End tol_end = { tol, keep(e, e->cells.v[tol].path + strlen(ii->name) + 1), QI_NONE, NULL };
         inter_bind(&ku, cap, QK_IN, rate_end);
         inter_bind(&ku, cap, QK_IN, tol_end);
+        if (rx) {
+            End ratio_end = { ratio, keep(e, e->cells.v[ratio].path + strlen(ii->name) + 1), QI_NONE, NULL };
+            inter_bind(&ku, cap, QK_IN, ratio_end);
+        }
         if (from.cell != QI_NONE)
             inter_bind(&ku, cap, e->cells.v[from.cell].phen == phen && from.mphen == QI_NONE ? QK_STOCK : QK_LINK, from);
         if (to.cell != QI_NONE)
             inter_bind(&ku, cap, e->cells.v[to.cell].phen == phen && to.mphen == QI_NONE ? QK_STOCK : QK_LINK, to);
         ku.transfers[ku.ntransfers++] =
             (QiTransfer) { keep(e, name), from.cell, to.cell, from.cell != QI_NONE && to.cell != QI_NONE, rate, tol,
-                           keep(e, in->text) };
+                           keep(e, in->text), ratio };
     }
     if (ok && ku.ntransfers) VEC_PUSH(e->kernels, ku);
     qf_buf_free(&evname);
@@ -1718,6 +1847,24 @@ static void phen_interactions(Elab *e, uint32_t phen, size_t conn0, size_t conn1
     /* the interactions of the phenomenon itself, and then those of each model */
     owner_interactions(e, phen, QI_NONE, &inters);
     for (uint32_t m = 0; m < nmodels(e, phen); m++) owner_interactions(e, phen, m, &inters);
+    /* a reaction is a set of flows (ADR 0021 section 7) */
+    InterVec reactions = { 0 };
+    if (e->treact != QF_BOTTOM) {
+        U32Vec rpath = { 0 };
+        NodeStack rstack = { 0 };
+        find_typed(e, e->treact, ii->name, ii->node, &rpath, &rstack, conn0, conn1, &reactions);
+        VEC_FREE(rpath);
+        VEC_FREE(rstack);
+    }
+    for (size_t r = 0; r < reactions.n; r++) {
+        bool flows = false;
+        for (size_t i = 0; i < inters.n; i++) flows |= starts_with(inters.v[i].path.v, inters.v[i].path.n, &reactions.v[r].path);
+        if (!flows)
+            err(e, inst_loc(ii), "the reaction %s has no flows: give it an interaction with a ratio for each stock that it "
+                "changes, as in `fuel: #Interaction & { source: .wood, ratio: 1, conserved: false }`", reactions.v[r].text);
+        VEC_FREE(reactions.v[r].path);
+    }
+    VEC_FREE(reactions);
     for (size_t i = 0; i < inters.n; i++) VEC_FREE(inters.v[i].path);
     VEC_FREE(inters);
 }
@@ -2085,6 +2232,7 @@ static QIr *finish(Elab *e)
             REMAP(e->kernels.v[i].transfers[t].to);
             REMAP(e->kernels.v[i].transfers[t].rate);
             REMAP(e->kernels.v[i].transfers[t].tolerance);
+            REMAP(e->kernels.v[i].transfers[t].ratio);
         }
     }
 #undef REMAP
@@ -2211,6 +2359,8 @@ QIr *qf_elaborate(Front *f, const QiOptions *opt)
     e.fmodel = feat_lookup(f, qf_sym(f, "quad.model"));
     e.ffrom = feat_lookup(f, qf_sym(f, "quad.from"));
     e.fto = feat_lookup(f, qf_sym(f, "quad.to"));
+    e.treact = prelude_type(f, "#Reaction");
+    e.fratio = feat_lookup(f, qf_sym(f, "quad.ratio"));
     e.assume = e.via = QI_NONE;
 
     /* the phenomena, in the order of their names */
