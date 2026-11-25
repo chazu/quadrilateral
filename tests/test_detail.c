@@ -570,7 +570,9 @@ void test_detail_switch(void)
     CWorld c = c_mixed(1, 0);
     CHECK(qw_switch_to(c.w, c.b, "fine") == QW_ENAME);                     /* no transition yet */
     CHECK(qw_transition(c.w, c.b, "refine", "coarse", "medium", c.refine) == QW_ENAME);
-    CHECK(qw_transition(c.w, c.b, "refine", "medium", "fine", c.refine) == QW_ENAME);
+    HAS(qw_error(c.w), "roomB: no model 'medium'");
+    CHECK(qw_transition(c.w, c.b, "refine", "nothing", "fine", c.refine) == QW_ENAME);
+    HAS(qw_error(c.w), "roomB: no model 'nothing'");
     CHECK(qw_transition(c.w, c.b, "refine", "fine", "fine", c.refine) == QW_EDUP);
     CHECK(qw_transition(c.w, c.b, "re fine", "coarse", "fine", c.refine) == QW_ENAME);
     CHECK(qw_transition(c.w, c.b, "refine", "coarse", "fine", qk_conduction()) == QW_EKERNEL);
@@ -817,4 +819,100 @@ void test_detail_snapshot(void)
     qw_free(a);
     qw_free(b);
     qi_free(ir);
+}
+
+/* Two rooms with models, and a wall between them: each port of the wall
+ * follows the model of its own room. */
+void test_detail_two_rooms(void)
+{
+    QIr *ir = compile("east: #DetailRoom & { coarse: { temperature: 303.15K, capacity: 10000J/K },\n"
+                      "  fine: { c0: { capacity: 2500J/K }, c1: { capacity: 2500J/K }, c2: { capacity: 2500J/K },\n"
+                      "          c3: { capacity: 2500J/K }, conductance: 100W/K }, spread: 0K }\n"
+                      ROOM("#DetailRoom")
+                      "wall: #ConductiveWall & { hot: east.west, cold: r.west, conductance: 10W/K, tolerance: 1pct }\n");
+    if (!ir) return;
+    char *text = qi_text(ir);
+    HAS(text, "    in hot.temperature = east.coarse.temperature, by the model of east: coarse -> east.coarse.temperature, "
+              "fine -> east.fine.c0.temperature\n"
+              "    in cold.temperature = r.coarse.temperature, by the model of r: coarse -> r.coarse.temperature, "
+              "fine -> r.fine.c0.temperature\n");
+    free(text);
+    CHECK(ir->phens[0].nmodels == 2 && ir->phens[1].nmodels == 2 && ir->phens[2].nmodels == 0);
+    CHECK_I64(ir->nmaps, 4);
+    CHECK(ir->maps[0].phen == 0 && ir->maps[2].phen == 1 && !strcmp(ir->maps[2].name, "abstract"));
+    QWorld *w = build(ir, 2);
+    if (w) {
+        const int64_t total = stock(w, "east.coarse.energy") + stock(w, "r.coarse.energy");
+        OK(qw_run(w, 50 * SEC));
+        OK(qi_switch(ir, w, "east", "fine"));
+        OK(qw_run(w, 100 * SEC));
+        CHECK_I64(fine_of(w, "east") + stock(w, "r.coarse.energy"), total);
+        int64_t before = stock(w, "r.coarse.energy");
+        OK(qi_switch(ir, w, "r", "fine"));
+        OK(qw_run(w, 150 * SEC));
+        CHECK_I64(fine_of(w, "east") + fine_of(w, "r"), total);
+        CHECK(fine_of(w, "r") > before);                                   /* the heat still goes from east to r */
+        /* the heat leaves the first cell of east, and it comes to the first cell of r */
+        CHECK(stock(w, "east.fine.c0.energy") < stock(w, "east.fine.c3.energy"));
+        CHECK(stock(w, "r.fine.c0.energy") > stock(w, "r.fine.c3.energy"));
+        OK(qi_switch(ir, w, "east", "coarse"));
+        OK(qw_run(w, 200 * SEC));
+        CHECK_I64(stock(w, "east.coarse.energy") + fine_of(w, "r"), total);
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* a port of the phenomenon that the walk finds before the ports of the models */
+    ir = compile("#M2: #Model & #Lump & { alpha: #ThermalPort & { temperature: .temperature, capacity: .capacity, energy: .energy } }\n"
+                 "#P: #Phenomenon & { alpha: #ThermalPort, model: \"m\", m: #M2, n: #M2 }\n"
+                 "p: #P & { m: { temperature: 300K, capacity: 1J/K }, n: { capacity: 1J/K } }\n");
+    if (ir) {
+        text = qi_text(ir);
+        HAS(text, "  port alpha: #ThermalPort, the port of the active model: m -> p.m.alpha, n -> p.n.alpha\n");
+        free(text);
+    }
+    qi_free(ir);
+}
+
+/* The host can give the kernels of the room. They then have precedence over
+ * the kernels that the front end generates. */
+void test_detail_host_kernels(void)
+{
+    QkKernel *made[3] = { qk_diffusion_new(4), qk_refine_new(4), qk_abstract_new(4) };
+    const QkKernel *given[3] = { made[0], made[1], made[2] };
+    QiOptions opt = { given, 3 };
+    char *diag = NULL;
+    QIr *host = compile_with(MIXED("0.05K", "temperature: 293.15K,"), &opt, &diag), *own = compile(MIXED("0.05K", "temperature: 293.15K,"));
+    CHECK(host != NULL);
+    free(diag);
+    if (host && own) {
+        CHECK(host->kernels[0].size == 0 && host->maps[0].size == 0 && host->maps[1].size == 0);
+        CHECK(own->kernels[0].size == 4 && own->maps[0].size == 4 && own->maps[1].size == 4);
+        QWorld *a = NULL, *b = build(own, 9);
+        char *error = NULL;
+        OK(qi_instantiate(host, 9, &opt, &a, &error));
+        free(error);
+        /* without the kernels of the host, the world has no kernel with that name for the model */
+        QWorld *none = NULL;
+        CHECK(qi_instantiate(host, 9, NULL, &none, &error) == QW_ENAME && none == NULL);
+        HAS(error ? error : "", "unknown evaluator \"native.diffusion\"");
+        free(error);
+        if (a && b) {
+            OK(qw_run(a, 100 * SEC));
+            OK(qw_run(b, 100 * SEC));
+            OK(qi_switch(host, a, "roomB", "fine"));
+            OK(qi_switch(own, b, "roomB", "fine"));
+            OK(qw_run(a, 300 * SEC));
+            OK(qw_run(b, 300 * SEC));
+            CHECK(qw_hash(a) == qw_hash(b));
+            OK(qi_switch(host, a, "roomB", "coarse"));
+            OK(qi_switch(own, b, "roomB", "coarse"));
+            CHECK(qw_hash(a) == qw_hash(b));
+        }
+        qw_free(a);
+        qw_free(b);
+    }
+    qi_free(host);
+    qi_free(own);
+    for (int i = 0; i < 3; i++) qk_free(made[i]);
 }
