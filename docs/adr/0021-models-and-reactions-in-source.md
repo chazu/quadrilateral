@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Source states the models of a phenomenon, the maps between them, and reactions
@@ -42,11 +42,13 @@ roomB: #DetailRoom & {
     coarse: { temperature: 293.15K, capacity: 10000J/K }
     fine:   { c0: { capacity: 2500J/K }, c1: { capacity: 2500J/K }, c2: { capacity: 2500J/K }, c3: { capacity: 2500J/K },
               conductance: 100W/K }
-    spread: 0.5K
+    spread: 0K
 }
 
 wall: #Wall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K }
 ```
+
+When the room becomes coarse, it keeps its total thermal energy and discards the temperature gradient. When it becomes fine again, all four cells start at the coarse temperature, to the precision of their energy stocks. Each cell receives energy in proportion to its heat capacity. The map accounts for the rounding remainder so the total stays exact. The zero spread in this example selects uniform refinement.
 
 The wall connects to `roomB.west`. It does not know which model is behind the port (design section 7.5).
 
@@ -87,15 +89,25 @@ Two smaller parts of stage 4 are also open. An interaction of a phenomenon with 
 - The prelude has `#Map: { from: text, to: text, evaluator: text }`.
 - `from` and `to` are names of models of the phenomenon. `evaluator` names a map kernel (ADR 0009 section 5).
 - Two maps with the same `from` and `to` are an error.
-- The start of a switch stays explicit (ADR 0010 section 4). A new function, `qi_switch(ir, world, "roomB", "fine")`, finds the map from the active model to the named model and calls `qw_switch`. With no such map, it gives an error.
+- The application can explicitly request a switch (ADR 0010 section 4). A new function, `qi_switch(ir, world, "roomB", "fine")`, finds the map from the active model to the named model and calls `qw_switch`. With no such map, it gives an error.
+
+#### Transition conditions and application overrides
+
+Source can name a transition between two models and give it a default condition. A condition can read simulation values and named inputs supplied by the application, such as whether a room is visible. The host can also request a switch directly. Both routes use the map for the same pair of models.
+
+The public C API lets the application inspect, replace, and clear a named transition’s condition in a running world. A change takes effect at a simulation boundary and is recorded for replay. Source and C use the same condition evaluator.
+
+For each transition, the world first checks for an instance override, then an exact-type override, then the source default. Each instance evaluates the effective condition using its own values and inputs. An override for `#DetailRoom` applies only to instances of that exact type. Clearing an instance override exposes the current type default. Clearing the type override exposes the source default.
 
 ### 6. An interaction with no rate states a transfer of the native kernel
 
 - A phenomenon or a model with an `evaluator` can have interactions with no rate. Each states one transfer that the kernel makes.
 - The compiler checks each against the contract of the kernel. The kernel must have a transfer from the cell of `source` to the cell of `sink`, with the same `conserved` flag. If not, the compile gives an error.
-- The statement is optional. A kernel can have transfers that no interaction states.
+- The statement is optional. Inspection tools must show the complete list of transfers from the kernel contract, including transfers omitted from source.
 
-### 7. A reaction is a rate and a set of interactions with ratios
+### 7. Use a reaction when one amount determines several changes
+
+When a fire burns wood, the mass of wood burned determines both how much fuel disappears and how much heat the fire releases. A `#Reaction` lets the author give the burn rate once. At each step, the simulation computes how much wood burned and uses that amount for both changes. For example, if 0.1 kg burns and each kilogram releases 15 MJ, the fuel stock loses 0.1 kg and the room gains 1.5 MJ.
 
 ```cue
 burn: #Reaction & {
@@ -104,6 +116,8 @@ burn: #Reaction & {
     heat: #Interaction & { sink: .room.energy, ratio: .heating, conserved: false }   // J for each kg
 }
 ```
+
+This example sends the heat straight to the room. If the model includes a stove that stores heat, give heat transfer from the stove to the room its own interaction. A hot stove can keep warming the room after the fire goes out.
 
 - The prelude has `#Reaction: { rate: _, tolerance: *1pct | %ratio }`, and `#Interaction` gets the field `ratio`.
 - Each interaction below the reaction is one flow. It has a `ratio` and no rate. Its rate is the ratio times the rate of the reaction.
@@ -115,20 +129,23 @@ burn: #Reaction & {
 
 - A phenomenon lists its models and names the active one. Each cell, propagator and kernel names its model, or none.
 - A port lists its target for each model.
+- The world retains each phenomenon’s exact source type and the default condition of each named transition so the application can inspect and override it.
 - A phenomenon lists its maps: the two models and the kernel.
 - A transfer of `native.rate` can name the cell of a ratio.
 - `qi_instantiate` builds the models with the calls of ADR 0010: `qw_model`, `qw_model_begin`, `qw_port` and `qw_model_attach`.
 
 ## Acceptance tests
 
-1. The world of phase 5 from source has the same state hash as the world from C, at each time and after each switch of `tests/test_models.c`.
-2. A switch from source conserves the total energy exactly, and the same seed gives the same detail.
+1. The world of phase 5 from source has the same state hash as the world from C, at each comparison time and switch when both use the same model names, map settings, and switch schedule (`tests/test_models.c`).
+2. Start the fine room with a temperature gradient, coarsen it, and then refine it with zero spread. Check that the total energy is unchanged and that refinement gives a uniform temperature up to quantization.
 3. An interaction that states a transfer that the kernel does not make gives a compile error.
 4. A reaction that burns wood moves the energy and the mass in the stated ratio, at each time of a run.
+5. Change a source condition through the C API. Check instance and exact-type precedence, clearing both overrides, subtype isolation, and replay at the same boundary. Two rooms with different application inputs can make different switch decisions under the same rule.
+6. Inspect a native kernel with an undeclared transfer. The list includes that transfer and its endpoints and conservation flag.
 
 ## Considered options
 
-- **The fields of ADR 0011 section 5 for a model: its conditions, the information that it keeps, and its cost.** Not now. Nothing reads them until automatic selection (`quad-ft5.3`), so they would have no test and no meaning. They come with that work. This changes ADR 0011 section 5, which wanted the fields from the start.
+- **Cost-based model selection (ADR 0011 section 5).** Authors and applications can supply transition conditions now. Choosing the cheapest applicable model from cost, uncertainty, and budget remains separate work (`quad-ft5.3`).
 - **The first model in source is active at the start.** Rejected. Source has no order.
 - **A model as a separate declaration, outside its phenomenon.** Rejected. The paths of ADR 0010 put the cells of a model below its phenomenon, and a field gives that path with no new rule.
 - **The port of the phenomenon follows from the ports of the models, with no declaration.** Rejected. A reference to `roomB.west` needs a field with that name in the type of `roomB`.
@@ -137,8 +154,8 @@ burn: #Reaction & {
 
 ## Consequences
 
-- The room of phase 5 needs one field for each cell: `c0`, `c1`, `c2`, `c3`. The fix is a comprehension. Time: `quad-ijx.9`.
+- The room of phase 5 needs one field for each cell: `c0`, `c1`, `c2`, `c3`. Authors can also use the comprehensions delivered by `quad-ijx.9`.
 - A switch needs a map kernel in C. The fix is a map in source: a set of transfers that happen at once, at a boundary. Time: a new issue, after this work.
-- Nothing starts a switch but the host. The fix is automatic selection. Time: `quad-ft5.3`.
+- Implementing transition conditions adds a public C API and boundary evaluation to the existing explicit switch mechanism.
 - ADR 0020 named this stage for a rate law with a condition, such as "a constant flow until the tank is empty". That was wrong. The fix is a phenomenon that exists only while a condition holds (ADR 0013). Time: `quad-ijx.7`.
 - The acceptance test of `quad-ijx.4` (phase 5 in source) is test 1 here.
