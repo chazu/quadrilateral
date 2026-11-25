@@ -2086,3 +2086,61 @@ void test_truth_enums(void)
     qw_free(w);
     qi_free(ir);
 }
+
+/* --- a rate near a balance, with other kernels (ADR 0020 section 5) ---------------------------------------- */
+
+/* A feeder puts coal on a grate, and a fire burns the bed faster in a warmer
+ * furnace. Two walls take the heat away, with boundaries of their own. */
+#define GRATE                                                                                           \
+    MASS BURN                                                                                           \
+    "#CoalPort: #Port & { coal: %mass }\n"                                                              \
+    "#Feeder: #Phenomenon & { grate: #CoalPort, coal: %mass, feed: %mass / %time,\n"                    \
+    "  move: #Interaction & { source: .coal, sink: .grate.coal, rate: .feed } }\n"                      \
+    "#Grate: #Phenomenon & { furnace: #ThermalPort, bed: %mass, grate: #CoalPort & { coal: .bed },\n"   \
+    "  life: %time, cold: %temperature, kindle: %temperature, pilot: %ratio, warm: %ratio,\n"           \
+    "  alight: %ratio, firing: %mass / %time, heating: %energy / %mass,\n"                              \
+    "  warmth: .warm == (.furnace.temperature - .cold) / .kindle,\n"                                    \
+    "  ignition: .alight == (.pilot + .warm) / (1 + .warm),\n"                                          \
+    "  speed: .firing == .alight * .bed / .life,\n"                                                     \
+    "  burn: #Burn & { rate: .firing, fuel: { source: .bed },\n"                                        \
+    "                  heat: { sink: .furnace.energy, ratio: .heating } } }\n"                          \
+    "furnace: #LumpedRoom & { temperature: 290K, capacity: 20MJ/K }\n"                                  \
+    "boiler:  #LumpedRoom & { temperature: 290K, capacity: 60MJ/K }\n"                                  \
+    "air:     #LumpedRoom & { temperature: 290K, capacity: 1TJ/K }\n"                                   \
+    "feeder:  #Feeder & { grate: fire.grate, coal: 12000kg, feed: 0.5kg/s }\n"                          \
+    "fire:    #Grate & { furnace: furnace.west, bed: 0kg, life: 60s, cold: 290K, kindle: 200K,\n"       \
+    "                    pilot: 5pct, heating: 24MJ/kg }\n"                                             \
+    "tubes:   #ConductiveWall & { hot: furnace.west, cold: boiler.west, conductance: 27kW/K, tolerance: 0.01 }\n" \
+    "stack:   #ConductiveWall & { hot: furnace.west, cold: air.west, conductance: 1300W/K, tolerance: 0.01 }\n"
+
+/* One quantum of the bed (1 mg) is thousands of quanta of the burn rate, so
+ * the rate has small steps up and down while the bed comes to its balance.
+ * A boundary of a wall can come a moment after a boundary of the fire. In
+ * that short span the small steps were larger than the change of the rate.
+ * The kernel counted them as turns, made the cap half of the short span each
+ * time, and its step went down to one tick. The steps must stay long: before
+ * an input, and after it. */
+void test_rate_balance_with_other_kernels(void)
+{
+    QIr *ir = compile(GRATE);
+    if (!ir) return;
+    QWorld *w = build(ir, 1);
+    if (w) {
+        /* a stop each second, so that a step of one tick ends the test and does not hold it */
+        const uint64_t limit = 100000;
+        for (int t = 1; t <= 1500 && qw_boundaries(w) < limit; t++) OK(qw_run(w, t * SEC));
+        CHECK(qw_boundaries(w) < 10000);
+        /* the fire burns what the feeder gives: 0.5 kg/s, within 5 % */
+        int64_t firing = qw_get(w, "fire.firing").lo;
+        CHECK(firing > 475000000000 && firing < 525000000000);
+        /* half the feed. The bed burns down to the new balance, and the steps become long again */
+        uint64_t before = qw_boundaries(w);
+        OK(qw_input(w, "feeder.feed", qi_point(250000000000)));
+        for (int t = 1501; t <= 3000 && qw_boundaries(w) - before < limit; t++) OK(qw_run(w, t * SEC));
+        CHECK(qw_boundaries(w) - before < 10000);
+        firing = qw_get(w, "fire.firing").lo;
+        CHECK(firing > 237500000000 && firing < 262500000000);
+    }
+    qw_free(w);
+    qi_free(ir);
+}

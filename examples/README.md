@@ -259,3 +259,37 @@ $ build/quad run examples/thermal.quad examples/fire.quad --until 2h --every 20m
 
 The fire burns fast at the start and slower as the wood goes. The room becomes warm, and then the walls lose more heat than the fire gives. At each time, the heat that the fire gave is the wood that burned times 15 MJ/kg.
 
+
+## thermal.quad and plant.quad: a toy power plant, with a page that shows it
+
+A coal power plant in one file. A feeder puts coal on the grate, the fire burns it in the furnace, tubes heat the boiler, the steam goes through the turbine to the condenser, and two cooling towers give the rest of the heat to the air. The rooms and the walls are the types of `thermal.quad`.
+
+The fire starts small and grows. In a cold furnace only the part `pilot` of the coal on the grate burns. A warmer furnace lights more of the bed, and the coal that does not burn yet stays on the grate. So the heat of the fire starts near zero, goes above the feed for some minutes while the bed burns down, and then follows the feed.
+
+```
+warmth:   .warm == (.furnace.temperature - .cold) / .kindle
+ignition: .alight == (.pilot + .warm) / (1 + .warm)
+speed:    .firing == .alight * .bed / .life
+```
+
+The turbine is a reaction with two flows from the same stock. The part `efficiency` of the heat of the steam becomes electricity, and the rest goes to the condenser. A law gives the efficiency from the two temperatures, so a warmer condenser makes less electricity.
+
+```
+carnot: .efficiency == .quality * (1 - .cold.temperature / .hot.temperature)
+rest:   .rejected == 1 - .efficiency
+
+expand: #Expand & {
+    rate:    .steam
+    work:    { source: .hot.energy, sink: .generated,   ratio: .efficiency }
+    exhaust: { source: .hot.energy, sink: .cold.energy, ratio: .rejected }
+}
+```
+
+The operator sets the feed of coal and the steam valve with `--set`. A script runs ten hours with five inputs, and it makes a page with a diagram that moves with the time, and with charts:
+
+```
+$ examples/plant-view.sh --open
+wrote build/plant-view.html
+```
+
+The feeder starts, the fire grows, the valve opens, the fan of a tower fails and works again, the plant goes to half load, and then the bunker is empty. The page is `plant-view.html` with the table of `quad run` in it. It computes nothing about the plant.

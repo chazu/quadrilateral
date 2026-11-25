@@ -33,6 +33,22 @@ typedef struct {
 /* A change of fewer quanta than this is the noise of rounding, and not a turn. */
 enum { NOISE = 4 };
 
+/* The largest change of a rate that is noise, and not a turn: NOISE quanta,
+ * or 1/1024 of the tolerance of the rate, if that is more. A stock and each
+ * cell of a law have quanta, so a rate that goes in one direction has small
+ * steps up and down also. One quantum of a stock can be thousands of quanta
+ * of a rate. A boundary of another kernel can make a span very short, and in
+ * a short span those steps are larger than the change of the rate. Without
+ * this limit, they count as turns, each cap is half of a short span, and the
+ * step goes down to one tick. tol is in units of 10^-9. */
+static km_i128 noise_of(int64_t r, int64_t old, int64_t tol)
+{
+    km_i128 big = r < 0 ? -(km_i128) r : r, other = old < 0 ? -(km_i128) old : old;
+    if (other > big) big = other;
+    km_i128 part = big * tol / 1000000000 / 1024;
+    return part > NOISE ? part : NOISE;
+}
+
 struct QkInstance {
     const QkHost *host;
     const Gen    *g;
@@ -133,7 +149,7 @@ static QkResult predict(QkInstance *inst, QkCall *call, QkPrediction *out)
             }
             if (step > twice) step = twice;
             km_i128 diff = (km_i128) r - f->rate;
-            bool turn = f->sign && km_abs(diff) >= NOISE && (diff > 0 ? 1 : -1) != f->sign;
+            bool turn = f->sign && km_abs(diff) >= noise_of(r, f->rate, tol) && (diff > 0 ? 1 : -1) != f->sign;
             if ((turn || f->turns) && step > span) step = span;
             if (f->cap && step > f->cap) step = f->cap;
         }
@@ -158,7 +174,7 @@ static QkResult advance(QkInstance *inst, QkCall *call, int64_t to)
             f->since = now;
         } else if (r != f->rate) {
             km_i128 diff = (km_i128) r - f->rate;
-            if (km_abs(diff) >= NOISE) {
+            if (km_abs(diff) >= noise_of(r, f->rate, h->read(call, g->uses[t].tolerance).lo)) {
                 int8_t sign = diff > 0 ? 1 : -1;
                 f->turns = f->sign && sign != f->sign ? (uint8_t) (f->turns + 1) : 0;
                 f->sign = sign;
@@ -168,9 +184,12 @@ static QkResult advance(QkInstance *inst, QkCall *call, int64_t to)
                 } else if (f->cap && !f->turns && f->cap < INT64_MAX / 2) {
                     f->cap += f->cap / 16 + 1;
                 }
+                f->rate = r;
+                f->since = now;
             }
-            f->rate = r;
-            f->since = now;
+            /* A change that is noise changes nothing here. The kernel keeps the
+             * last rate and its time, so small changes in one direction add up
+             * until they are a change, and the span grows until then. */
         }
         /* amount in quanta of the stock = rate × dt × 10^e, and the rest stays for the next step */
         const QkTransfer *tr = &g->transfers[t];
