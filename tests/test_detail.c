@@ -916,3 +916,197 @@ void test_detail_host_kernels(void)
     qi_free(own);
     for (int i = 0; i < 3; i++) qk_free(made[i]);
 }
+
+/* --- an interaction with no rate states a transfer of the kernel (ADR 0021 section 6) --------------- */
+
+/* A kernel that moves 1 J for each second out of the world, and 2 J for each
+ * second from `energy` to `store`, which no interaction of the test states. */
+struct QkInstance { const QkHost *host; };
+
+static const QkSlot vent_slots[2] = {
+    { "energy", QK_STOCK, "J", -3, { Q_NINF, Q_INF } },
+    { "store", QK_STOCK, "J", -3, { Q_NINF, Q_INF } },
+};
+static const QkTransfer vent_transfers[2] = { { "loss", 0, QK_NONE, false }, { "keep", 0, 1, true } };
+
+static QkResult vent_create(const QkKernel *self, const QkHost *host, QkCall *call, QkInstance **out)
+{
+    (void) self;
+    (void) call;
+    QkInstance *i = malloc(sizeof *i);
+    if (!i) return QK_ERROR;
+    i->host = host;
+    *out = i;
+    return QK_OK;
+}
+
+static void vent_destroy(QkInstance *i) { free(i); }
+
+static QkResult vent_predict(QkInstance *i, QkCall *call, QkPrediction *out)
+{
+    out->horizon = i->host->now(call) + SEC;
+    out->event_lo = out->event_hi = QK_NO_TIME;
+    return QK_OK;
+}
+
+static QkResult vent_advance(QkInstance *i, QkCall *call, int64_t to)
+{
+    int64_t ms = (to - i->host->now(call)) / 1000;
+    i->host->transfer(call, 0, ms);
+    i->host->transfer(call, 1, 2 * ms);
+    return QK_OK;
+}
+
+static const QkKernel vent = {
+    .abi_version = QK_ABI_VERSION,
+    .size = sizeof(QkKernel),
+    .qr_version = QR_VERSION,
+    .name = "test.vent",
+    .flags = QK_EVOLVE | QK_STATELESS,
+    .slots = vent_slots,
+    .nslots = 2,
+    .transfers = vent_transfers,
+    .ntransfers = 2,
+    .create = vent_create,
+    .destroy = vent_destroy,
+    .predict = vent_predict,
+    .advance = vent_advance,
+};
+
+#define SAID(body) \
+    "#Said: #ConductiveWall & { " body " }\n" \
+    "roomA: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n" \
+    "roomB: #LumpedRoom & { temperature: 293.15K, capacity: 10000J/K }\n" \
+    "wall: #Said & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 1pct }\n"
+
+#define BOX(body, inst) "#Box: #Phenomenon & { energy: %energy, store: %energy, evaluator: \"test.vent\", " body " }\n" \
+                        "box: #Box & { energy: 100J, store: 0J " inst " }\n"
+
+void test_detail_stated_transfers(void)
+{
+    const QkKernel *given[1] = { &vent };
+    QiOptions opt = { given, 1 };
+
+    /* 1. the statement fits the transfer of the kernel. The IR names the interaction, and the world is the
+     * same as without the statement */
+    QIr *ir = compile(SAID("heat: #Interaction & { source: .hot.energy, sink: .cold.energy }"));
+    QIr *plain = compile(SAID("conductance: %conductance"));
+    if (ir && plain) {
+        char *text = qi_text(ir), *ptext = qi_text(plain);
+        HAS(text, "    transfer heat: roomA.energy -> roomB.energy, conserved, stated by wall.heat\n");
+        HAS(ptext, "    transfer heat: roomA.energy -> roomB.energy, conserved\n");
+        /* the source, the sink and the tolerance of the statement are not cells */
+        CHECK(!strstr(text, "wall.heat.") && !strstr(text, "native.rate"));
+        free(text);
+        free(ptext);
+        CHECK(ir->nkernels == 1 && ir->kernels[0].ntransfers == 1);
+        CHECK(!strcmp(ir->kernels[0].transfers[0].stated, "wall.heat") && plain->kernels[0].transfers[0].stated == NULL);
+        CHECK_I64(ir->ncells, plain->ncells);
+        QWorld *a = build(ir, 1), *b = build(plain, 1);
+        if (a && b) {
+            OK(qw_run(a, 300 * SEC));
+            OK(qw_run(b, 300 * SEC));
+            CHECK(qw_hash(a) == qw_hash(b));
+        }
+        qw_free(a);
+        qw_free(b);
+    }
+    qi_free(ir);
+    qi_free(plain);
+
+    /* 2. ADR 0021, acceptance test 6: a kernel with a transfer that source does not state. The IR has
+     * each transfer of the contract, with its stocks and its flag */
+    char *diag = NULL;
+    ir = compile_with(BOX("out: #Interaction & { source: .energy, conserved: false }", ""), &opt, &diag);
+    CHECK(ir != NULL);
+    if (!ir) fprintf(stderr, "%s", diag);
+    free(diag);
+    if (ir) {
+        const QiKernelUse *k = &ir->kernels[0];
+        CHECK_I64(k->ntransfers, 2);
+        const QiTransfer *loss = &k->transfers[0], *keep = &k->transfers[1];
+        CHECK(!strcmp(loss->name, "loss") && !strcmp(ir->cells[loss->from].path, "box.energy") && loss->to == QI_NONE &&
+              !loss->conserved && loss->stated && !strcmp(loss->stated, "box.out") && loss->rate == QI_NONE);
+        CHECK(!strcmp(keep->name, "keep") && !strcmp(ir->cells[keep->from].path, "box.energy") &&
+              !strcmp(ir->cells[keep->to].path, "box.store") && keep->conserved && keep->stated == NULL);
+        char *text = qi_text(ir);
+        HAS(text, "    transfer loss: box.energy -> nothing, stated by box.out\n"
+                  "    transfer keep: box.energy -> box.store, conserved\n");
+        HAS(text, "  box.store: read by K0; transferred by K0\n");
+        free(text);
+        QWorld *w = NULL;
+        char *error = NULL;
+        OK(qi_instantiate(ir, 1, &opt, &w, &error));
+        free(error);
+        if (w) {
+            OK(qw_run(w, 10 * SEC));
+            CHECK_I64(stock(w, "box.energy"), 100000 - 30000);
+            CHECK_I64(stock(w, "box.store"), 20000);
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* a transfer of the kernel of a model, and the other transfers of that kernel */
+    ir = compile("#Flowing: #FineRoom & { first: #Interaction & { source: .c0.energy, sink: .c1.energy } }\n"
+                 "#D3: #DetailRoom & { fine: #Flowing }\n" ROOM("#D3"));
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "    transfer flow0: r.fine.c0.energy -> r.fine.c1.energy, conserved, stated by r.fine.first\n"
+                  "    transfer flow1: r.fine.c1.energy -> r.fine.c2.energy, conserved\n");
+        free(text);
+    }
+    qi_free(ir);
+
+    /* a transfer through the port of the active model */
+    ir = compile("#Said: #ConductiveWall & { heat: #Interaction & { source: .hot.energy, sink: .cold.energy } }\n"
+                 "roomA: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n" ROOM("#DetailRoom")
+                 "wall: #Said & { hot: roomA.west, cold: r.west, conductance: 10W/K, tolerance: 1pct }\n");
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "    transfer heat: roomA.energy -> r.coarse.energy, conserved, stated by wall.heat\n");
+        free(text);
+    }
+    qi_free(ir);
+
+    /* 3. ADR 0021, acceptance test 3: a statement that the kernel does not make is a compile error */
+    static const struct { const char *src, *message; bool vent; } cases[] = {
+        { SAID("heat: #Interaction & { source: .cold.energy, sink: .hot.energy }"),
+          "error: wall.heat states the transfer roomB.energy -> roomA.energy, conserved, and the kernel native.conduction "
+          "makes no transfer between these stocks. Its transfers: heat (roomA.energy -> roomB.energy, conserved)\n", false },
+        { SAID("heat: #Interaction & { source: .hot.energy, conserved: false }"),
+          "error: wall.heat states the transfer roomA.energy -> nothing, not conserved, and the kernel native.conduction "
+          "makes no transfer between these stocks.", false },
+        { SAID("heat: #Interaction & { source: .hot.energy, sink: .cold.energy, conserved: false }"),
+          "error: wall.heat states the transfer roomA.energy -> roomB.energy, not conserved, and the transfer heat of the "
+          "kernel native.conduction is conserved: write `conserved: true`\n", false },
+        { SAID("heat: #Interaction & { source: .hot.energy, sink: .cold.energy },\n"
+               "  more: #Interaction & { source: .hot.energy, sink: .cold.energy }"),
+          "error: wall.heat and wall.more state the same transfer, heat of the kernel native.conduction: one interaction "
+          "states one transfer\n", false },
+        { SAID("heat: #Interaction & { conserved: true }"),
+          "error: wall.heat has no rate, no source and no sink: an interaction with no rate states a transfer of the "
+          "kernel native.conduction, as in `source: .hot.energy, sink: .cold.energy`\n", false },
+        { SAID("heat: #Interaction & { source: .hot.temperature, sink: .cold.energy }"),
+          "error: the source of wall.heat is roomA.temperature, which is not a stock", false },
+        { BOX("out: #Interaction & { source: .energy }", ""),
+          "error: box.out states the transfer box.energy -> nothing, conserved, and the transfer loss of the kernel "
+          "test.vent is not conserved: write `conserved: false`\n", true },
+        { BOX("out: #Interaction & { source: .store, sink: .energy }", ""),
+          "error: box.out states the transfer box.store -> box.energy, conserved, and the kernel test.vent makes no "
+          "transfer between these stocks. Its transfers: loss (box.energy -> nothing, not conserved), keep (box.energy -> "
+          "box.store, conserved)\n", true },
+        { "#Flowing: #FineRoom & { skip: #Interaction & { source: .c0.energy, sink: .c2.energy } }\n"
+          "#D3: #DetailRoom & { fine: #Flowing }\n" ROOM("#D3"),
+          "error: r.fine.skip states the transfer r.fine.c0.energy -> r.fine.c2.energy, conserved, and the kernel "
+          "native.diffusion makes no transfer between these stocks. Its transfers: flow0 (", false },
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        diag = NULL;
+        ir = compile_with(cases[i].src, cases[i].vent ? &opt : NULL, &diag);
+        CHECK(ir == NULL);
+        HAS(diag, cases[i].message);
+        free(diag);
+        qi_free(ir);
+    }
+}

@@ -10,6 +10,8 @@
  *
  *   quad check FILE...             reports the errors of a content
  *   quad ir FILE...                prints the IR (docs/adr/0016)
+ *   quad transfers FILE...         prints each transfer of each kernel, also one
+ *                                  that no interaction in source states
  *   quad run FILE... [options]     builds a world and prints its values
  *
  * Options of run:
@@ -27,6 +29,7 @@ static void usage(void)
 {
     fputs("usage: quad check FILE...\n"
           "       quad ir FILE...\n"
+          "       quad transfers FILE...\n"
           "       quad run FILE... [--until TIME] [--every TIME] [--show PATH,PATH] [--seed N]\n"
           "                        [--switch PHENOMENON=MODEL@TIME]...\n"
           "A time is a number and a unit: 1000s, 20min, 2h, 1d.\n",
@@ -132,6 +135,39 @@ static void report(const QIr *ir, QWorld *w, int64_t ticks)
                         "  If the laws compute one of them from the stock, mark it with @derived in its type.\n", fixed);
 }
 
+/* Each transfer of each kernel: the stocks, if the kernel conserves the
+ * quantity, and the interaction in source that states the transfer. A
+ * transfer that source does not state is in the list also (ADR 0021
+ * section 6). */
+static void show_transfers(const QIr *ir)
+{
+    size_t wk = 6, wt = 8, wf = 4, wto = 2;
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass) printf("%-*s  %-*s  %-*s  %-*s  %-9s  %s\n", (int) wk, "kernel", (int) wt, "transfer", (int) wf, "from",
+                         (int) wto, "to", "conserved", "stated by");
+        for (uint32_t i = 0; i < ir->nkernels; i++) {
+            const QiKernelUse *k = &ir->kernels[i];
+            const QiPhen *ph = &ir->phens[k->phen];
+            char who[300];
+            snprintf(who, sizeof who, "%s%s%s: %s", ph->name, k->model == QI_NONE ? "" : ".",
+                     k->model == QI_NONE ? "" : ph->models[k->model], k->kernel);
+            for (uint32_t t = 0; t < k->ntransfers; t++) {
+                const QiTransfer *tr = &k->transfers[t];
+                const char *from = tr->from == QI_NONE ? "outside" : ir->cells[tr->from].path;
+                const char *to = tr->to == QI_NONE ? "outside" : ir->cells[tr->to].path;
+                if (!pass) {
+                    if (strlen(who) > wk) wk = strlen(who);
+                    if (strlen(tr->name) > wt) wt = strlen(tr->name);
+                    if (strlen(from) > wf) wf = strlen(from);
+                    if (strlen(to) > wto) wto = strlen(to);
+                } else
+                    printf("%-*s  %-*s  %-*s  %-*s  %-9s  %s\n", (int) wk, who, (int) wt, tr->name, (int) wf, from, (int) wto,
+                           to, tr->conserved ? "yes" : "no", tr->stated ? tr->stated : "-");
+            }
+        }
+    }
+}
+
 /* A switch of a model that --switch asks for. */
 typedef struct { char phen[128], model[128]; const char *when; int64_t at; bool done; } Switch;
 
@@ -164,7 +200,8 @@ int main(int argc, char **argv)
     }
     const char *cmd = argv[1];
     bool check = !strcmp(cmd, "check"), show_ir = !strcmp(cmd, "ir"), run = !strcmp(cmd, "run");
-    if (!check && !show_ir && !run) {
+    bool transfers = !strcmp(cmd, "transfers");
+    if (!check && !show_ir && !run && !transfers) {
         usage();
         return 2;
     }
@@ -231,6 +268,12 @@ int main(int argc, char **argv)
         char *text = qi_text(ir);
         fputs(text, stdout);
         free(text);
+        qi_free(ir);
+        return 0;
+    }
+
+    if (transfers) {
+        show_transfers(ir);
         qi_free(ir);
         return 0;
     }

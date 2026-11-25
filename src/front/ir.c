@@ -112,6 +112,7 @@ char *qi_text(const QIr *ir)
                 if (k->transfers[t].rate != QI_NONE)
                     qf_buf_printf(&b, ", at the rate %s, with the tolerance %s", cell_path(ir, k->transfers[t].rate),
                                   cell_path(ir, k->transfers[t].tolerance));
+                else if (k->transfers[t].stated) qf_buf_printf(&b, ", stated by %s", k->transfers[t].stated);
                 qf_buf_putc(&b, '\n');
             }
         }

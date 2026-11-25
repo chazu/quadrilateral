@@ -138,12 +138,18 @@ typedef struct {
 
 /* A transfer of a kernel. An interaction with a rate in source (ADR 0020)
  * gives a transfer of the kernel native.rate: `rate` and `tolerance` are then
- * the cells that give its rate and the accuracy of its steps. */
+ * the cells that give its rate and the accuracy of its steps.
+ *
+ * A kernel use has each transfer of the contract of its kernel, also one that
+ * source does not state. An interaction with no rate states one transfer of a
+ * kernel in C (ADR 0021 section 6): `stated` is then the path of that
+ * interaction. */
 typedef struct {
     const char *name;
     uint32_t    from, to;    /* indices into cells, or QI_NONE */
     bool        conserved;
     uint32_t    rate, tolerance;   /* indices into cells; QI_NONE for a transfer of a kernel in C */
+    const char *stated;      /* the interaction in source that states the transfer, wall.flow, or NULL */
 } QiTransfer;
 
 /* A kernel of a phenomenon, or of one model of it, with the cell that each
