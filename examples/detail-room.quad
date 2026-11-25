@@ -10,8 +10,14 @@
 // the state from one model to another at a switch, and the energy of the
 // room stays the same.
 //
-// A map can have a condition. The room is fine while somebody looks at it:
-// `visible` is an input that the application sets.
+// A map can have a condition. The room is fine while somebody looks at it,
+// or while it is warmer than a limit. `visible` is an input that the
+// application sets. A condition has comparisons and the operators !, && and
+// ||. This run makes the limit lower at the start, and the room becomes fine
+// when it is warm:
+//
+//   build/quad run examples/thermal.quad examples/detail-room.quad --until 20min --every 5min \
+//       --set study.limit=296@0s --show study.refine.when,study.coarse.temperature,study.fine.c0.temperature
 
 // One part of a room, with the law of its heat.
 #Lump: #Thermal & { storage: .energy == .capacity * .temperature }
@@ -36,12 +42,15 @@
     spread: %temperature              // how far the map moves each part from the mean, with a seed
     model:  *"coarse" | text          // the model that is active at the start
     visible: *false | bool            // an input of the application: somebody looks at the room
+    limit:  %temperature              // above this temperature the room is fine also when nobody looks
 
     coarse: #CoarseRoom
     fine:   #FineRoom
 
-    refine:   #Map & { from: "coarse", to: "fine", evaluator: "native.room.refine", when: .visible }
-    abstract: #Map & { from: "fine", to: "coarse", evaluator: "native.room.abstract", when: .visible == false }
+    refine:   #Map & { from: "coarse", to: "fine", evaluator: "native.room.refine",
+                       when: .visible || .west.temperature > .limit }
+    abstract: #Map & { from: "fine", to: "coarse", evaluator: "native.room.abstract",
+                       when: !.visible && .west.temperature <= .limit }
 }
 
 hall: #Room & { temperature: 303.15K, capacity: 10000J/K }
@@ -51,6 +60,7 @@ study: #DetailRoom & {
     fine:   { c0: { capacity: 2500J/K }, c1: { capacity: 2500J/K }, c2: { capacity: 2500J/K }, c3: { capacity: 2500J/K },
               conductance: 20W/K }
     spread: 0K
+    limit:  299K
 }
 
 // The wall does not know which model is behind the port.

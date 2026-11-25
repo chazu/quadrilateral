@@ -84,6 +84,25 @@ char *qi_text(const QIr *ir)
             qf_buf_printf(&b, "  propagator P%u, in an epoch", i);
             if (pr->model != QI_NONE)
                 qf_buf_printf(&b, ", in the model %s.%s", ir->phens[pr->mphen].name, ir->phens[pr->mphen].models[pr->model]);
+            if (pr->op >= QI_IN_RANGE) {
+                /* a truth value (ADR 0022) */
+                qf_buf_printf(&b, ": %s <=> ", cell_path(ir, pr->cell[0]));
+                const QiCell *x = &ir->cells[pr->cell[1]];
+                if (pr->op == QI_IN_RANGE) {
+                    QiCell r = *x;
+                    r.base = pr->range;
+                    qf_buf_printf(&b, "%s is ", x->path);
+                    put_value(&b, ir, &r);
+                } else if (pr->op == QI_IN_SET) {
+                    QiCell r = *x;
+                    r.mask = pr->mask;
+                    qf_buf_printf(&b, "%s is ", x->path);
+                    put_value(&b, ir, &r);
+                } else if (pr->op == QI_NOT) qf_buf_printf(&b, "!%s", x->path);
+                else qf_buf_printf(&b, "%s %s %s", x->path, pr->op == QI_AND ? "&&" : "||", cell_path(ir, pr->cell[2]));
+                qf_buf_printf(&b, "\n    law %s: %s\n", pr->name, pr->law);
+                continue;
+            }
             qf_buf_printf(&b, ": %s %s %s", cell_path(ir, pr->cell[0]),
                           pr->op == QI_LESS_EQUAL ? "<=" : pr->op == QI_LESS ? "<" : "=", cell_path(ir, pr->cell[1]));
             if (pr->op >= QI_SUM && pr->op <= QI_QUOTIENT) qf_buf_printf(&b, " %s %s", ops[pr->op], cell_path(ir, pr->cell[2]));

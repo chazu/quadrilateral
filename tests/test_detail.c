@@ -1553,17 +1553,11 @@ void test_when_errors(void)
 {
     static const struct { const char *refine, *message; } cases[] = {
         { ", when: .coarse.temperature", "error: the condition of the map roomB.refine is not a truth value. A condition is a path "
-          "to a field with the type bool, as in `when: .visible`, or a comparison of one path with an atom or a quantity, "
-          "as in `when: .temperature > 300K`\n" },
+          "to a field with the type bool, as in `when: .visible`, a comparison, as in `when: .temperature > 300K`, or "
+          "conditions with !, && and ||\n" },
         { ", when: .door", "error: the condition of the map roomB.refine is not a truth value." },
         { ", when: false", "error: the condition of the map roomB.refine is always false: remove it, and the map has no "
           "condition\n" },
-        { ", when: .coarse.temperature > .spread", "error: the condition of the map roomB.refine is .coarse.temperature > "
-          ".spread. A condition is a path to a field with the type bool" },
-        { ", when: .coarse.temperature + 1K > 300K", "error: the condition of the map roomB.refine is (.coarse.temperature + 1K) "
-          "> 300K. A condition is a path" },
-        { ", when: .coarse.temperature != 300K", "error: the condition of the map roomB.refine is .coarse.temperature != 300K: "
-          "a quantity has no condition with !=. Use < or >\n" },
         { ", when: .coarse.temperature == 300.0000005K", "error: the condition of the map roomB.refine is .coarse.temperature == "
           "300.0000005K: the number is between two steps of the field. Use <= or >=\n" },
         { ", when: .coarse.temperature > 5J", "error: the condition of the map roomB.refine is .coarse.temperature > 5J: the "
@@ -1574,6 +1568,46 @@ void test_when_errors(void)
           "atoms: compare it with an atom, with == or !=\n" },
         { ", when: .door == \"ajar\"", "error: the condition of the map roomB.refine is .door == \"ajar\", and ajar is not an "
           "atom of roomB.door. Its atoms: closed, open\n" },
+        /* a condition with an operator (ADR 0022 sections 1 to 3) */
+        { ", when: .visible && .coarse.temperature", "error: the condition .visible && .coarse.temperature reads roomB.coarse.temperature as a truth "
+          "value, and it is a quantity. A condition has a path to a field with the type bool, a comparison of "
+          "a path with an atom (== or !=), a comparison of two quantities, and the operators !, && and ||\n" },
+        { ", when: .door || .visible", "error: the condition .door || .visible reads roomB.door as a truth value, and it does not have the "
+          "type bool. A condition has" },
+        { ", when: .visible && .door == \"ajar\"", "error: the condition .visible && (.door == \"ajar\") has the comparison .door == \"ajar\", and ajar "
+          "is not an atom of roomB.door. Its atoms: closed, open\n" },
+        { ", when: .visible || .coarse.temperature > 5J", "error: the condition .visible || (.coarse.temperature > 5J) compares .coarse.temperature, in K, "
+          "with 5J, in J\n" },
+        { ", when: .visible || .coarse.temperature + 1J > 300K", "error: the condition .visible || ((.coarse.temperature + 1J) > 300K) compares .coarse.temperature, "
+          "in K, with 1J, in J\n" },
+        { ", when: !.visible || .coarse.temperature == 300.0000005K", "error: the condition !.visible || (.coarse.temperature == 300.0000005K) compares "
+          ".coarse.temperature with 300.0000005K: the number is between two steps of the field, so the two are "
+          "never equal. Use <= or >=\n" },
+        { ", when: .visible || .coarse.temperature != 300.0000005K", "error: the condition .visible || (.coarse.temperature != 300.0000005K) compares .coarse.temperature "
+          "with 300.0000005K: the number is between two steps of the field, so the two are never equal. Use < "
+          "or >\n" },
+        { ", when: .visible == 5 || .visible", "error: the condition (.visible == 5) || .visible has a comparison with roomB.visible, which is a "
+          "set of atoms. A set of atoms stands in a comparison with an atom, with == or !=\n" },
+        { ", when: .visible || .coarse.temperature == true", "error: the condition .visible || (.coarse.temperature == true) has the comparison "
+          ".coarse.temperature == true, and roomB.coarse.temperature is a quantity: compare it with a "
+          "quantity\n" },
+        { ", when: .visible || .coarse.temperature > true", "error: the atom true can stand in an expression only in a comparison with == or !=\n" },
+        { ", when: .visible || .coarse.temperature + 1K == true",
+          "error: the condition .visible || ((.coarse.temperature + 1K) == true) has the comparison (.coarse.temperature + 1K) "
+          "== true. An atom stands in a comparison with one path, with == or !=\n" },
+        { ", when: .visible && .door > .door", "error: the condition .visible && (.door > .door) has a comparison with roomB.door, which is a set "
+          "of atoms." },
+        { ", when: .visible == .visible", "error: the condition .visible == .visible has a comparison with roomB.visible, which is a set of "
+          "atoms. A set of atoms stands in a comparison with an atom, with == or !=\n" },
+        { ", when: .coarse.temperature > .coarse.capacity", "error: the condition .coarse.temperature > .coarse.capacity compares .coarse.temperature, in K, "
+          "with .coarse.capacity, in J/K\n" },
+        { ", when: .coarse.temperature > .coarse.temperature * .coarse.capacity", "error: the condition .coarse.temperature > (.coarse.temperature * .coarse.capacity) compares "
+          ".coarse.temperature, in K, with .coarse.temperature * .coarse.capacity, in J\n" },
+        { ", when: !.coarse.temperature", "error: the condition !.coarse.temperature reads roomB.coarse.temperature as a truth value, and it "
+          "is a quantity." },
+        { ", when: .coarse.temperature < .spread < .coarse.temperature", "error: expected a field label" },
+        { ", when: .visible && .nothing", "error: unknown field 'nothing'." },
+        { ", when: .coarse.temperature != 5J", "error: the condition .coarse.temperature != 5J compares .coarse.temperature, in K, with 5J, in J\n" },
         { ", when: .west.capacity > 5J/K, extra: 1", "unknown field 'extra'" },
     };
     for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
@@ -1585,14 +1619,6 @@ void test_when_errors(void)
                  cases[i].refine, WROOM("roomB", "#Watched"), WARM);
         HAS(compile_error(src), cases[i].message);
     }
-    /* a condition reads a field of its own phenomenon, and not through a connection */
-    HAS(compile_error("#Linked: #Phenomenon & { other: #ThermalPort, west: #ThermalPort, spread: %temperature, model: \"coarse\",\n"
-                      "  coarse: #CoarseRoom, fine: #FineRoom,\n"
-                      "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\", when: .other.temperature > 300K } }\n"
-                      "roomA: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n"
-                      WROOM("roomB", "#Linked & { other: roomA.west }")),
-        "error: the condition of the map roomB.refine reads roomA.temperature, a field of another phenomenon: a condition "
-        "reads a field of its own phenomenon. Give roomB a field with a law for the value\n");
     /* a field with one text value is not state, so a condition cannot read it */
     HAS(compile_error("#Solo: #Phenomenon & { west: #ThermalPort, spread: %temperature, model: \"coarse\", mode: \"on\",\n"
                       "  coarse: #CoarseRoom, fine: #FineRoom,\n"
@@ -1616,4 +1642,447 @@ void test_when_errors(void)
         "error: the law .on == true uses p.on, which is a set of atoms: arithmetic needs quantities");
     HAS(compile_error("#P: #Phenomenon & { on: bool, x: %energy, rule: .x == true + 1J }\np: #P & { on: true }\n"),
         "error: the atom true can stand in an expression only in a comparison with == or !=");
+}
+
+/* --- a condition with operators (ADR 0022 sections 1 to 4) ------------------------------------------------ */
+
+enum { K_FALSE, K_TRUE, K_UNKNOWN };
+static const uint64_t K_MASK[3] = { 1, 2, 3 };
+static int k_not(int a) { return a == K_UNKNOWN ? K_UNKNOWN : !a; }
+static int k_and(int a, int b) { return a == K_FALSE || b == K_FALSE ? K_FALSE : a == K_TRUE && b == K_TRUE ? K_TRUE : K_UNKNOWN; }
+static int k_or(int a, int b) { return k_not(k_and(k_not(a), k_not(b))); }
+
+/* ADR 0022, acceptance test 2: each operator gives the result of section 2
+ * for each pair of true, false and unknown. */
+void test_truth_tables(void)
+{
+    QIr *ir = compile("#Gate: #Phenomenon & { a: bool, b: bool, both: bool, either: bool, nota: bool, mixed: bool, same: bool,\n"
+                      "  laws: [ .both == (.a && .b), .either == (.a || .b), .nota == !.a,\n"
+                      "          .mixed == (!(.a && .b) || .a == false && .b != true), .same == .a ] }\n"
+                      "g: #Gate\n");
+    QWorld *w = ir ? build(ir, 1) : NULL;
+    for (int a = 0; w && a < 3; a++)
+        for (int b = 0; b < 3; b++) {
+            OK(qw_input_set(w, "g.a", K_MASK[a]));
+            OK(qw_input_set(w, "g.b", K_MASK[b]));
+            CHECK(qw_get_set(w, "g.both") == K_MASK[k_and(a, b)]);
+            CHECK(qw_get_set(w, "g.either") == K_MASK[k_or(a, b)]);
+            CHECK(qw_get_set(w, "g.nota") == K_MASK[k_not(a)]);
+            /* && binds more than ||, and ! binds most */
+            CHECK(qw_get_set(w, "g.mixed") == K_MASK[k_or(k_not(k_and(a, b)), k_and(k_not(a), k_not(b)))]);
+            CHECK(qw_get_set(w, "g.same") == K_MASK[a]);
+            /* the inputs keep their values */
+            CHECK(qw_get_set(w, "g.a") == K_MASK[a] && qw_get_set(w, "g.b") == K_MASK[b]);
+        }
+    qw_free(w);
+    qi_free(ir);
+}
+
+/* A detail room with a limit, a door, and a truth value that a law gives. */
+#define GUARDED(refine, abstract)                                                                       \
+    "#Guarded: #Phenomenon & { west: #ThermalPort, spread: %temperature, model: *\"coarse\" | text,\n"  \
+    "  visible: *false | bool, limit: %temperature, door: *\"closed\" | \"open\" | \"closed\", busy: bool,\n" \
+    "  coarse: #CoarseRoom, fine: #FineRoom,\n"                                                         \
+    "  laws: [ .busy == (.visible || .door == \"open\") ],\n"                                           \
+    "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\"" refine " },\n" \
+    "  abstract: #Map & { from: \"fine\", to: \"coarse\", evaluator: \"native.room.abstract\"" abstract " } }\n"
+
+/* ADR 0022, acceptance test 3: a condition with || and a comparison of two
+ * fields. The room makes its switch at the first boundary where one part is
+ * true. While one part is unknown and the other is false, it makes none. */
+void test_truth_when(void)
+{
+    /* the limit is 293 K: the condition is "above 294 K", as in the world with a condition on one cell */
+    QIr *ir = compile(GUARDED(", when: .visible || .west.temperature > .limit + 1K", "") WROOM("roomB", "#Guarded & { limit: 293K }")
+                      WARM);
+    QIr *plain = compile(WATCHED(", when: .coarse.temperature > 294K", "") WROOM("roomB", "#Watched") WARM);
+    QWorld *w = ir ? build(ir, 1) : NULL, *ref = plain ? build(plain, 1) : NULL;
+    if (w && ref) {
+        char *text = qi_text(ir);
+        HAS(text, "  derived roomB.refine.when: bool = false | true\n");
+        HAS(text, "  map refine, at a switch: coarse -> fine, native.room.refine, for 4 cells, when roomB.refine.when is true\n");
+        /* the port of the active model gives a copy, and the comparison is a range of a difference */
+        HAS(text, "  propagator P8, in an epoch, in the model roomB.coarse: roomB.refine.when.1 = roomB.coarse.temperature\n");
+        HAS(text, "  propagator P11, in an epoch: roomB.refine.when.4 = roomB.refine.when.1 - roomB.refine.when.3\n");
+        HAS(text, "  propagator P12, in an epoch: roomB.refine.when.5 <=> roomB.refine.when.4 is >= 0.000001\n");
+        HAS(text, "  propagator P13, in an epoch: roomB.refine.when <=> roomB.visible || roomB.refine.when.5\n"
+                  "    law roomB.refine.when: .visible || (.west.temperature > (.limit + 1K))\n");
+        HAS(text, "  propagator P6, in an epoch: roomB.laws.first.1 <=> roomB.door is open\n");
+        HAS(text, "  roomB.refine.when: narrowed by P13\n");
+        free(text);
+        QwPhen b;
+        QwCondition got;
+        QwLevel level;
+        OK(qw_find_phenomenon(w, "roomB", &b));
+        OK(qw_condition(w, b, "refine", &got, &level));
+        CHECK(level == QW_LEVEL_SOURCE && !strcmp(got.path, "refine.when") && got.mask == 2);
+        /* the cell of a condition is derived: it takes no input */
+        CHECK(qw_input_set(w, "roomB.refine.when", 2) == QW_EOWNER);
+        HAS(qw_error(w), "'roomB.refine.when' is derived: a law gives its value");
+        int became = 0;
+        for (int t = 5; t <= 1500; t += 5) {
+            OK(qw_run(w, t * SEC));
+            OK(qw_run(ref, t * SEC));
+            CHECK(is_fine(w, "roomB") == is_fine(ref, "roomB"));
+            CHECK(qw_get(w, "roomA.temperature").lo == qw_get(ref, "roomA.temperature").lo);
+            if (!became && is_fine(w, "roomB")) became = t;
+            /* the cell has the value of the condition at each stop */
+            CHECK(qw_get_set(w, "roomB.refine.when") == (became ? 2u : 1u));
+        }
+        CHECK(became > 5 && became < 1500);
+        CHECK_I64((int64_t) qw_switches(w), 1);
+    }
+    qw_free(w);
+    qw_free(ref);
+    qi_free(ir);
+    qi_free(plain);
+
+    /* the limit has no value: the comparison is unknown, and the room makes no switch */
+    ir = compile(GUARDED(", when: .visible || .west.temperature > .limit + 1K", "") WROOM("roomB", "#Guarded") WARM);
+    for (int v = 0; ir && v < 2; v++) {
+        w = build(ir, 1);
+        if (!w) continue;
+        for (int t = 100; t <= 1500; t += 100) {
+            OK(qw_run(w, t * SEC));
+            CHECK(qw_get_set(w, "roomB.refine.when") == 3);
+        }
+        CHECK(!is_fine(w, "roomB") && qw_switches(w) == 0);
+        /* v 0: true || unknown is true. v 1: the limit gets a value, and the comparison is true */
+        if (v == 0) OK(qw_input_set(w, "roomB.visible", 2));
+        else OK(qw_input(w, "roomB.limit", qi_point(293000000)));
+        CHECK(qw_get_set(w, "roomB.refine.when") == 2);
+        OK(qw_run(w, 1500 * SEC));
+        CHECK(is_fine(w, "roomB") && qw_switches(w) == 1);
+        qw_free(w);
+    }
+    qi_free(ir);
+
+    /* ! and &&: the room is coarse again when nobody looks at it and it is below a limit */
+    ir = compile(GUARDED(", when: .visible", ", when: !.visible && .west.temperature < .limit + 100K")
+                 WROOM("roomB", "#Guarded & { limit: 293K }") WARM);
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 10 * SEC));
+        CHECK(!is_fine(w, "roomB") && qw_get_set(w, "roomB.abstract.when") == 2);   /* true, and `fine` is not active */
+        OK(qw_input_set(w, "roomB.visible", 2));
+        CHECK(qw_get_set(w, "roomB.abstract.when") == 1);
+        OK(qw_run(w, 20 * SEC));
+        CHECK(is_fine(w, "roomB"));
+        OK(qw_input_set(w, "roomB.visible", 1));
+        OK(qw_run(w, 30 * SEC));
+        CHECK(!is_fine(w, "roomB"));
+        CHECK_I64((int64_t) qw_switches(w), 2);
+    }
+    qw_free(w);
+    qi_free(ir);
+}
+
+/* ADR 0022, acceptance tests 4 and 5: the application replaces a condition
+ * with one that names a truth value from a law, and a replay gives the same
+ * state after each call. */
+void test_truth_override(void)
+{
+    QIr *ir = compile(GUARDED(", when: .visible && .west.temperature > .limit", ", when: !.busy && !.visible")
+                      WROOM("roomB", "#Guarded & { limit: 900K }") WARM);
+    QWorld *w = ir ? build(ir, 1) : NULL, *again = ir ? build(ir, 1) : NULL;
+    if (w && again) {
+        uint64_t hashes[16];
+        size_t nh = 0;
+#define STEP(call)                       \
+    do {                                 \
+        OK(call);                        \
+        hashes[nh++] = qw_hash(w);       \
+    } while (0)
+        QwPhen b;
+        OK(qw_find_phenomenon(w, "roomB", &b));
+        qw_record(w, true);
+        /* the condition of the content is false: the room is not above 900 K */
+        STEP(qw_input_set(w, "roomB.visible", 2));
+        STEP(qw_run(w, 10 * SEC));
+        CHECK(!is_fine(w, "roomB"));
+        STEP(qw_input_set(w, "roomB.visible", 1));
+        /* the new condition: the truth value `busy`, which the law gives from the door */
+        QwCondition busy = qw_when_true("busy"), got;
+        QwLevel level;
+        STEP(qw_override_condition(w, b, "refine", &busy));
+        OK(qw_condition(w, b, "refine", &got, &level));
+        CHECK(level == QW_LEVEL_INSTANCE && !strcmp(got.path, "busy") && got.mask == 2);
+        STEP(qw_run(w, 20 * SEC));
+        CHECK(!is_fine(w, "roomB") && qw_get_set(w, "roomB.busy") == 1);
+        STEP(qw_input_set(w, "roomB.door", 2));                          /* open */
+        CHECK(qw_get_set(w, "roomB.busy") == 2);
+        STEP(qw_run(w, 30 * SEC));
+        CHECK(is_fine(w, "roomB"));
+        /* the door closes: the condition of the content for `abstract` is true */
+        STEP(qw_input_set(w, "roomB.door", 1));
+        STEP(qw_run(w, 40 * SEC));
+        CHECK(!is_fine(w, "roomB"));
+        /* a condition can name the cell of another transition. A run to the current time reads the conditions */
+        QwCondition other = qw_when_true("abstract.when");
+        STEP(qw_override_condition(w, b, "refine", &other));
+        STEP(qw_run(w, 40 * SEC));
+        CHECK(is_fine(w, "roomB"));
+        CHECK_I64((int64_t) qw_switches(w), 3);
+#undef STEP
+
+        size_t n = 0;
+        const QwCall *calls = qw_calls(w, &n);
+        CHECK_I64((int64_t) n, (int64_t) nh);
+        for (size_t k = 0; k < n && k < nh; k++) {
+            OK(qw_replay(again, calls + k, 1));
+            CHECK(qw_hash(again) == hashes[k]);
+        }
+        CHECK_I64((int64_t) qw_switches(again), 3);
+        CHECK_I64((int64_t) qw_boundaries(again), (int64_t) qw_boundaries(w));
+    }
+    qw_free(w);
+    qw_free(again);
+    qi_free(ir);
+}
+
+/* The forms of a comparison in a condition. */
+void test_truth_compare(void)
+{
+    QIr *ir = compile("#Box: #Phenomenon & { t: %temperature, u: %temperature, a: bool,\n"
+                      "  more: bool, always: bool, same: bool, never: bool, twice: bool, differs: bool, turned: bool,\n"
+                      "  laws: [ .more == (.t > .u + 1K), .always == (.t > .t - 1K), .same == (.t + .u >= .u + .t),\n"
+                      "          .never == (.t - .u < .t - .u), .twice == (.t + .u > 2 * .u), .differs == (.t != 300K),\n"
+                      "          .turned == (300K < .t) ] }\n"
+                      "box: #Box\n");
+    QWorld *w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 0));
+        /* with no values: the same text on the two sides goes away, and each other comparison is unknown */
+        CHECK(qw_get_set(w, "box.always") == 2 && qw_get_set(w, "box.same") == 2 && qw_get_set(w, "box.never") == 1);
+        CHECK(qw_get_set(w, "box.more") == 3 && qw_get_set(w, "box.twice") == 3 && qw_get_set(w, "box.differs") == 3);
+        static const struct { int64_t t, u; uint64_t more, twice, differs, turned; } cases[] = {
+            { 300000000, 298000000, 2, 2, 1, 1 },
+            { 300000000, 299000000, 1, 2, 1, 1 },     /* t is u + 1 K: not more */
+            { 300000001, 299000000, 2, 2, 2, 2 },     /* one step above */
+            { 299999999, 299999999, 1, 1, 2, 1 },     /* t + u is 2 * u */
+            { 290000000, 299000000, 1, 1, 2, 1 },
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            OK(qw_input(w, "box.t", qi_point(cases[i].t)));
+            OK(qw_input(w, "box.u", qi_point(cases[i].u)));
+            CHECK(qw_get_set(w, "box.more") == cases[i].more);
+            CHECK(qw_get_set(w, "box.twice") == cases[i].twice);
+            CHECK(qw_get_set(w, "box.differs") == cases[i].differs);
+            CHECK(qw_get_set(w, "box.turned") == cases[i].turned);
+            CHECK(qw_get_set(w, "box.always") == 2 && qw_get_set(w, "box.same") == 2 && qw_get_set(w, "box.never") == 1);
+        }
+        /* a range of t that has the limit: unknown */
+        OK(qw_input(w, "box.t", (QInterval) { 299000000, 301000000 }));
+        CHECK(qw_get_set(w, "box.differs") == 3 && qw_get_set(w, "box.turned") == 3);
+        OK(qw_input(w, "box.t", (QInterval) { 300000001, 301000000 }));
+        CHECK(qw_get_set(w, "box.differs") == 2 && qw_get_set(w, "box.turned") == 2);
+    }
+    qw_free(w);
+    if (ir) {
+        char *text = qi_text(ir);
+        /* a difference and its range */
+        HAS(text, "  propagator P1, in an epoch: box.laws.first.3 = box.t - box.laws.first.2\n"
+                  "    law box.laws.first: .more == (.t > (.u + 1K))\n"
+                  "  propagator P2, in an epoch: box.more <=> box.laws.first.3 is >= 0.000001\n");
+        /* the same text on the two sides goes away: a number is left, or nothing */
+        HAS(text, "  inner box.laws.rest.first.1: dim[K]@0 = 1\n");
+        HAS(text, "  propagator P3, in an epoch: box.always <=> box.laws.rest.first.1 is >= 1\n");
+        HAS(text, "  inner box.laws.rest.rest.first.1: bool = false\n");
+        HAS(text, "  propagator P4, in an epoch: box.same <=> !box.laws.rest.rest.first.1\n");
+        HAS(text, "  inner box.laws.rest.rest.rest.first.1: bool = true\n");
+        /* one cell and one number: a range of the cell, with no cell for the number */
+        HAS(text, "  propagator P10, in an epoch: box.laws.rest.rest.rest.rest.rest.first.1 <=> box.t is 300\n");
+        HAS(text, "  propagator P11, in an epoch: box.differs <=> !box.laws.rest.rest.rest.rest.rest.first.1\n");
+        HAS(text, "  propagator P12, in an epoch: box.turned <=> box.t is >= 300.000001\n");
+        CHECK(!strstr(text, "rest.rest.rest.rest.rest.rest.first.1"));
+        free(text);
+    }
+    qi_free(ir);
+
+    /* a law is a relation: a result that the instance gives makes the fields of the condition smaller */
+    ir = compile("#Box: #Phenomenon & { t: %temperature, a: bool, r: bool, laws: [ .r == (.a || .t > 300K) ] }\n"
+                 "box: #Box & { r: false }\n");
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 0));
+        CHECK(qw_get_set(w, "box.a") == 1);
+        CHECK(qw_get(w, "box.t").hi == 300000000 && qw_get(w, "box.t").lo == Q_NINF);
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* the values of the start contradict the law */
+    HAS(compile_error("#Box: #Phenomenon & { a: bool, b: bool, r: bool, laws: [ .r == (.a || .b) ] }\n"
+                      "box: #Box & { a: true, r: false }\n"),
+        "error: the values of box at the start contradict the law box.laws.first: .r == (.a || .b) (box.r = false, box.a = "
+        "true, box.b = false or true)\n");
+    HAS(compile_error("#Box: #Phenomenon & { t: %temperature, r: bool, laws: [ .r == !(.t > 300K) ] }\n"
+                      "box: #Box & { t: 301K, r: true }\n"),
+        "error: the values of box at the start contradict the law box.laws.first");
+    /* the forms of a law with a truth value */
+    HAS(compile_error("#Box: #Phenomenon & { t: %temperature, a: bool, b: bool, laws: [ .t == (.a && .b) ] }\nbox: #Box\n"),
+        "error: the law .t == (.a && .b) gives the value of a condition to box.t, which does not have the type bool\n");
+    HAS(compile_error("#Box: #Phenomenon & { door: \"open\" | \"closed\", a: bool, laws: [ .door == !.a ] }\nbox: #Box\n"),
+        "error: the law .door == !.a gives the value of a condition to box.door, which does not have the type bool\n");
+    HAS(compile_error("#Box: #Phenomenon & { a: bool, b: bool, laws: [ .a && .b ] }\nbox: #Box\n"),
+        "error: the law .a && .b is a condition with a logic operator. A law can give a condition to a field with the type "
+        "bool, as in `.busy == (.a && .b)`\n");
+    HAS(compile_error("#Box: #Phenomenon & { a: bool, laws: [ !.a ] }\nbox: #Box\n"),
+        "error: the law !.a is a condition with a logic operator.");
+}
+
+/* A condition reads through a connection and through the port of the active
+ * model, and a snapshot keeps a world with such conditions. */
+void test_truth_paths(void)
+{
+    /* through a connection: the field of another phenomenon */
+    QIr *ir = compile("#Linked: #Phenomenon & { other: #ThermalPort, west: #ThermalPort, spread: %temperature, model: \"coarse\",\n"
+                      "  coarse: #CoarseRoom, fine: #FineRoom,\n"
+                      "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\", when: .other.temperature < 300K } }\n"
+                      "roomA: #LumpedRoom & { temperature: 303.15K, capacity: 10000J/K }\n"
+                      WROOM("roomB", "#Linked & { other: roomA.west }")
+                      "wall: #ConductiveWall & { hot: roomA.west, cold: roomB.west, conductance: 10W/K, tolerance: 1pct }\n");
+    QWorld *w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        char *text = qi_text(ir);
+        HAS(text, "when roomB.refine.when is true\n");
+        HAS(text, "  propagator P6, in an epoch: roomB.refine.when <=> roomA.temperature is <= 299.999999\n");
+        free(text);
+        int became = 0;
+        for (int t = 5; t <= 1500 && !became; t += 5) {
+            OK(qw_run(w, t * SEC));
+            if (is_fine(w, "roomB")) became = t;
+            /* the switch is at the first stop where the other room is below 300 K */
+            CHECK((qw_get(w, "roomA.temperature").hi < 300000000) == (became != 0));
+        }
+        CHECK(became > 5);
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* a set of atoms through the port of the active model: the truth value follows a switch */
+    ir = compile("#Lit: { lit: bool }\n"
+                 "#FlagPort: #ThermalPort & #Lit\n"
+                 "#P: #Model & #Lump & #Lit & { west: #FlagPort & { temperature: .temperature, capacity: .capacity, "
+                 "energy: .energy, lit: .lit } }\n"
+                 "#Q: #Model & #Lit & { c0: #Lump, west: #FlagPort & { temperature: .c0.temperature, capacity: .c0.capacity, "
+                 "energy: .c0.energy, lit: .lit } }\n"
+                 "#R: #Phenomenon & { west: #FlagPort, spread: %temperature, model: \"p\", p: #P, q: #Q, seen: bool,\n"
+                 "  laws: [ .seen == (.west.lit && .west.temperature > 280K) ],\n"
+                 "  pq: #Map & { from: \"p\", to: \"q\", evaluator: \"native.room.refine\" } }\n"
+                 "r: #R & { spread: 0K, p: { temperature: 300K, capacity: 1J/K, lit: true }, q: { c0: { capacity: 1J/K }, "
+                 "lit: false } }\n");
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 5 * SEC));
+        CHECK(qw_get_set(w, "r.seen") == 2);
+        OK(qi_switch(ir, w, "r", "q"));
+        OK(qw_run(w, 10 * SEC));
+        CHECK(qw_get_set(w, "r.seen") == 1);
+        CHECK(qw_get(w, "r.q.c0.temperature").lo == 300000000);
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* a snapshot: the cell of a condition is not state, and the world goes on in the same way */
+    ir = compile(GUARDED(", when: .visible || .west.temperature > .limit + 1K", ", when: !.visible && .door == \"open\"")
+                 WROOM("roomB", "#Guarded & { limit: 293K }") WARM);
+    w = ir ? build(ir, 1) : NULL;
+    QWorld *copy = ir ? build(ir, 1) : NULL;
+    if (w && copy) {
+        void *bytes = NULL;
+        size_t len = 0;
+        OK(qw_run(w, 100 * SEC));
+        OK(qw_snapshot(w, &bytes, &len));
+        OK(qw_restore(copy, bytes, len));
+        free(bytes);
+        CHECK(qw_hash(copy) == qw_hash(w));
+        CHECK(qw_get_set(copy, "roomB.refine.when") == qw_get_set(w, "roomB.refine.when"));
+        OK(qw_run(w, 1000 * SEC));
+        OK(qw_run(copy, 1000 * SEC));
+        CHECK(is_fine(w, "roomB") && is_fine(copy, "roomB"));
+        CHECK(qw_hash(copy) == qw_hash(w));
+        OK(qw_input_set(w, "roomB.door", 2));
+        OK(qw_input_set(copy, "roomB.door", 2));
+        OK(qw_run(w, 1100 * SEC));
+        OK(qw_run(copy, 1100 * SEC));
+        /* the room is above the limit: fine and coarse in turn, one switch at each boundary */
+        CHECK(qw_switches(w) > 2 && qw_switches(copy) == qw_switches(w));
+        CHECK(qw_hash(copy) == qw_hash(w));
+    }
+    qw_free(w);
+    qw_free(copy);
+    qi_free(ir);
+}
+
+/* Truth values and the enumerations of the content. */
+void test_truth_enums(void)
+{
+    /* two fields with the type bool: one propagator makes them equal */
+    QIr *ir = compile("#Box: #Phenomenon & { a: bool, r: bool, laws: [ .r == .a ] }\nbox: #Box\n");
+    if (ir) {
+        char *text = qi_text(ir);
+        HAS(text, "  propagator P0, in an epoch: box.r = box.a\n");
+        CHECK(!strstr(text, "propagator P1") && !strstr(text, "inner "));
+        free(text);
+    }
+    qi_free(ir);
+
+    /* a field with the atoms of bool and another type: two negations make the two fields equal */
+    ir = compile("#Box: #Phenomenon & { a: bool, r: true | false, laws: [ .r == .a ] }\nbox: #Box\n");
+    QWorld *w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        char *text = qi_text(ir);
+        HAS(text, "enumeration bool: false true\nenumeration false | true: false true\n");
+        HAS(text, "  propagator P0, in an epoch: box.laws.first.1 <=> !box.a\n");
+        HAS(text, "  propagator P1, in an epoch: box.r <=> !box.laws.first.1\n");
+        CHECK(!strstr(text, "propagator P2"));
+        free(text);
+        OK(qw_input_set(w, "box.a", 2));
+        CHECK(qw_get_set(w, "box.r") == 2);
+        OK(qw_input_set(w, "box.a", 1));
+        CHECK(qw_get_set(w, "box.r") == 1);
+        OK(qw_input_set(w, "box.a", 3));
+        CHECK(qw_get_set(w, "box.r") == 3);
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* no field with the type bool: the elaborator makes that enumeration for the inner values of the condition */
+    ir = compile("#Box: #Phenomenon & { t: %temperature, u: %temperature, r: true | false,\n"
+                 "  laws: [ .r == (.t > .u || .t < 0K) ] }\nbox: #Box\n");
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        char *text = qi_text(ir);
+        HAS(text, "enumeration bool: false true\n");
+        HAS(text, "  inner box.laws.first.2: bool = false | true\n");
+        free(text);
+        OK(qw_input(w, "box.t", qi_point(1000000)));
+        OK(qw_input(w, "box.u", qi_point(0)));
+        CHECK(qw_get_set(w, "box.r") == 2);
+        OK(qw_input(w, "box.u", qi_point(2000000)));
+        CHECK(qw_get_set(w, "box.r") == 1);
+    }
+    qw_free(w);
+    qi_free(ir);
+
+    /* an enumeration with 64 atoms: the largest set cell */
+    char src[1024];
+    int at = snprintf(src, sizeof src, "#Box: #Phenomenon & { r: bool, e: ");
+    for (int i = 0; i < 64; i++) at += snprintf(src + at, sizeof src - (size_t) at, "%s\"a%02d\"", i ? " | " : "", i);
+    snprintf(src + at, sizeof src - (size_t) at, ", laws: [ .r == (.e != \"a63\") ] }\nbox: #Box\n");
+    ir = compile(src);
+    w = ir ? build(ir, 1) : NULL;
+    if (w) {
+        OK(qw_run(w, 0));
+        CHECK(qw_get_set(w, "box.r") == 3);
+        OK(qw_input_set(w, "box.e", 1));
+        CHECK(qw_get_set(w, "box.r") == 2);
+        OK(qw_input_set(w, "box.e", (uint64_t) 1 << 63));
+        CHECK(qw_get_set(w, "box.r") == 1);
+        OK(qw_input_set(w, "box.e", ((uint64_t) 1 << 63) | 1));
+        CHECK(qw_get_set(w, "box.r") == 3);
+    }
+    qw_free(w);
+    qi_free(ir);
 }

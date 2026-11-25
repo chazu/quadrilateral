@@ -313,3 +313,57 @@ void test_world_set_assumptions_and_log(void)
     CHECK(found);
     qw_free(d.w);
 }
+
+/* A derived set cell (ADR 0022 section 3): a truth value that propagators
+ * give. It is not state: it takes no input, and qw_hash and a snapshot do
+ * not cover it. */
+void test_world_derived_set_cell(void)
+{
+    QWorld *pair[2] = { qw_new(1, -6), qw_new(1, -6) };
+    QnCell seen[2], lit[2], open[2];
+    QwPhen p;
+    for (int k = 0; k < 2; k++) {
+        QWorld *w = pair[k];
+        OK(qw_phenomenon(w, "room", &p));
+        OK(qw_set_cell(w, "room.seen", qw_boolean(w), 3, &seen[k]));
+        OK(qw_set_cell(w, "room.open", qw_boolean(w), 3, &open[k]));
+        OK(qw_derived_set_cell(w, "room.lit", qw_boolean(w), 3, &lit[k]));
+        CHECK(qn_and(qw_net(w), lit[k], seen[k], open[k]) == QN_OK);
+    }
+    QWorld *w = pair[0], *other = pair[1];
+    /* the errors of a set cell */
+    QnCell c;
+    QwKind energy;
+    OK(qw_kind(w, "energy", "m^2 kg s^-2", -3, true, &energy));
+    CHECK(qw_derived_set_cell(w, "room.bad", energy, 1, &c) == QW_ETYPE);
+    CHECK(qw_derived_set_cell(w, "room.bad", qw_boolean(w), 4, &c) == QW_ETYPE);
+    CHECK(qw_derived_set_cell(w, "room.lit", qw_boolean(w), 3, &c) == QW_EDUP);
+    OK(qw_derived_set_cell(w, "room.spare", qw_boolean(w), 3, NULL));
+    OK(qw_kind(other, "energy", "m^2 kg s^-2", -3, true, &energy));
+    OK(qw_derived_set_cell(other, "room.spare", qw_boolean(other), 3, NULL));
+
+    OK(qw_run(w, 0));
+    OK(qw_run(other, 0));
+    CHECK(qw_get_set(w, "room.lit") == 3);
+    CHECK(qw_input_set(w, "room.lit", 2) == QW_EOWNER);
+    CHECK(strstr(qw_error(w), "'room.lit' is derived: a law gives its value") != NULL);
+    uint64_t unknown = qw_hash(w);
+    CHECK(qw_hash(other) == unknown);
+    OK(qw_input_set(w, "room.seen", 2));
+    OK(qw_input_set(w, "room.open", 2));
+    CHECK(qw_get_set(w, "room.lit") == 2);
+    CHECK(qw_hash(w) != unknown);
+
+    /* a snapshot has the inputs, and the derived cell gets its value again from the propagator */
+    void *bytes = NULL;
+    size_t len = 0;
+    OK(qw_snapshot(w, &bytes, &len));
+    OK(qw_restore(other, bytes, len));
+    free(bytes);
+    CHECK(qw_hash(other) == qw_hash(w));
+    CHECK(qw_get_set(other, "room.lit") == 2 && qw_get_set(other, "room.seen") == 2);
+    OK(qw_input_set(other, "room.open", 1));
+    CHECK(qw_get_set(other, "room.lit") == 1);
+    qw_free(w);
+    qw_free(other);
+}

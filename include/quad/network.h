@@ -98,6 +98,19 @@ QnStatus qn_element(QNet *net, QnCell x, QnCell a, const QInterval *table, size_
 /* b <=> (x in range): b is a boolean set cell (atom 0 false, atom 1 true) and
  * x an interval cell; range is in x's scale. */
 QnStatus qn_reify_in(QNet *net, QnCell b, QnCell x, QInterval range);
+/* b <=> (a in atoms): b is a boolean set cell and a a set cell; atoms is a
+ * part of the universe of a, and not all of it. */
+QnStatus qn_reify_set(QNet *net, QnCell b, QnCell a, uint64_t atoms);
+
+/* Logic on boolean set cells (ADR 0022 section 2). A cell with the two atoms
+ * is unknown. Each propagator works in each direction, and none changes an
+ * unknown value into false:
+ *   r <=> a && b: r is false if a or b is false, and true if the two are true.
+ *   r <=> a || b: r is true if a or b is true, and false if the two are false.
+ *   r <=> !a. */
+QnStatus qn_and(QNet *net, QnCell r, QnCell a, QnCell b);
+QnStatus qn_or(QNet *net, QnCell r, QnCell a, QnCell b);
+QnStatus qn_not(QNet *net, QnCell r, QnCell a);
 
 /* --- groups ------------------------------------------------------------------ */
 

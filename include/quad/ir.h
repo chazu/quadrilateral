@@ -103,12 +103,21 @@ typedef struct {
     const char **targets;     /* by model: for each model of the phenomenon, the path of its port, roomB.fine.west */
 } QiPort;
 
-typedef enum { QI_EQUAL, QI_SUM, QI_DIFFERENCE, QI_PRODUCT, QI_QUOTIENT, QI_LESS_EQUAL, QI_LESS } QiOp;
+typedef enum {
+    QI_EQUAL, QI_SUM, QI_DIFFERENCE, QI_PRODUCT, QI_QUOTIENT, QI_LESS_EQUAL, QI_LESS,
+    /* truth values (ADR 0022): cell[0] is a cell with the type bool */
+    QI_IN_RANGE,             /* cell[0] <=> cell[1] is in `range`, in quanta of cell[1] */
+    QI_IN_SET,               /* cell[0] <=> the set cell cell[1] is in the atoms `mask` */
+    QI_AND,                  /* cell[0] <=> cell[1] && cell[2] */
+    QI_OR,                   /* cell[0] <=> cell[1] || cell[2] */
+    QI_NOT,                  /* cell[0] <=> !cell[1] */
+} QiOp;
 
 /* A propagator: cell[0] = cell[1] op cell[2]. For QI_EQUAL, cell[0] =
- * cell[1]. For QI_LESS_EQUAL and QI_LESS, cell[0] <= cell[1] or cell[0] <
- * cell[1]. It narrows every cell that it names, in every direction. One law
- * can give several propagators, with derived cells between them. */
+ * cell[1]: two quantities, or two set cells of one enumeration. For
+ * QI_LESS_EQUAL and QI_LESS, cell[0] <= cell[1] or cell[0] < cell[1]. It
+ * narrows every cell that it names, in every direction. One law can give
+ * several propagators, with derived cells between them. */
 /* A law of a model works only while the model is active (ADR 0021): `mphen`
  * and `model` name that model. A law that reads through a port of the active
  * model gives one propagator for each model of that phenomenon. */
@@ -122,6 +131,8 @@ typedef struct {
     const char *law;         /* the text of the law */
     const char *file;
     int         line, col;
+    QInterval   range;       /* QI_IN_RANGE */
+    uint64_t    mask;        /* QI_IN_SET */
 } QiProp;
 
 /* The cell of a slot. A slot can go through a port of the active model of a

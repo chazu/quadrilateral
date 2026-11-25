@@ -36,7 +36,7 @@ The map's random cursor uses the phenomenon's identity, the stream name, and the
 ### 4. What starts a switch
 
 - First version: an explicit call, `qw_switch(world, phenomenon, model, map)`. A test or a game script decides when to switch.
-- ADR 0021 adds a condition for a transition. The world switches at a boundary while the condition is true, and the application can replace the condition. ADR 0022 proposes the details.
+- ADR 0021 adds a condition for a transition. The world switches at a boundary while the condition is true, and the application can replace the condition. ADR 0022 has the details.
 - Later: model selection by observability, causal relevance, uncertainty, and budget (design section 7.1). It is a non-monotonic step at an epoch boundary (ADR 0008), and it uses the same switch.
 - Later: a kernel that returns `QK_INAPPLICABLE`, or an input outside a valid range, can request a switch instead of stopping the run.
 

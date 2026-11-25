@@ -164,7 +164,7 @@ The level comes to the inflow times the time constant: 0.002 m^3/s × 100 s = 0.
 
 A room can have more than one model. The coarse model has one temperature. The fine model has four parts in a row, and a kernel moves heat between neighbors. One model is active, and the other has no state and costs no computation.
 
-A model is a field with a type below `#Model`. The phenomenon names the model that is active at the start. A map moves the state from one model to another. A map can have a condition: the room is fine while somebody looks at it.
+A model is a field with a type below `#Model`. The phenomenon names the model that is active at the start. A map moves the state from one model to another. A map can have a condition: the room is fine while somebody looks at it, or while it is warmer than a limit.
 
 ```
 #DetailRoom: #Phenomenon & {
@@ -172,12 +172,15 @@ A model is a field with a type below `#Model`. The phenomenon names the model th
     spread: %temperature
     model:  *"coarse" | text          // the model that is active at the start
     visible: *false | bool            // an input of the application
+    limit:  %temperature              // above this temperature the room is fine also when nobody looks
 
     coarse: #CoarseRoom
     fine:   #FineRoom
 
-    refine:   #Map & { from: "coarse", to: "fine", evaluator: "native.room.refine", when: .visible }
-    abstract: #Map & { from: "fine", to: "coarse", evaluator: "native.room.abstract", when: .visible == false }
+    refine:   #Map & { from: "coarse", to: "fine", evaluator: "native.room.refine",
+                       when: .visible || .west.temperature > .limit }
+    abstract: #Map & { from: "fine", to: "coarse", evaluator: "native.room.abstract",
+                       when: !.visible && .west.temperature <= .limit }
 }
 ```
 
@@ -197,7 +200,36 @@ time [s]    hall.temperature [K]  study.coarse.temperature [K]  study.fine.c0.te
 
 At 300 s somebody looks at the room, and it becomes fine. Each part starts at the temperature of the whole room, and the energy of the room does not change. Then the part at the wall warms faster than the far part, so less power comes through the wall. At 900 s nobody looks, and the room becomes coarse again, with the energy of the four parts.
 
-A condition is a statement about one field of the phenomenon: a `bool` field, or a comparison with an atom or a quantity, such as `when: .coarse.temperature > 300K`. A program in C sets the input with `qw_input_set`. It can also give a room or a type of room another condition, with `qw_override_condition` and `qw_override_type_condition`, or switch a room with `qi_switch(ir, world, "study", "fine")`.
+The limit of the study is 299 K, and the study does not get that warm. With a lower limit, the room becomes fine when it is warm, with no input:
+
+```
+$ build/quad run examples/thermal.quad examples/detail-room.quad --until 20min --every 5min \
+      --set study.limit=296@0s --show study.refine.when,study.coarse.temperature,study.fine.c0.temperature
+time [s]    study.refine.when  study.coarse.temperature [K]  study.fine.c0.temperature [K]
+0                       false                        293.15                        unknown
+300                     false                   ~295.414217                        unknown
+600                      true                       unknown                    ~297.373659
+900                      true                       unknown                    ~297.825027
+1200                     true                       unknown                    ~297.953413
+```
+
+A condition has these parts (ADR 0022):
+
+- a path to a field with the type `bool`: `.visible`
+- a comparison of a path with an atom: `.door != "open"`
+- a comparison of two quantities: `.west.temperature > .limit + 2K`
+- the operators `!`, `&&` and `||`, and parentheses
+
+A part can be unknown, for example a comparison with a field that has no value. An unknown condition changes nothing. `true || unknown` is true, and `false && unknown` is false.
+
+A condition with an operator is a cell with the path of its field `when`, such as `study.refine.when`. The laws compute it, and `--show` can print it. A law can also give a name to a truth value:
+
+```
+busy: bool
+laws: [ .busy == (.visible || .people > 0) ]
+```
+
+A program in C sets the input with `qw_input_set`. It can give a room or a type of room another condition, with `qw_override_condition` and `qw_override_type_condition`. That condition is a statement about one field, such as `qw_when_true("busy")`. The program can also switch a room with `qi_switch(ir, world, "study", "fine")`.
 
 ## thermal.quad and fire.quad: a reaction
 
