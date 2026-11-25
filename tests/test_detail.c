@@ -1534,7 +1534,12 @@ void test_when_forms(void)
             QwPhen t;
             QwCondition never = qw_never();
             OK(qw_find_phenomenon(w, "t", &t));
-            OK(qw_override_condition(w, t, "ac", &never));
+            CHECK(t == 0);
+            OK(qw_override_type_condition(w, "#Three", "ac", &never));     /* for the first phenomenon of the world */
+            QwCondition got;
+            QwLevel level;
+            OK(qw_condition(w, t, "ac", &got, &level));
+            CHECK(level == QW_LEVEL_TYPE);
             OK(qw_run(w, 20 * SEC));
             CHECK(!strcmp(qw_active_model(w, t), "b"));
         }
@@ -1588,6 +1593,24 @@ void test_when_errors(void)
                       WROOM("roomB", "#Linked & { other: roomA.west }")),
         "error: the condition of the map roomB.refine reads roomA.temperature, a field of another phenomenon: a condition "
         "reads a field of its own phenomenon. Give roomB a field with a law for the value\n");
+    /* a field with one text value is not state, so a condition cannot read it */
+    HAS(compile_error("#Solo: #Phenomenon & { west: #ThermalPort, spread: %temperature, model: \"coarse\", mode: \"on\",\n"
+                      "  coarse: #CoarseRoom, fine: #FineRoom,\n"
+                      "  refine: #Map & { from: \"coarse\", to: \"fine\", evaluator: \"native.room.refine\", when: .mode != \"on\" } }\n"
+                      WROOM("roomB", "#Solo")),
+        "error: the condition of the map roomB.refine reads roomB.mode, which is not a cell of roomB\n");
+    /* an instance can give the condition of a map of its type */
+    QIr *ir = compile(WATCHED("", "") WROOM("roomB", "#Watched") "roomB: { refine: { when: .visible }, visible: true }\n" WARM);
+    if (ir) {
+        CHECK(ir->maps[1].when.path && !strcmp(ir->maps[1].when.path, "visible") && ir->maps[0].when.path == NULL);
+        QWorld *w = build(ir, 1);
+        if (w) {
+            OK(qw_run(w, 0));
+            CHECK(is_fine(w, "roomB"));
+        }
+        qw_free(w);
+    }
+    qi_free(ir);
     /* an atom in a law that is not the condition of a map */
     HAS(compile_error("#P: #Phenomenon & { on: bool, rule: .on == true }\np: #P & { on: true }\n"),
         "error: the law .on == true uses p.on, which is a set of atoms: arithmetic needs quantities");

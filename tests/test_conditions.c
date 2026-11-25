@@ -335,6 +335,19 @@ void test_condition_conflict(void)
     /* one switch at each boundary, and one more at the start of the run */
     CHECK_I64((int64_t) qw_switches(m.w), 1 + 1 + (int64_t) (qw_boundaries(m.w) - b0));
     CHECK(qw_boundaries(m.w) - b0 > 3);
+    drop(&m);
+
+    /* only the second transition of a room has a condition */
+    m = make(1, false);
+    QwCondition unseen = qw_when_false("visible");
+    OK(qw_override_condition(m.w, m.b, "abstract", &unseen));
+    OK(qw_switch_to(m.w, m.b, "fine"));
+    OK(qw_run(m.w, 5 * SEC));
+    CHECK(!fine(&m, m.b));                                          /* nobody looks: coarse again */
+    CHECK_I64((int64_t) qw_switches(m.w), 2);
+    OK(qw_input_set(m.w, "roomB.visible", TRUE_ONLY));
+    OK(qw_run(m.w, 10 * SEC));
+    CHECK(!fine(&m, m.b));                                          /* refine has no condition */
     (void) seen;
     drop(&m);
 }
@@ -355,6 +368,16 @@ void test_condition_state(void)
     OK(qw_override_type_condition(b.w, "#BigRoom", "refine", &never));
     CHECK(qw_hash(a.w) != qw_hash(b.w));                            /* another condition */
     OK(qw_override_type_condition(b.w, "#BigRoom", "refine", &warm));
+    CHECK(qw_hash(a.w) == qw_hash(b.w));
+    /* a removal names the type and the transition: the other condition of the type stays */
+    QwCondition got0;
+    QwLevel level0;
+    OK(qw_override_type_condition(a.w, "#BigRoom", "abstract", &never));
+    OK(qw_clear_type_condition(a.w, "#BigRoom", "abstract"));
+    OK(qw_condition(a.w, a.d, "refine", &got0, &level0));
+    CHECK(level0 == QW_LEVEL_TYPE && !strcmp(got0.path, "west.temperature"));
+    OK(qw_condition(a.w, a.d, "abstract", &got0, &level0));
+    CHECK(level0 == QW_LEVEL_SOURCE);
     CHECK(qw_hash(a.w) == qw_hash(b.w));
     OK(qw_clear_condition(a.w, a.b, "refine"));
     OK(qw_clear_condition(b.w, b.b, "refine"));
@@ -391,6 +414,36 @@ void test_condition_state(void)
     CHECK(qw_restore(c.w, bytes, len - 8) == QW_ESNAPSHOT);
     CHECK(qw_restore(c.w, bytes, len - 40) == QW_ESNAPSHOT);
     CHECK(qw_hash(c.w) == h);
+    /* a snapshot with a condition for a phenomenon or a transition that the world does not have */
+    {
+        World s1 = make(1, true), s2 = make(1, true);
+        void *sb = NULL;
+        size_t sl = 0;
+        OK(qw_override_condition(s1.w, s1.c, "refine", &never));
+        OK(qw_snapshot(s1.w, &sb, &sl));
+        /* the end of the bytes: the count 1, the phenomenon, the transition, the condition "never" in 5 words,
+         * and the count 0 of the types */
+        uint8_t *raw = sb;
+        CHECK(raw[sl - 72] == 1 && raw[sl - 64] == (uint8_t) s1.c && raw[sl - 56] == 0);
+        uint64_t h2 = qw_hash(s2.w);
+        raw[sl - 64] = 99;                                          /* no such phenomenon */
+        CHECK(qw_restore(s2.w, sb, sl) == QW_ESNAPSHOT);
+        raw[sl - 64] = (uint8_t) s1.c;
+        raw[sl - 56] = 7;                                           /* no such transition */
+        CHECK(qw_restore(s2.w, sb, sl) == QW_ESNAPSHOT);
+        CHECK(qw_hash(s2.w) == h2);
+        raw[sl - 56] = 1;                                           /* the other transition of the room */
+        OK(qw_restore(s2.w, sb, sl));
+        QwCondition g2;
+        QwLevel l2;
+        OK(qw_condition(s2.w, s2.c, "abstract", &g2, &l2));
+        CHECK(l2 == QW_LEVEL_INSTANCE);
+        OK(qw_condition(s2.w, s2.c, "refine", &g2, &l2));
+        CHECK(l2 == QW_LEVEL_SOURCE);
+        free(sb);
+        drop(&s1);
+        drop(&s2);
+    }
     /* a world with no rule has another structure */
     World plain = make(1, false);
     CHECK(qw_restore(plain.w, bytes, len) == QW_ESNAPSHOT);

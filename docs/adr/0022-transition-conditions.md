@@ -100,6 +100,19 @@ Acceptance test 5 of ADR 0021: change a source condition through the C API. Chec
 ## Consequences
 
 - A condition reads one cell. A condition on two fields, such as `.inside > .outside`, needs a field for the difference and a law. The fix is an expression as the value of a field. Time: `quad-pr0`.
-- A condition has no "and", "or" and "not". The fix is a field with the type `bool` that laws compute from other fields. The network has no such laws yet. Time: a new issue, after this work.
+- A condition has no "and", "or" and "not". The fix is a field with the type `bool` that laws compute from other fields. The network has no such laws yet. Time: `quad-esj`, after this work.
 - The record has one entry for each call of `qw_run`. An application that calls `qw_run` for each frame gets a long record. The fix is a run that stops at a time and makes no boundary. Time: with the asynchronous clocks of `quad-h21.3`.
 - Automatic selection by cost (`quad-ft5.3`) can use the same step at a boundary and the same switch.
+
+## Notes from the implementation (`quad-ijx.4.4`)
+
+- **The functions.** `include/quad/world.h` has the condition (`QwCondition`) and `qw_transition_when` for the condition of the content. It has the four functions for the conditions of the application, and `qw_condition`. The record has `qw_record`, `qw_calls` and `qw_replay`. `qw_set_type` gives the world the exact type of a phenomenon. `qi_instantiate` calls it for each phenomenon.
+- **The time of the decision.** The world reads the conditions at the start of each `qw_run`, also a run to the current time. So a change of an input or of a condition takes effect when the application runs the world again. That is at the same time, with no new boundary.
+- **A path that is not a cell.** The world finds the cell of a condition when the application gives the condition, and again after a switch of that phenomenon. A condition of a type must fit each phenomenon of the type that has the transition. If a path is not a cell after a switch, the condition is unknown.
+- **A number between two steps.** `.temperature > 294.0000005K` on a field with 6 decimals is `>= 294.000001`. A comparison with `==` needs a number on a step.
+- **An atom in an expression.** A comparison with `==` or `!=` can have an atom: `.visible == false`. Before, each expression with an atom was an error. A law with an atom is still an error.
+- **The snapshot.** The format of a snapshot has a new number, because it has the conditions of the application. A snapshot from before this work does not load.
+- **A switch from `qw_switch` in the record.** The record has the phenomenon and the model. The replay finds the transition between the two models. So a switch with a kernel that is not a transition of the world does not replay.
+- **The tool.** `quad run --set study.visible=true@5min` gives a cell a value at a time. `examples/detail-room.quad` has a room that is fine while `visible` is true.
+- A condition `when: false` is an error, because the map then has no use for a condition. `when: true` is always true.
+
