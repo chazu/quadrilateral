@@ -159,3 +159,17 @@ This example sends the heat straight to the room. If the model includes a stove 
 - Implementing transition conditions adds a public C API and boundary evaluation to the existing explicit switch mechanism.
 - ADR 0020 named this stage for a rate law with a condition, such as "a constant flow until the tank is empty". That was wrong. The fix is a phenomenon that exists only while a condition holds (ADR 0013). Time: `quad-ijx.7`.
 - The acceptance test of `quad-ijx.4` (phase 5 in source) is test 1 here.
+
+
+## Notes from the implementation
+
+### Models, ports and maps (`quad-ijx.4.1`)
+
+- **A law that reads through the port of the active model reads a copy.** A propagator keeps the same cells for the whole run, and the cell behind the port changes at a switch. So the law gets an inner value, `wall.flow.1`. Each model of the room has one propagator that makes the copy equal to its own cell. That propagator works only while its model is active. The law has one form for all models. A kernel has no copy: the world binds its slots again at a switch. The IR lists the cell of each slot for each model.
+- **The front end generates the kernels of a room.** `native.diffusion`, `native.room.refine` and `native.room.abstract` have a contract for each number of cells. The front end counts the fields `c0`, `c1`, and so on, of the model, and makes the kernel. The room of phase 5 needs no C, and `quad run` can run it. A kernel with the same name from the options of the host has precedence.
+- **The world keeps a map as a transition.** `qw_transition` gives the world the name, the two models and the map kernel. `qw_switch_to` switches with the map from the active model, and `qi_switch` calls it. `qw_switch` with an explicit kernel stays.
+- **The state hash has the active model by its name.** It had the number of the model, so two worlds with the same state and another order of the models had different hashes. In the C API the first declared model is active (ADR 0010). `qi_instantiate` declares the model of the start first.
+- **A port with no view that no model gives stays open.** It is an error only if a connection, a law or a kernel uses it, as before. If one model gives the port, each model must give it.
+- **The tool can switch.** `quad run --switch study=fine@5min` switches at a time, with the map that the content gives. `examples/detail-room.quad` shows it.
+- A value that two models share has its cell in one model: the one with the first path. An interaction of the other model cannot move it. We know no use for such a value.
+

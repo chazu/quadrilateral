@@ -821,7 +821,7 @@ void test_resolve_fixture(void)
     STR_EQ(node_text(f, a),
            "#LumpedRoom & { capacity: $1 & %capacity & 1000, door: \"open\", energy: $2 & %energy & 293150, "
            "evaluator: text, laws: [constraint, ...constraint] & { first: .energy == (.capacity * .temperature), rest: #Null }, "
-           "temperature: $3 & %temperature & 293.15, west: #ThermalPort & { capacity: $1, energy: $2, temperature: $3 } }");
+           "model: text, temperature: $3 & %temperature & 293.15, west: #ThermalPort & { capacity: $1, energy: $2, temperature: $3 } }");
     const QfNode *e = at(f, a, "energy");
     CHECK(e && e->lo == 293150000 && e->hi == 293150000);                       /* millijoules */
     CHECK(at(f, a, "west.energy") == e);                                        /* one node */

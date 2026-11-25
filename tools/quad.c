@@ -17,6 +17,8 @@
  *   --every TIME    prints a row at each step of this length
  *   --show PATHS    the cells to print, with commas: roomA.temperature,wall.power
  *   --seed N        the seed of the world (the default is 1)
+ *   --switch P=M@T  switches the phenomenon P to its model M at the time T, with
+ *                   the map that the content gives: roomB=fine@200s
  *
  * Without --until, run prints each cell after propagation, with no time
  * step. A value is in the coherent unit of its dimension. */
@@ -26,6 +28,7 @@ static void usage(void)
     fputs("usage: quad check FILE...\n"
           "       quad ir FILE...\n"
           "       quad run FILE... [--until TIME] [--every TIME] [--show PATH,PATH] [--seed N]\n"
+          "                        [--switch PHENOMENON=MODEL@TIME]...\n"
           "A time is a number and a unit: 1000s, 20min, 2h, 1d.\n",
           stderr);
 }
@@ -129,6 +132,30 @@ static void report(const QIr *ir, QWorld *w, int64_t ticks)
                         "  If the laws compute one of them from the stock, mark it with @derived in its type.\n", fixed);
 }
 
+/* A switch of a model that --switch asks for. */
+typedef struct { char phen[128], model[128]; const char *when; int64_t at; bool done; } Switch;
+
+/* Makes each switch whose time is not after `t`, in the order of the times.
+ * False with a report if the run or a switch fails. */
+static bool switches_to(const QIr *ir, QWorld *w, Switch *sw, size_t nsw, int64_t t)
+{
+    for (;;) {
+        Switch *next = NULL;
+        for (size_t i = 0; i < nsw; i++)
+            if (!sw[i].done && sw[i].at <= t && (!next || sw[i].at < next->at)) next = &sw[i];
+        if (!next) return true;
+        next->done = true;
+        if (qw_run(w, next->at) != QW_OK) {
+            report(ir, w, next->at);
+            return false;
+        }
+        if (qi_switch(ir, w, next->phen, next->model) != QW_OK) {
+            fprintf(stderr, "quad: --switch %s=%s@%s: %s\n", next->phen, next->model, next->when, qw_error(w));
+            return false;
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -143,8 +170,9 @@ int main(int argc, char **argv)
     }
     const char *names[64], *until_text = NULL, *every_text = NULL, *show = NULL;
     char *sources[64];
-    size_t n = 0;
+    size_t n = 0, nsw = 0;
     uint64_t seed = 1;
+    Switch sw[16];
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
         bool opt = !strncmp(a, "--", 2);
@@ -156,6 +184,17 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--every")) every_text = argv[++i];
         else if (!strcmp(a, "--show")) show = argv[++i];
         else if (!strcmp(a, "--seed")) seed = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--switch")) {
+            const char *v = argv[++i], *eq = strchr(v, '='), *at = eq ? strchr(eq, '@') : NULL;
+            if (!at || eq == v || at == eq + 1 || !at[1] || nsw == 16 || eq - v > 127 || at - eq > 127) {
+                fprintf(stderr, "quad: --switch needs PHENOMENON=MODEL@TIME, for example roomB=fine@200s, 16 times at most\n");
+                return 2;
+            }
+            memset(&sw[nsw], 0, sizeof sw[nsw]);
+            memcpy(sw[nsw].phen, v, (size_t) (eq - v));
+            memcpy(sw[nsw].model, eq + 1, (size_t) (at - eq - 1));
+            sw[nsw++].when = at + 1;
+        }
         else if (opt) {
             fprintf(stderr, "quad: unknown option %s\n", a);
             return 2;
@@ -201,6 +240,15 @@ int main(int argc, char **argv)
     if (until < 0 || every < 0 || (until_text && every == 0)) {
         fprintf(stderr, "quad: a time is a number and a unit, for example 1000s or 20min\n");
         return 2;
+    }
+
+    for (size_t i = 0; i < nsw; i++) {
+        sw[i].at = parse_time(sw[i].when, ir->tick_scale);
+        if (sw[i].at < 0 || !until_text || sw[i].at > until) {
+            fprintf(stderr, "quad: --switch %s=%s@%s: the time must be a time of the run, so --until must give a later time\n",
+                    sw[i].phen, sw[i].model, sw[i].when);
+            return 2;
+        }
     }
 
     /* the cells to print: the ones that --show names, or every field */
@@ -254,6 +302,10 @@ int main(int argc, char **argv)
         }
         putchar('\n');
         for (int64_t t = 0; !status; t = t + every > until ? until : t + every) {
+            if (!switches_to(ir, w, sw, nsw, t)) {
+                status = 1;
+                break;
+            }
             if (qw_run(w, t) != QW_OK) {
                 report(ir, w, t);
                 status = 1;

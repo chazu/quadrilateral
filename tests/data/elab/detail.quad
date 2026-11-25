@@ -1,0 +1,30 @@
+// A room with two models (ADR 0021). The coarse model has one temperature.
+// The fine model has four cells in a row, and heat moves between them.
+// thermal.quad gives the kinds, #Thermal and #ThermalPort.
+
+// One part of a room, with the law of its heat.
+#Lump: #Thermal & { storage: .energy == .capacity * .temperature }
+
+#CoarseRoom: #Model & #Lump & {
+    west: #ThermalPort & { temperature: .temperature, capacity: .capacity, energy: .energy }
+}
+
+#FineRoom: #Model & {
+    c0: #Lump, c1: #Lump, c2: #Lump, c3: #Lump
+    conductance: %conductance
+    tolerance:   *1pct | %ratio
+    evaluator:   "native.diffusion"
+    west: #ThermalPort & { temperature: .c0.temperature, capacity: .c0.capacity, energy: .c0.energy }
+}
+
+#DetailRoom: #Phenomenon & {
+    west:   #ThermalPort              // each model gives this port
+    spread: %temperature              // a field of every model
+    model:  *"coarse" | text          // the model at the start
+
+    coarse: #CoarseRoom
+    fine:   #FineRoom
+
+    refine:   #Map & { from: "coarse", to: "fine", evaluator: "native.room.refine" }
+    abstract: #Map & { from: "fine", to: "coarse", evaluator: "native.room.abstract" }
+}

@@ -15,6 +15,7 @@ The tool has three commands:
 | `quad ir FILE...` | The IR: kinds, cells, ports, propagators, kernels and dependencies |
 | `quad run FILE...` | The value of each cell after propagation |
 | `quad run FILE... --until 30min --every 10min --show a.x,b.y` | A table of values over time |
+| `quad run FILE... --until 20min --switch room=fine@5min` | The same, with a switch of a model at a time |
 
 A value is in the coherent unit of its dimension. `~` before a value means that the value is between two steps of its scale.
 
@@ -156,3 +157,41 @@ time [s]    tank.volume [m^3]  tank.outflow [m^3 s^-1]
 ```
 
 The level comes to the inflow times the time constant: 0.002 m^3/s × 100 s = 0.2 m^3. Each interaction has a `tolerance` with the default 1 %. A smaller tolerance gives shorter steps and a smaller error.
+
+## thermal.quad and detail-room.quad: a room with two models
+
+A room can have more than one model. The coarse model has one temperature. The fine model has four parts in a row, and a kernel moves heat between neighbors. One model is active, and the other has no state and costs no computation.
+
+A model is a field with a type below `#Model`. The phenomenon names the model that is active at the start. A map moves the state from one model to another:
+
+```
+#DetailRoom: #Phenomenon & {
+    west:   #ThermalPort              // the port of the active model
+    spread: %temperature
+    model:  *"coarse" | text          // the model that is active at the start
+
+    coarse: #CoarseRoom
+    fine:   #FineRoom
+
+    refine:   #Map & { from: "coarse", to: "fine", evaluator: "native.room.refine" }
+    abstract: #Map & { from: "fine", to: "coarse", evaluator: "native.room.abstract" }
+}
+```
+
+The wall connects to `study.west`. It does not know which model is behind the port, and its law for the power follows a switch.
+
+```
+$ build/quad run examples/thermal.quad examples/detail-room.quad --until 20min --every 5min \
+      --switch study=fine@5min --switch study=coarse@15min \
+      --show hall.temperature,study.coarse.temperature,study.fine.c0.temperature,study.fine.c3.temperature,door.power
+time [s]    hall.temperature [K]  study.coarse.temperature [K]  study.fine.c0.temperature [K]  study.fine.c3.temperature [K]  door.power [W]
+0                         303.15                        293.15                        unknown                        unknown             100
+300                  ~300.885782                       unknown                    ~295.414216                     295.414218         ~54.715
+600                  ~299.852832                       unknown                    ~297.502956                    ~295.724492         ~23.498
+900                  ~299.294988                   ~297.005011                        unknown                        unknown         ~22.899
+1200                 ~298.776488                   ~297.523511                        unknown                        unknown         ~12.529
+```
+
+At 300 s the room becomes fine. Each part starts at the temperature of the whole room, and the energy of the room does not change. Then the part at the wall warms faster than the far part, so less power comes through the wall. At 900 s the room becomes coarse again, with the energy of the four parts.
+
+A program in C makes the same switch with `qi_switch(ir, world, "study", "fine")`.

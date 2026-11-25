@@ -51,7 +51,10 @@ char *qi_text(const QIr *ir)
         qf_buf_putc(&b, '\n');
     }
     for (uint32_t p = 0; p < ir->nphens; p++) {
-        qf_buf_printf(&b, "phenomenon %s: %s\n", ir->phens[p].name, ir->phens[p].type);
+        const QiPhen *ph = &ir->phens[p];
+        qf_buf_printf(&b, "phenomenon %s: %s\n", ph->name, ph->type);
+        for (uint32_t m = 0; m < ph->nmodels; m++)
+            qf_buf_printf(&b, "  model %s%s\n", ph->models[m], m == ph->start ? ", active at the start" : "");
         for (uint32_t i = 0; i < ir->ncells; i++) {
             const QiCell *c = &ir->cells[i];
             if (c->phen != p) continue;
@@ -68,12 +71,20 @@ char *qi_text(const QIr *ir)
             if (pt->phen != p) continue;
             qf_buf_printf(&b, "  port %s: %s, ", pt->name, pt->type);
             if (pt->state == QI_PORT_CONNECTED) qf_buf_printf(&b, "connected to %s\n", pt->target);
-            else qf_buf_puts(&b, pt->state == QI_PORT_VIEW ? "a view\n" : "open\n");
+            else if (pt->state == QI_PORT_MODEL) {
+                qf_buf_puts(&b, "the port of the active model:");
+                for (uint32_t m = 0; m < ph->nmodels; m++)
+                    qf_buf_printf(&b, "%s %s -> %s", m ? "," : "", ph->models[m], pt->targets[m]);
+                qf_buf_putc(&b, '\n');
+            } else qf_buf_puts(&b, pt->state == QI_PORT_VIEW ? "a view\n" : "open\n");
         }
         for (uint32_t i = 0; i < ir->nprops; i++) {
             const QiProp *pr = &ir->props[i];
             if (pr->phen != p) continue;
-            qf_buf_printf(&b, "  propagator P%u, in an epoch: %s %s %s", i, cell_path(ir, pr->cell[0]),
+            qf_buf_printf(&b, "  propagator P%u, in an epoch", i);
+            if (pr->model != QI_NONE)
+                qf_buf_printf(&b, ", in the model %s.%s", ir->phens[pr->mphen].name, ir->phens[pr->mphen].models[pr->model]);
+            qf_buf_printf(&b, ": %s %s %s", cell_path(ir, pr->cell[0]),
                           pr->op == QI_LESS_EQUAL ? "<=" : pr->op == QI_LESS ? "<" : "=", cell_path(ir, pr->cell[1]));
             if (pr->op >= QI_SUM && pr->op <= QI_QUOTIENT) qf_buf_printf(&b, " %s %s", ops[pr->op], cell_path(ir, pr->cell[2]));
             qf_buf_printf(&b, "\n    law %s: %s\n", pr->name, pr->law);
@@ -81,10 +92,20 @@ char *qi_text(const QIr *ir)
         for (uint32_t i = 0; i < ir->nkernels; i++) {
             const QiKernelUse *k = &ir->kernels[i];
             if (k->phen != p) continue;
-            qf_buf_printf(&b, "  kernel K%u, at a boundary: %s\n", i, k->kernel);
-            for (uint32_t s = 0; s < k->nbinds; s++)
-                qf_buf_printf(&b, "    %s %s = %s\n", roles[k->binds[s].role], k->binds[s].slot,
-                              cell_path(ir, k->binds[s].cell));
+            qf_buf_printf(&b, "  kernel K%u, at a boundary", i);
+            if (k->model != QI_NONE) qf_buf_printf(&b, ", in the model %s", ph->models[k->model]);
+            qf_buf_printf(&b, ": %s", k->kernel);
+            if (k->size) qf_buf_printf(&b, ", for %u cells", k->size);
+            qf_buf_putc(&b, '\n');
+            for (uint32_t s = 0; s < k->nbinds; s++) {
+                const QiBind *bd = &k->binds[s];
+                qf_buf_printf(&b, "    %s %s = %s", roles[bd->role], bd->slot, cell_path(ir, bd->cell));
+                /* behind a port of the active model: the cell for each model */
+                if (bd->mcells) qf_buf_printf(&b, ", by the model of %s:", ir->phens[bd->mphen].name);
+                for (uint32_t m = 0; bd->mcells && m < ir->phens[bd->mphen].nmodels; m++)
+                    qf_buf_printf(&b, "%s %s -> %s", m ? "," : "", ir->phens[bd->mphen].models[m], cell_path(ir, bd->mcells[m]));
+                qf_buf_putc(&b, '\n');
+            }
             for (uint32_t t = 0; t < k->ntransfers; t++) {
                 qf_buf_printf(&b, "    transfer %s: %s -> %s%s", k->transfers[t].name, cell_path(ir, k->transfers[t].from),
                               cell_path(ir, k->transfers[t].to), k->transfers[t].conserved ? ", conserved" : "");
@@ -93,6 +114,17 @@ char *qi_text(const QIr *ir)
                                   cell_path(ir, k->transfers[t].tolerance));
                 qf_buf_putc(&b, '\n');
             }
+        }
+        for (uint32_t i = 0; i < ir->nmaps; i++) {
+            const QiMap *mp = &ir->maps[i];
+            if (mp->phen != p) continue;
+            qf_buf_printf(&b, "  map %s, at a switch: %s -> %s, %s", mp->name, ph->models[mp->from], ph->models[mp->to],
+                          mp->kernel);
+            if (mp->size) qf_buf_printf(&b, ", for %u cells", mp->size);
+            qf_buf_putc(&b, '\n');
+            for (uint32_t s2 = 0; s2 < mp->nbinds; s2++)
+                qf_buf_printf(&b, "    %s %s = %s\n", roles[mp->binds[s2].role], mp->binds[s2].slot,
+                              cell_path(ir, mp->binds[s2].cell));
         }
     }
     qf_buf_puts(&b, "dependencies\n");
