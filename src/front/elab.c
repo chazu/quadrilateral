@@ -381,9 +381,14 @@ static void walk(Walk *w, const QfNode *n)
             /* The source and the sink of an interaction are paths to stocks,
              * and its flag is a statement: none of them is a cell (ADR 0020). */
             bool inter = e->tinter != QF_BOTTOM && is_subtype(f, n->type, e->tinter);
+            /* An interaction with no rate states a transfer of a kernel in C
+             * (ADR 0021 section 6): its tolerance has no use, and it is not a cell. */
+            const QfNode *rate = inter ? node_arc(n, e->frate) : NULL;
+            bool stated = inter && (!rate || (!(rate->flags & NF_VALUE) && rate->type == f->top && !rate->narcs));
             for (uint32_t i = 0; i < n->narcs; i++) {
                 uint32_t ft = n->arcs[i].feat;
                 if (inter && (ft == e->fsource || ft == e->fsink || ft == e->fcons)) continue;
+                if (stated && ft == e->ftol) continue;
                 VEC_PUSH(w->path, ft);
                 walk(w, n->arcs[i].val);
                 w->path.n--;
@@ -1420,7 +1425,7 @@ static void kernel_use(Elab *e, uint32_t phen, uint32_t model)
         const QkTransfer *kt = &k->transfers[t];
         ku.transfers[t] = (QiTransfer) { keep(e, kt->name), kt->from == QK_NONE ? QI_NONE : ku.binds[kt->from].cell,
                                          kt->to == QK_NONE ? QI_NONE : ku.binds[kt->to].cell, kt->conserved, QI_NONE,
-                                         QI_NONE };
+                                         QI_NONE, NULL };
     }
     if (ok) VEC_PUSH(e->kernels, ku);
     qf_buf_free(&who);
@@ -1503,6 +1508,61 @@ static void inter_bind(QiKernelUse *ku, size_t cap, QkRole role, End end)
     if (ku->nbinds < cap) ku->binds[ku->nbinds++] = (QiBind) { end.slot, role, end.cell, end.mphen, end.mcells };
 }
 
+/* "roomA.energy -> roomB.energy, conserved": a transfer, for a message. */
+static void put_transfer(Elab *e, Buf *b, uint32_t from, uint32_t to, bool conserved)
+{
+    qf_buf_printf(b, "%s -> %s%s", from == QI_NONE ? "nothing" : e->cells.v[from].path,
+                  to == QI_NONE ? "nothing" : e->cells.v[to].path, conserved ? ", conserved" : ", not conserved");
+}
+
+/* An interaction with no rate states one transfer of the kernel that its
+ * phenomenon or its model names (ADR 0021 section 6). The kernel must make a
+ * transfer from the stock of `source` to the stock of `sink`, with the same
+ * flag `conserved`. The statement is optional: a kernel can make a transfer
+ * that no interaction states. */
+static void stated_transfer(Elab *e, uint32_t phen, uint32_t owner, const Inter *in, Loc loc)
+{
+    Front *f = e->f;
+    QiKernelUse *ku = NULL;
+    for (size_t k = 0; k < e->kernels.n; k++)
+        if (e->kernels.v[k].phen == phen && e->kernels.v[k].model == owner && strcmp(e->kernels.v[k].kernel, "native.rate"))
+            ku = &e->kernels.v[k];
+    if (!ku) return;                                 /* the kernel has an error of its own */
+    End from, to;
+    bool ends = inter_end(e, phen, in, e->fsource, "source", loc, &from);
+    if (!inter_end(e, phen, in, e->fsink, "sink", loc, &to) || !ends) return;
+    const QfNode *cn = node_arc(in->node, e->fcons);
+    bool conserved = !cn || strcmp(f->types.v[cn->type].name, "false") != 0;
+    if (from.cell == QI_NONE && to.cell == QI_NONE) {
+        err(e, loc, "%s has no rate, no source and no sink: an interaction with no rate states a transfer of the kernel %s, "
+            "as in `source: .hot.energy, sink: .cold.energy`", in->text, ku->kernel);
+        return;
+    }
+    QiTransfer *match = NULL;
+    for (uint32_t t = 0; t < ku->ntransfers && !match; t++)
+        if (ku->transfers[t].from == from.cell && ku->transfers[t].to == to.cell) match = &ku->transfers[t];
+    Buf says = { 0 }, has = { 0 };
+    put_transfer(e, &says, from.cell, to.cell, conserved);
+    for (uint32_t t = 0; t < ku->ntransfers; t++) {
+        qf_buf_printf(&has, "%s%s (", t ? ", " : "", ku->transfers[t].name);
+        put_transfer(e, &has, ku->transfers[t].from, ku->transfers[t].to, ku->transfers[t].conserved);
+        qf_buf_putc(&has, ')');
+    }
+    if (!match)
+        err(e, loc, "%s states the transfer %s, and the kernel %s makes no transfer between these stocks. Its transfers: %s",
+            in->text, says.s, ku->kernel, has.len ? has.s : "none");
+    else if (match->conserved != conserved)
+        err(e, loc, "%s states the transfer %s, and the transfer %s of the kernel %s is %s: write `conserved: %s`", in->text,
+            says.s, match->name, ku->kernel, match->conserved ? "conserved" : "not conserved",
+            match->conserved ? "true" : "false");
+    else if (match->stated)
+        err(e, loc, "%s and %s state the same transfer, %s of the kernel %s: one interaction states one transfer", match->stated,
+            in->text, match->name, ku->kernel);
+    else match->stated = keep(e, in->text);
+    qf_buf_free(&says);
+    qf_buf_free(&has);
+}
+
 /* Makes the kernel native.rate of a phenomenon, or of its model `owner`,
  * from the interactions with a rate that stand there: each is one transfer
  * (ADR 0020 section 6). */
@@ -1530,12 +1590,12 @@ static void owner_interactions(Elab *e, uint32_t phen, uint32_t owner, const Int
         const QfNode *rn = node_arc(in->node, e->frate), *cn = node_arc(in->node, e->fcons);
         TypeKind rk = rn ? f->types.v[rn->type].kind : TK_TOP;
         if (!rn || (!(rn->flags & NF_VALUE) && rn->type == f->top && !rn->narcs)) {
-            /* no rate: the interaction states a transfer of a native kernel (quad-ijx.4) */
+            /* no rate: the interaction states a transfer of the kernel in C */
             if (!evaluator) {
                 err(e, loc, "%s has no rate, and %s names no evaluator: nothing moves the quantity. Give the interaction "
                     "a rate, as in `rate: .power`", in->text, who.s);
                 ok = false;
-            }
+            } else stated_transfer(e, phen, owner, in, loc);
             continue;
         }
         if (evaluator) {
@@ -1635,7 +1695,8 @@ static void owner_interactions(Elab *e, uint32_t phen, uint32_t owner, const Int
         if (to.cell != QI_NONE)
             inter_bind(&ku, cap, e->cells.v[to.cell].phen == phen && to.mphen == QI_NONE ? QK_STOCK : QK_LINK, to);
         ku.transfers[ku.ntransfers++] =
-            (QiTransfer) { keep(e, name), from.cell, to.cell, from.cell != QI_NONE && to.cell != QI_NONE, rate, tol };
+            (QiTransfer) { keep(e, name), from.cell, to.cell, from.cell != QI_NONE && to.cell != QI_NONE, rate, tol,
+                           keep(e, in->text) };
     }
     if (ok && ku.ntransfers) VEC_PUSH(e->kernels, ku);
     qf_buf_free(&evname);

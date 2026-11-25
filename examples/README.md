@@ -13,6 +13,7 @@ The tool has three commands:
 |---|---|
 | `quad check FILE...` | The errors of a content, or a count of its parts |
 | `quad ir FILE...` | The IR: kinds, cells, ports, propagators, kernels and dependencies |
+| `quad transfers FILE...` | Each transfer of each kernel, and the interaction in source that states it |
 | `quad run FILE...` | The value of each cell after propagation |
 | `quad run FILE... --until 30min --every 10min --show a.x,b.y` | A table of values over time |
 | `quad run FILE... --until 20min --switch room=fine@5min` | The same, with a switch of a model at a time |
